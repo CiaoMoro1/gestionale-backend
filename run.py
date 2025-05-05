@@ -1,6 +1,7 @@
 from flask import Flask
 from flask_cors import CORS
 from dotenv import load_dotenv
+import os
 import ssl
 import certifi  # ✅ Per risolvere problemi SSL su Windows
 
