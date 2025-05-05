@@ -1,26 +1,32 @@
-import os
-import jwt
 from functools import wraps
-from flask import request, abort
+from flask import request, jsonify
+from supabase import create_client
+import os
 
-from dotenv import load_dotenv
-load_dotenv()
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-def require_auth(func):
-    @wraps(func)
+def require_auth(fn):
+    @wraps(fn)
     def wrapper(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        token = auth_header.replace("Bearer ", "")
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Token mancante o malformato"}), 401
+
+        token = auth_header.split(" ")[1]
+        print("🔎 DEBUG JWT\n→ Token ricevuto:", token[:50] + "...")
 
         try:
-            payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-            user_id = payload["sub"]
-            print("✅ JWT OK — user_id:", user_id)
+            user = supabase.auth.get_user(token)
+            if user and user.user and user.user.id:
+                print("✅ Utente verificato:", user.user.email)
+                return fn(user.user.id, *args, **kwargs)
+            else:
+                return jsonify({"error": "Token non valido"}), 401
         except Exception as e:
-            print("❌ Errore JWT:", str(e))
-            abort(401, "Token non valido")
+            print("❌ Errore Supabase Auth:", str(e))
+            return jsonify({"error": "Token non valido"}), 401
 
-        return func(user_id=user_id, *args, **kwargs)
     return wrapper

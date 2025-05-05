@@ -6,6 +6,7 @@ anyio==4.9.0
 attrs==25.3.0
 blinker==1.9.0
 certifi==2025.4.26
+charset-normalizer==3.4.2
 click==8.1.8
 colorama==0.4.6
 deprecation==2.1.0
@@ -37,6 +38,7 @@ pytest-mock==3.14.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.1.0
 realtime==2.4.3
+requests==2.32.3
 six==1.17.0
 sniffio==1.3.1
 storage3==0.11.3
@@ -45,6 +47,7 @@ supabase==2.15.1
 supafunc==0.9.4
 typing-inspection==0.4.0
 typing_extensions==4.13.2
+urllib3==2.4.0
 websockets==14.2
 Werkzeug==3.1.3
 yarl==1.20.0
