@@ -17,8 +17,9 @@ from app.routes.bulk_sync import bulk_sync
 def create_app():
     app = Flask(__name__)
 
-    # ✅ Abilita CORS solo per il frontend (vite)
-    CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
+    # ✅ Abilita CORS solo per il frontend (vite) CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
+    FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+    CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
 
     # ✅ Registra blueprint
     app.register_blueprint(bulk_sync)
