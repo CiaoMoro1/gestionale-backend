@@ -30,7 +30,6 @@ mutation {
             sku
             barcode
             price
-            inventoryQuantity
             inventoryPolicy
             product {
               id
@@ -183,15 +182,14 @@ def fetch_bulk_data(user_id):
                 variant = entry["variant"]
                 product = variant["product"]
                 record = {
-                    "shopify_variant_id": variant["id"],
-                    "shopify_product_id": product["id"],
+                    "shopify_variant_id": normalize_gid(variant["id"]),
+                    "shopify_product_id": normalize_gid(product["id"]),
                     "sku": variant.get("sku", ""),
                     "ean": variant.get("barcode", ""),
                     "variant_title": variant.get("title", ""),
                     "product_title": product.get("title", ""),
                     "image_url": entry["image_url"],
                     "price": float(variant.get("price") or 0),
-                    "quantity": variant.get("inventoryQuantity") or 0,
                     "inventory_policy": variant.get("inventoryPolicy", ""),
                     "user_id": user_id,
                 }

@@ -14,16 +14,24 @@ ssl._create_default_https_context().load_verify_locations(certifi.where())
 
 # 📦 Importa blueprint delle rotte
 from app.routes.bulk_sync import bulk_sync
+from app.routes.webhook import webhook
+from app.routes.orders import orders
+
 
 def create_app():
     app = Flask(__name__)
 
     # ✅ Abilita CORS solo per il frontend (vite) CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
     FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-    CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
+    CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}}, supports_credentials=True)
+
 
     # ✅ Registra blueprint
     app.register_blueprint(bulk_sync)
+    
+    app.register_blueprint(webhook)
+
+    app.register_blueprint(orders)
 
     return app
 
