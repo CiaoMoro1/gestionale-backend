@@ -37,16 +37,17 @@ def handle_product_update():
 
     for variant in variants:
         record = {
-            "shopify_product_id": product_id,
-            "shopify_variant_id": normalize_gid(variant["id"]),
             "shopify_product_id": normalize_gid(product_id),
+            "shopify_variant_id": normalize_gid(variant["id"]),
             "product_title": product_title,
             "variant_title": variant.get("title", ""),
             "price": float(variant.get("price", 0)),
             "ean": variant.get("barcode", ""),
+            "sku": variant.get("sku") or payload.get("sku") or "",  # ✅ fix qui
             "image_url": image_url,
             "user_id": user_id,
         }
         upsert_variant(record)
+
 
     return jsonify({"status": "success", "imported": len(variants)}), 200
