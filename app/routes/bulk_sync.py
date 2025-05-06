@@ -13,8 +13,9 @@ SHOPIFY_GRAPHQL_URL = os.environ.get("SHOPIFY_GRAPHQL_URL")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 # 🔧 Funzione per normalizzare GID Shopify
-def normalize_gid(gid: str) -> str:
-    return gid.split("/")[-1] if gid and "/" in gid else gid
+def normalize_gid(gid) -> str:
+    gid = str(gid)  # 👈 forza cast a stringa
+    return gid.split("/")[-1] if "/" in gid else gid
 
 # 🔹 1. Bulk query (le immagini arrivano in righe separate)
 BULK_QUERY = '''

@@ -16,8 +16,9 @@ HEADERS = {
 }
 
 
-def normalize_gid(gid: str) -> str:
-    return gid.split("/")[-1] if gid and "/" in gid else gid
+def normalize_gid(gid) -> str:
+    gid = str(gid)  # 👈 forza cast a stringa
+    return gid.split("/")[-1] if "/" in gid else gid
 
 
 @orders.route("/shopify/import-orders", methods=["POST"])
