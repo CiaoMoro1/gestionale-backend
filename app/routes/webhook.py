@@ -5,6 +5,7 @@ import hmac
 import base64
 import hashlib
 from app.services.supabase_write import upsert_variant
+from app.routes.bulk_sync import normalize_gid
 
 webhook = Blueprint("webhook", __name__)
 
@@ -37,8 +38,8 @@ def handle_product_update():
     for variant in variants:
         record = {
             "shopify_product_id": product_id,
-            "shopify_variant_id": variant["id"],
-            "sku": variant.get("sku", ""),
+            "shopify_variant_id": normalize_gid(variant["id"]),
+            "shopify_product_id": normalize_gid(product_id),
             "product_title": product_title,
             "variant_title": variant.get("title", ""),
             "price": float(variant.get("price", 0)),
