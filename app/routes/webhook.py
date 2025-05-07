@@ -122,16 +122,28 @@ def handle_order_create():
         abort(401, "Invalid HMAC")
 
     payload = json.loads(raw_body)
-
-    # Verifica stato
-    if payload.get("financial_status") != "paid" or payload.get("fulfillment_status") != "unfulfilled":
-        return jsonify({"status": "skipped", "reason": "not paid or already fulfilled"}), 200
-
     shopify_order_id = int(normalize_gid(payload["id"]))
+    financial_status = payload.get("financial_status")
+    fulfillment_status = payload.get("fulfillment_status")
+
+    print(f"🧾 Webhook ordine ricevuto: ID {shopify_order_id}")
+    print(f"📌 Status: {financial_status=} | {fulfillment_status=}")
+
+    # Salta se non pagato o già evaso
+    if financial_status != "paid" or fulfillment_status != "unfulfilled":
+        print(f"⚠️ Ordine skippato: non valido per l'import.")
+        return jsonify({
+            "status": "skipped",
+            "reason": "not paid or already fulfilled",
+            "shopify_order_id": shopify_order_id,
+            "financial_status": financial_status,
+            "fulfillment_status": fulfillment_status
+        }), 200
 
     # Verifica duplicati
     exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
     if exists.data:
+        print(f"⛔ Ordine già presente, ignorato: {shopify_order_id}")
         return jsonify({"status": "skipped", "reason": "already imported"}), 200
 
     user_id = os.environ.get("DEFAULT_USER_ID", None)
