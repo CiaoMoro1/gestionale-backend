@@ -1,4 +1,5 @@
 from flask import Blueprint, request, jsonify, abort
+from app.supabase_client import supabase
 import os
 import json
 import hmac
