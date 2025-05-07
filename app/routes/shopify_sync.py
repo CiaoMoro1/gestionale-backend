@@ -3,6 +3,7 @@ import os
 import httpx
 import certifi
 from datetime import datetime, timedelta
+
 from app.routes.bulk_sync import normalize_gid
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
@@ -17,7 +18,6 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ Sync ordini pagati e inevasi (ultimi 3 giorni)
 @shopify.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
 def manual_sync_orders(user_id):
@@ -43,6 +43,7 @@ def manual_sync_orders(user_id):
                 id
                 name
                 createdAt
+                fulfillmentStatus
                 totalPriceSet {{ shopMoney {{ amount }} }}
                 customer {{ displayName }}
                 app {{ name }}
@@ -63,7 +64,7 @@ def manual_sync_orders(user_id):
         """
 
         try:
-            with httpx.Client(verify=False) as client:
+            with httpx.Client(verify=certifi.where()) as client:
                 response = client.post(
                     SHOPIFY_GRAPHQL_URL,
                     headers=HEADERS,
@@ -90,7 +91,6 @@ def manual_sync_orders(user_id):
 
             exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
             if exists.data:
-                # Ordine già presente — verifichiamo se è diventato evaso
                 if order.get("fulfillmentStatus") == "FULFILLED":
                     order_id = exists.data[0]["id"]
                     supabase.rpc("evadi_ordine", { "ordine_id": order_id }).execute()
@@ -99,12 +99,15 @@ def manual_sync_orders(user_id):
                     skipped += 1
                 continue
 
+            # Campi sicuri per customer e app
+            customer_name = (order.get("customer") or {}).get("displayName", "Ospite")
+            channel = (order.get("app") or {}).get("name", "Online Store")
 
             order_resp = supabase.table("orders").insert({
                 "shopify_order_id": shopify_order_id,
                 "number": order["name"],
-                "customer_name": order["customer"]["displayName"] if order["customer"] else "Ospite",
-                "channel": order["app"]["name"] if order["app"] else "Online Store",
+                "customer_name": customer_name,
+                "channel": channel,
                 "created_at": order["createdAt"],
                 "payment_status": "pagato",
                 "fulfillment_status": "inevaso",
@@ -149,5 +152,3 @@ def manual_sync_orders(user_id):
         "skipped": skipped,
         "errors": errors
     }), 200
-
-
