@@ -1,10 +1,10 @@
 from flask import Blueprint, request, jsonify, abort
-from app.supabase_client import supabase
 import os
 import json
 import hmac
 import base64
 import hashlib
+from app.supabase_client import supabase
 from app.services.supabase_write import upsert_variant
 from app.routes.bulk_sync import normalize_gid
 

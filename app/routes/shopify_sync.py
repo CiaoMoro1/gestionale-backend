@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
-from app.routes.bulk_sync import normalize_gid, bulk_fetch
 
 shopify = Blueprint("shopify", __name__)
 
@@ -151,13 +150,4 @@ def manual_sync_orders(user_id):
         "errors": errors
     }), 200
 
-# ✅ Sync prodotti (bulk fetch)
-@shopify.route("/shopify/manual-sync-products", methods=["POST"])
-@require_auth
-def manual_sync_products(user_id):
-    try:
-        bulk_fetch(user_id=user_id)
-        return jsonify({"status": "ok", "message": "bulk fetch avviato"}), 200
-    except Exception as e:
-        print("❌ Errore bulk fetch:", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+
