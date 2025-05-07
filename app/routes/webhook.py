@@ -22,18 +22,14 @@ def verify_webhook(data, hmac_header):
 def handle_product_update():
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-
     if not verify_webhook(raw_body, hmac_header):
         abort(401, "Invalid HMAC")
 
     payload = json.loads(raw_body)
-
     variants = payload.get("variants", [])
     product_id = payload.get("id")
     product_title = payload.get("title", "")
     image_url = (payload.get("image") or {}).get("src", "")
-
-    # ✅ ID statico, puoi cambiarlo con auth se necessario
     user_id = os.environ.get("DEFAULT_USER_ID", "admin-sync")
 
     for variant in variants:
@@ -44,72 +40,30 @@ def handle_product_update():
             "variant_title": variant.get("title", ""),
             "price": float(variant.get("price", 0)),
             "ean": variant.get("barcode", ""),
-            "sku": variant.get("sku") or payload.get("sku") or "",  # ✅ fix qui
+            "sku": variant.get("sku") or payload.get("sku") or "",
             "image_url": image_url,
             "user_id": user_id,
         }
         upsert_variant(record)
 
-# ✅ Webhook per products/delete
-
+    print(f"✅ Prodotto aggiornato: {product_title} ({product_id})")
     return jsonify({"status": "success", "imported": len(variants)}), 200
+
+
+# ✅ Webhook per products/delete
 @webhook.route("/webhook/product-delete", methods=["POST"])
 def handle_product_delete():
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-
     if not verify_webhook(raw_body, hmac_header):
         abort(401, "Invalid HMAC")
 
     payload = json.loads(raw_body)
     shopify_product_id = normalize_gid(payload.get("id"))
-
-    from app.supabase_client import supabase
-    response = supabase.table("products") \
-        .delete() \
-        .eq("shopify_product_id", shopify_product_id) \
-        .execute()
+    response = supabase.table("products").delete().eq("shopify_product_id", shopify_product_id).execute()
 
     print(f"🗑️ Prodotto eliminato: {shopify_product_id} — {response}")
-
     return jsonify({"status": "deleted", "shopify_product_id": shopify_product_id}), 200
-
-# ✅ Webhook per order-update
-@webhook.route("/webhook/order-update", methods=["POST"])
-def handle_order_update():
-    raw_body = request.get_data()
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-
-    if not verify_webhook(raw_body, hmac_header):
-        abort(401, "Invalid HMAC")
-
-    payload = json.loads(raw_body)
-
-    # Ignora se l'ordine NON è evaso
-    fulfillment_status = payload.get("fulfillment_status")
-    if fulfillment_status != "fulfilled":
-        return jsonify({"status": "skipped", "reason": "not fulfilled"}), 200
-
-    shopify_order_id = int(normalize_gid(payload.get("id")))
-
-    # Recupera ordine Supabase tramite shopify_order_id
-    try:
-        order_resp = supabase.table("orders") \
-            .select("id") \
-            .eq("shopify_order_id", shopify_order_id) \
-            .single() \
-            .execute()
-    except Exception:
-        print(f"🔁 Ordine {shopify_order_id} non ancora importato → webhook ignorato.")
-        return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
-
-    order_id = order_resp.data["id"]
-
-    # Chiama la funzione evadi_ordine() su Supabase
-    supabase.rpc("evadi_ordine", { "ordine_id": order_id }).execute()
-
-    print(f"✅ Ordine evaso via webhook: {shopify_order_id}")
-    return jsonify({"status": "fulfilled and cleaned", "order_id": order_id}), 200
 
 
 # ✅ Webhook per order-create
@@ -117,7 +71,6 @@ def handle_order_update():
 def handle_order_create():
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-
     if not verify_webhook(raw_body, hmac_header):
         abort(401, "Invalid HMAC")
 
@@ -129,26 +82,17 @@ def handle_order_create():
     print(f"🧾 Webhook ordine ricevuto: ID {shopify_order_id}")
     print(f"📌 Status: {financial_status=} | {fulfillment_status=}")
 
-    # Salta se non pagato o già evaso
     if financial_status != "paid" or fulfillment_status not in [None, "unfulfilled"]:
         print(f"⚠️ Ordine skippato: non valido per l'import.")
-        return jsonify({
-            "status": "skipped",
-            "reason": "not paid or already fulfilled",
-            "shopify_order_id": shopify_order_id,
-            "financial_status": financial_status,
-            "fulfillment_status": fulfillment_status
-        }), 200
+        return jsonify({"status": "skipped", "reason": "not paid or already fulfilled"}), 200
 
-    # Verifica duplicati
     exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
     if exists.data:
-        print(f"⛔ Ordine già presente, ignorato: {shopify_order_id}")
+        print(f"⛔ Ordine già presente: {shopify_order_id}")
         return jsonify({"status": "skipped", "reason": "already imported"}), 200
 
     user_id = os.environ.get("DEFAULT_USER_ID", None)
 
-    # Inserisci ordine
     order_resp = supabase.table("orders").insert({
         "shopify_order_id": shopify_order_id,
         "number": payload.get("name"),
@@ -169,7 +113,6 @@ def handle_order_create():
         sku = item.get("sku") or item.get("title") or "Senza SKU"
         product_id = None
 
-        # Collega al product_id (se esiste)
         product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
         if product.data:
             product_id = product.data[0]["id"]
@@ -182,12 +125,95 @@ def handle_order_create():
             "quantity": quantity
         }).execute()
 
-        # Aggiorna riservato_sito
         if product_id:
             supabase.rpc("adjust_inventory_after_fulfillment", {
                 "pid": product_id,
-                "delta": -quantity * -1  # somma positiva
+                "delta": -quantity * -1
             }).execute()
 
     print(f"🛒 Nuovo ordine importato: {shopify_order_id}")
     return jsonify({"status": "order created", "order_id": shopify_order_id}), 200
+
+
+# ✅ Webhook per order-update
+@webhook.route("/webhook/order-update", methods=["POST"])
+def handle_order_update():
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+    if not verify_webhook(raw_body, hmac_header):
+        abort(401, "Invalid HMAC")
+
+    payload = json.loads(raw_body)
+    shopify_order_id = int(normalize_gid(payload.get("id")))
+
+    try:
+        order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
+        order_id = order_resp.data["id"]
+    except Exception:
+        print(f"🔁 Ordine {shopify_order_id} non trovato → webhook ignorato.")
+        return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
+
+    items = payload.get("line_items", [])
+    for item in items:
+        shopify_variant_id = normalize_gid(item.get("variant_id"))
+        sku = item.get("sku") or item.get("title") or "Senza SKU"
+        quantity = item.get("quantity", 1)
+
+        product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+        product_id = product.data[0]["id"] if product.data else None
+
+        existing = supabase.table("order_items").select("id").eq("order_id", order_id).eq("sku", sku).execute()
+        if not existing.data:
+            supabase.table("order_items").insert({
+                "order_id": order_id,
+                "shopify_variant_id": shopify_variant_id,
+                "product_id": product_id,
+                "sku": sku,
+                "quantity": quantity
+            }).execute()
+
+            if product_id:
+                supabase.rpc("adjust_inventory_after_fulfillment", {
+                    "pid": product_id,
+                    "delta": -quantity * -1
+                }).execute()
+
+    if payload.get("fulfillment_status") == "fulfilled":
+        supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
+        print(f"✅ Ordine {shopify_order_id} evaso via webhook")
+
+    print(f"🔁 Ordine aggiornato: {shopify_order_id}")
+    return jsonify({"status": "updated", "order_id": order_id}), 200
+
+
+# ✅ Webhook per order-cancel
+@webhook.route("/webhook/order-cancel", methods=["POST"])
+def handle_order_cancel():
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+    if not verify_webhook(raw_body, hmac_header):
+        abort(401, "Invalid HMAC")
+
+    payload = json.loads(raw_body)
+    shopify_order_id = int(normalize_gid(payload.get("id")))
+
+    try:
+        order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
+        order_id = order_resp.data["id"]
+    except Exception:
+        print(f"🗑️ Ordine {shopify_order_id} non trovato → webhook ignorato.")
+        return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
+
+    items = supabase.table("order_items").select("product_id, quantity").eq("order_id", order_id).execute()
+    for item in items.data:
+        if item["product_id"]:
+            inv = supabase.table("inventory").select("riservato_sito").eq("product_id", item["product_id"]).single().execute()
+            current = inv.data.get("riservato_sito") or 0
+            supabase.table("inventory").update({
+                "riservato_sito": max(0, current - item["quantity"])
+            }).eq("product_id", item["product_id"]).execute()
+
+    supabase.table("orders").update({"fulfillment_status": "annullato"}).eq("id", order_id).execute()
+
+    print(f"🗑️ Ordine annullato e riservato aggiornato: {shopify_order_id}")
+    return jsonify({"status": "cancelled", "order_id": order_id}), 200
