@@ -130,7 +130,7 @@ def handle_order_create():
     print(f"📌 Status: {financial_status=} | {fulfillment_status=}")
 
     # Salta se non pagato o già evaso
-    if financial_status != "paid" or fulfillment_status != "unfulfilled":
+    if financial_status != "paid" or fulfillment_status not in [None, "unfulfilled"]:
         print(f"⚠️ Ordine skippato: non valido per l'import.")
         return jsonify({
             "status": "skipped",
