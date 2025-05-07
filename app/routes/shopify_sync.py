@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 import os
 import httpx
 import certifi
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from app.routes.bulk_sync import normalize_gid
 from app.supabase_client import supabase
@@ -18,6 +18,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+
 @shopify.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
 def manual_sync_orders(user_id):
@@ -27,7 +28,7 @@ def manual_sync_orders(user_id):
     cursor = None
     has_next_page = True
 
-    from_date = (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%d")
+    from_date = "2025-03-01"
 
     while has_next_page:
         after_clause = f', after: "{cursor}"' if cursor else ""
@@ -64,7 +65,7 @@ def manual_sync_orders(user_id):
         """
 
         try:
-            with httpx.Client(verify=False) as client:
+            with httpx.Client(verify=certifi.where()) as client:
                 response = client.post(
                     SHOPIFY_GRAPHQL_URL,
                     headers=HEADERS,
@@ -93,13 +94,13 @@ def manual_sync_orders(user_id):
             if exists.data:
                 if order.get("fulfillmentStatus") == "FULFILLED":
                     order_id = exists.data[0]["id"]
-                    supabase.rpc("evadi_ordine", { "ordine_id": order_id }).execute()
+                    supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
                     print(f"✅ Ordine {shopify_order_id} evaso via sync manuale.")
                 else:
                     skipped += 1
                 continue
 
-            # Campi sicuri per customer e app
+            # Sicurezza su campi opzionali
             customer_name = (order.get("customer") or {}).get("displayName", "Ospite")
             channel = (order.get("app") or {}).get("name", "Online Store")
 
