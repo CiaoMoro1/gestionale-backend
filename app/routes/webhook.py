@@ -93,10 +93,16 @@ def handle_order_create():
 
     user_id = os.environ.get("DEFAULT_USER_ID", None)
 
+    # 👤 Recupero nome completo del cliente
+    customer = payload.get("customer") or {}
+    first_name = customer.get("first_name", "")
+    last_name = customer.get("last_name", "")
+    customer_name = f"{first_name} {last_name}".strip() or "Ospite"
+
     order_resp = supabase.table("orders").insert({
         "shopify_order_id": shopify_order_id,
         "number": payload.get("name"),
-        "customer_name": (payload.get("customer") or {}).get("first_name", "Ospite"),
+        "customer_name": customer_name,
         "channel": (payload.get("app") or {}).get("name", "Online Store"),
         "created_at": payload.get("created_at"),
         "payment_status": "pagato",
@@ -133,6 +139,7 @@ def handle_order_create():
 
     print(f"🛒 Nuovo ordine importato: {shopify_order_id}")
     return jsonify({"status": "order created", "order_id": shopify_order_id}), 200
+
 
 
 # ✅ Webhook per order-update
