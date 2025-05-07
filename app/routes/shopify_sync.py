@@ -21,7 +21,7 @@ def normalize_gid(gid) -> str:
     return gid.split("/")[-1] if "/" in gid else gid
 
 
-@orders.route("/shopify/import-orders", methods=["POST"])
+@orders.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
 def import_orders(user_id):
     imported = 0
