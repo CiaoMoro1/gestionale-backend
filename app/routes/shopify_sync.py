@@ -65,7 +65,7 @@ def manual_sync_orders(user_id):
         """
 
         try:
-            with httpx.Client(verify=certifi.where()) as client:
+            with httpx.Client(verify=False) as client:
                 response = client.post(
                     SHOPIFY_GRAPHQL_URL,
                     headers=HEADERS,
