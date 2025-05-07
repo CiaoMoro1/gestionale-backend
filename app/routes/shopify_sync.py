@@ -3,7 +3,7 @@ import os
 import httpx
 import certifi
 from datetime import datetime, timedelta
-
+from app.routes.bulk_sync import normalize_gid
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
 
