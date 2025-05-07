@@ -5,7 +5,7 @@ import certifi
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
 
-orders = Blueprint("orders", __name__)
+orders = Blueprint("shopify", __name__)
 
 SHOPIFY_GRAPHQL_URL = os.environ.get("SHOPIFY_GRAPHQL_URL")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
@@ -184,3 +184,4 @@ def import_orders(user_id):
         "skipped": skipped,
         "errors": errors
     }), 200
+
