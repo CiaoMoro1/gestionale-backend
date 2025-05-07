@@ -16,7 +16,7 @@ ssl._create_default_https_context().load_verify_locations(certifi.where())
 from app.routes.bulk_sync import bulk_sync
 from app.routes.webhook import webhook
 from app.routes.orders import orders
-
+from app.routes.shopify_sync import shopify
 
 def create_app():
     app = Flask(__name__)
@@ -33,6 +33,7 @@ def create_app():
 
     app.register_blueprint(orders)
 
+    app.register_blueprint(shopify)
     return app
 
 app = create_app()
