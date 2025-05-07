@@ -91,8 +91,15 @@ def manual_sync_orders(user_id):
 
             exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
             if exists.data:
-                skipped += 1
+                # Ordine già presente — verifichiamo se è diventato evaso
+                if order.get("fulfillmentStatus") == "FULFILLED":
+                    order_id = exists.data[0]["id"]
+                    supabase.rpc("evadi_ordine", { "ordine_id": order_id }).execute()
+                    print(f"✅ Ordine {shopify_order_id} evaso via sync manuale.")
+                else:
+                    skipped += 1
                 continue
+
 
             order_resp = supabase.table("orders").insert({
                 "shopify_order_id": shopify_order_id,
