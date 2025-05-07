@@ -49,5 +49,26 @@ def handle_product_update():
         }
         upsert_variant(record)
 
+# ✅ Webhook per products/delete
 
     return jsonify({"status": "success", "imported": len(variants)}), 200
+@webhook.route("/webhook/product-delete", methods=["POST"])
+def handle_product_delete():
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+
+    if not verify_webhook(raw_body, hmac_header):
+        abort(401, "Invalid HMAC")
+
+    payload = json.loads(raw_body)
+    shopify_product_id = normalize_gid(payload.get("id"))
+
+    from app.supabase_client import supabase
+    response = supabase.table("products") \
+        .delete() \
+        .eq("shopify_product_id", shopify_product_id) \
+        .execute()
+
+    print(f"🗑️ Prodotto eliminato: {shopify_product_id} — {response}")
+
+    return jsonify({"status": "deleted", "shopify_product_id": shopify_product_id}), 200

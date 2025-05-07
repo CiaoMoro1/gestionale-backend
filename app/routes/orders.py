@@ -17,7 +17,7 @@ HEADERS = {
 
 
 def normalize_gid(gid) -> str:
-    gid = str(gid)  # 👈 forza cast a stringa
+    gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
 
 
@@ -30,11 +30,18 @@ def import_orders(user_id):
     cursor = None
     has_next_page = True
 
+    COD_KEYWORDS = [
+        "contrassegno",
+        "pagamento alla consegna",
+        "cash on delivery",
+        "commissione pagamento"
+    ]
+
     while has_next_page:
         after_clause = f', after: "{cursor}"' if cursor else ""
         query = f"""
         {{
-          orders(first: 50{after_clause}, query: "financial_status:paid AND fulfillment_status:unfulfilled") {{
+          orders(first: 50{after_clause}, query: "(created_at:>='2025-03-01') AND (financial_status:paid OR financial_status:pending) AND fulfillment_status:unfulfilled") {{
             pageInfo {{
               hasNextPage
               endCursor
@@ -44,12 +51,21 @@ def import_orders(user_id):
                 id
                 name
                 createdAt
+                displayFinancialStatus
                 totalPriceSet {{ shopMoney {{ amount }} }}
                 customer {{ displayName }}
                 app {{ name }}
+                shippingLines(first: 5) {{
+                  edges {{
+                    node {{
+                      title
+                    }}
+                  }}
+                }}
                 lineItems(first: 50) {{
                   edges {{
                     node {{
+                      title
                       sku
                       quantity
                       variant {{ id }}
@@ -73,7 +89,6 @@ def import_orders(user_id):
             response.raise_for_status()
             data = response.json()
 
-            # 🔍 Se GraphQL ha errori
             if "errors" in data:
                 print("❌ Shopify GraphQL error:", data["errors"])
                 return jsonify({"error": "Errore GraphQL da Shopify", "details": data["errors"]}), 500
@@ -88,20 +103,42 @@ def import_orders(user_id):
 
         for edge in orders_data["edges"]:
             order = edge["node"]
-
             shopify_order_id = int(normalize_gid(order["id"]))
+
             exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
             if exists.data:
                 skipped += 1
                 continue
 
+            line_items = order["lineItems"]["edges"]
+            shipping_lines = order.get("shippingLines", {}).get("edges", [])
+            financial_status = order["displayFinancialStatus"]
+
+            # 🧠 Riconoscimento contrassegno
+            has_cod_fee = any(
+                any(kw in (item["node"]["title"] or "").lower() for kw in COD_KEYWORDS)
+                for item in line_items
+            ) or any(
+                (line["node"]["title"] or "").lower() == "spedizione non richiesta"
+                for line in shipping_lines
+            )
+
+            if financial_status == "PAID":
+                payment_status = "pagato"
+            elif financial_status == "PENDING" and has_cod_fee:
+                payment_status = "contrassegno"
+            else:
+                skipped += 1
+                continue
+
+            # ✅ Inserimento ordine
             order_resp = supabase.table("orders").insert({
                 "shopify_order_id": shopify_order_id,
                 "number": order["name"],
                 "customer_name": order["customer"]["displayName"] if order["customer"] else "Ospite",
                 "channel": order["app"]["name"] if order["app"] else "Online Store",
                 "created_at": order["createdAt"],
-                "payment_status": "pagato",
+                "payment_status": payment_status,
                 "fulfillment_status": "inevaso",
                 "total": float(order["totalPriceSet"]["shopMoney"]["amount"]),
                 "user_id": user_id
@@ -109,11 +146,13 @@ def import_orders(user_id):
 
             order_id = order_resp.data[0]["id"]
 
-            for item_edge in order["lineItems"]["edges"]:
+            # ➕ Aggiunta articoli ordine
+            for item_edge in line_items:
                 item = item_edge["node"]
                 variant = item.get("variant")
                 quantity = item.get("quantity", 1)
-                sku = item.get("sku") or ""
+                title = item.get("title") or ""
+                sku = item.get("sku") or title
                 shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                 product_id = None
 
@@ -130,6 +169,7 @@ def import_orders(user_id):
                     "quantity": quantity
                 }).execute()
 
+                # 🧮 Aggiorna quantità riservata
                 if product_id:
                     inv = supabase.table("inventory").select("riservato_sito").eq("product_id", product_id).single().execute()
                     current = inv.data.get("riservato_sito") or 0
@@ -138,6 +178,7 @@ def import_orders(user_id):
                     }).eq("product_id", product_id).execute()
                 else:
                     print(f"⚠️ Riga con variante non trovata → ordine {order['name']}, SKU: {sku}, qty: {quantity}")
+
 
             imported += 1
 
