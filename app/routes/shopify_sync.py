@@ -1,14 +1,11 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
 import os
 import httpx
 import certifi
-from datetime import datetime
-
-from app.routes.bulk_sync import normalize_gid
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
 
-shopify = Blueprint("shopify", __name__)
+orders = Blueprint("orders", __name__)
 
 SHOPIFY_GRAPHQL_URL = os.environ.get("SHOPIFY_GRAPHQL_URL")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
@@ -19,22 +16,32 @@ HEADERS = {
 }
 
 
-@shopify.route("/shopify/manual-sync-orders", methods=["POST"])
+def normalize_gid(gid) -> str:
+    gid = str(gid)
+    return gid.split("/")[-1] if "/" in gid else gid
+
+
+@orders.route("/shopify/import-orders", methods=["POST"])
 @require_auth
-def manual_sync_orders(user_id):
+def import_orders(user_id):
     imported = 0
     skipped = 0
     errors = []
     cursor = None
     has_next_page = True
 
-    from_date = "2025-03-01"
+    COD_KEYWORDS = [
+        "contrassegno",
+        "pagamento alla consegna",
+        "cash on delivery",
+        "commissione pagamento"
+    ]
 
     while has_next_page:
         after_clause = f', after: "{cursor}"' if cursor else ""
         query = f"""
         {{
-          orders(first: 50{after_clause}, query: "(created_at:>='{from_date}') AND (financial_status:paid OR financial_status:pending) AND fulfillment_status:unfulfilled") {{
+          orders(first: 50{after_clause}, query: "(created_at:>='2025-03-01') AND (financial_status:paid OR financial_status:pending) AND fulfillment_status:unfulfilled") {{
             pageInfo {{
               hasNextPage
               endCursor
@@ -44,16 +51,20 @@ def manual_sync_orders(user_id):
                 id
                 name
                 createdAt
-                fulfillmentStatus
+                displayFinancialStatus
+                fulfillments {{ status }}
                 totalPriceSet {{ shopMoney {{ amount }} }}
                 customer {{ displayName }}
                 app {{ name }}
+                shippingLines(first: 5) {{
+                  edges {{ node {{ title }} }}
+                }}
                 lineItems(first: 50) {{
                   edges {{
                     node {{
+                      title
                       sku
                       quantity
-                      title
                       variant {{ id }}
                     }}
                   }}
@@ -74,13 +85,10 @@ def manual_sync_orders(user_id):
                 )
             response.raise_for_status()
             data = response.json()
+            if "errors" in data:
+                return jsonify({"error": "GraphQL error", "details": data["errors"]}), 500
         except Exception as e:
-            print(f"❌ Shopify API error: {e}")
-            return jsonify({"error": "Errore nella chiamata a Shopify"}), 500
-
-        if "errors" in data:
-            print("❌ GraphQL error:", data["errors"])
-            return jsonify({"error": "Errore GraphQL", "details": data["errors"]}), 500
+            return jsonify({"error": str(e)}), 500
 
         orders_data = data["data"]["orders"]
         has_next_page = orders_data["pageInfo"]["hasNextPage"]
@@ -89,28 +97,49 @@ def manual_sync_orders(user_id):
         for edge in orders_data["edges"]:
             order = edge["node"]
             shopify_order_id = int(normalize_gid(order["id"]))
+            fulfillments = order.get("fulfillments", [])
+            is_fulfilled = any(f.get("status") == "FULFILLED" for f in fulfillments)
 
+            # Verifica se ordine esiste già
             exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
             if exists.data:
-                if order.get("fulfillmentStatus") == "FULFILLED":
+                if is_fulfilled:
                     order_id = exists.data[0]["id"]
-                    supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
-                    print(f"✅ Ordine {shopify_order_id} evaso via sync manuale.")
+                    supabase.rpc("evadi_ordine", { "ordine_id": order_id }).execute()
+                    print(f"✅ Ordine {shopify_order_id} evaso")
                 else:
                     skipped += 1
                 continue
 
-            # Sicurezza su campi opzionali
-            customer_name = (order.get("customer") or {}).get("displayName", "Ospite")
-            channel = (order.get("app") or {}).get("name", "Online Store")
+            line_items = order["lineItems"]["edges"]
+            shipping_lines = order.get("shippingLines", {}).get("edges", [])
+            financial_status = order["displayFinancialStatus"]
 
+            # Contrassegno
+            has_cod_fee = any(
+                any(kw in (item["node"]["title"] or "").lower() for kw in COD_KEYWORDS)
+                for item in line_items
+            ) or any(
+                (line["node"]["title"] or "").lower() == "spedizione non richiesta"
+                for line in shipping_lines
+            )
+
+            if financial_status == "PAID":
+                payment_status = "pagato"
+            elif financial_status == "PENDING" and has_cod_fee:
+                payment_status = "contrassegno"
+            else:
+                skipped += 1
+                continue
+
+            # Crea ordine
             order_resp = supabase.table("orders").insert({
                 "shopify_order_id": shopify_order_id,
                 "number": order["name"],
-                "customer_name": customer_name,
-                "channel": channel,
+                "customer_name": (order.get("customer") or {}).get("displayName", "Ospite"),
+                "channel": (order.get("app") or {}).get("name", "Online Store"),
                 "created_at": order["createdAt"],
-                "payment_status": "pagato",
+                "payment_status": payment_status,
                 "fulfillment_status": "inevaso",
                 "total": float(order["totalPriceSet"]["shopMoney"]["amount"]),
                 "user_id": user_id
@@ -118,12 +147,13 @@ def manual_sync_orders(user_id):
 
             order_id = order_resp.data[0]["id"]
 
-            for item_edge in order["lineItems"]["edges"]:
+            # Aggiungi articoli
+            for item_edge in line_items:
                 item = item_edge["node"]
-                variant_id = item.get("variant", {}).get("id")
-                shopify_variant_id = normalize_gid(variant_id) if variant_id else None
+                variant = item.get("variant")
                 quantity = item.get("quantity", 1)
                 sku = item.get("sku") or item.get("title") or "Senza SKU"
+                shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                 product_id = None
 
                 if shopify_variant_id:
@@ -140,15 +170,16 @@ def manual_sync_orders(user_id):
                 }).execute()
 
                 if product_id:
-                    supabase.rpc("adjust_inventory_after_fulfillment", {
-                        "pid": product_id,
-                        "delta": -quantity * -1
-                    }).execute()
+                    inv = supabase.table("inventory").select("riservato_sito").eq("product_id", product_id).single().execute()
+                    current = inv.data.get("riservato_sito") or 0
+                    supabase.table("inventory").update({
+                        "riservato_sito": current + quantity
+                    }).eq("product_id", product_id).execute()
 
             imported += 1
 
     return jsonify({
-        "status": "ok",
+        "status": "success",
         "imported": imported,
         "skipped": skipped,
         "errors": errors
