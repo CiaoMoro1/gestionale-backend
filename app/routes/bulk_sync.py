@@ -14,10 +14,10 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 # 🔧 Funzione per normalizzare GID Shopify
 def normalize_gid(gid) -> str:
-    gid = str(gid)  # 👈 forza cast a stringa
+    gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
 
-# 🔹 1. Bulk query (le immagini arrivano in righe separate)
+# 🔹 1. Bulk query (inclusi status e cost)
 BULK_QUERY = '''
 mutation {
   bulkOperationRunQuery(
@@ -31,10 +31,12 @@ mutation {
             sku
             barcode
             price
+            cost
             inventoryPolicy
             product {
               id
               title
+              status
               images(first: 1) {
                 edges {
                   node {
@@ -60,7 +62,6 @@ mutation {
   }
 }
 '''
-
 
 # 🔹 2. Avvia bulk
 @bulk_sync.route("/shopify/bulk-launch", methods=["POST"])
@@ -192,7 +193,9 @@ def fetch_bulk_data(user_id):
                     "image_url": entry["image_url"],
                     "price": float(variant.get("price") or 0),
                     "inventory_policy": variant.get("inventoryPolicy", ""),
-                    "user_id": user_id,
+                    "status": product.get("status", ""),
+                    "cost": float(variant.get("cost") or 0),
+                    "user_id": user_id
                 }
 
                 if upsert_variant(record):

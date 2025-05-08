@@ -15,11 +15,9 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-
 def normalize_gid(gid) -> str:
     gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
-
 
 @orders.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
@@ -100,7 +98,7 @@ def import_orders(user_id):
             fulfillments = order.get("fulfillments", [])
             is_fulfilled = any(f.get("status") == "FULFILLED" for f in fulfillments)
 
-            # Verifica se ordine esiste già
+            # Ordine già esistente?
             exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
             if exists.data:
                 if is_fulfilled:
@@ -115,7 +113,7 @@ def import_orders(user_id):
             shipping_lines = order.get("shippingLines", {}).get("edges", [])
             financial_status = order["displayFinancialStatus"]
 
-            # Contrassegno
+            # Rileva contrassegno
             has_cod_fee = any(
                 any(kw in (item["node"]["title"] or "").lower() for kw in COD_KEYWORDS)
                 for item in line_items
@@ -147,7 +145,7 @@ def import_orders(user_id):
 
             order_id = order_resp.data[0]["id"]
 
-            # Aggiungi articoli
+            # Aggiungi articoli (attiverà trigger riservato_sito)
             for item_edge in line_items:
                 item = item_edge["node"]
                 variant = item.get("variant")
@@ -169,12 +167,7 @@ def import_orders(user_id):
                     "quantity": quantity
                 }).execute()
 
-                if product_id:
-                    inv = supabase.table("inventory").select("riservato_sito").eq("product_id", product_id).single().execute()
-                    current = inv.data.get("riservato_sito") or 0
-                    supabase.table("inventory").update({
-                        "riservato_sito": current + quantity
-                    }).eq("product_id", product_id).execute()
+                # ✅ Non aggiornare manualmente riservato_sito! Lo farà il trigger.
 
             imported += 1
 

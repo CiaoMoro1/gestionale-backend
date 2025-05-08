@@ -42,13 +42,16 @@ def handle_product_update():
             "ean": variant.get("barcode", ""),
             "sku": variant.get("sku") or payload.get("sku") or "",
             "image_url": image_url,
+            # Solo se disponibili nei webhook:
+            "inventory_policy": variant.get("inventory_policy", ""),
+            "cost": float(variant.get("cost", 0)),
+            "status": payload.get("status", ""),  # spesso mancante
             "user_id": user_id,
         }
         upsert_variant(record)
 
     print(f"✅ Prodotto aggiornato: {product_title} ({product_id})")
     return jsonify({"status": "success", "imported": len(variants)}), 200
-
 
 # ✅ Webhook per products/delete
 @webhook.route("/webhook/product-delete", methods=["POST"])
@@ -65,7 +68,6 @@ def handle_product_delete():
     print(f"🗑️ Prodotto eliminato: {shopify_product_id} — {response}")
     return jsonify({"status": "deleted", "shopify_product_id": shopify_product_id}), 200
 
-
 # ✅ Webhook per order-create
 @webhook.route("/webhook/order-create", methods=["POST"])
 def handle_order_create():
@@ -76,15 +78,40 @@ def handle_order_create():
 
     payload = json.loads(raw_body)
     shopify_order_id = int(normalize_gid(payload["id"]))
-    financial_status = payload.get("financial_status")
+    financial_status = (payload.get("financial_status") or "").upper()
     fulfillment_status = payload.get("fulfillment_status")
 
-    print(f"🧾 Webhook ordine ricevuto: ID {shopify_order_id}")
-    print(f"📌 Status: {financial_status=} | {fulfillment_status=}")
+    line_items = payload.get("line_items", [])
+    shipping_lines = payload.get("shipping_lines", [])
 
-    if financial_status != "paid" or fulfillment_status not in [None, "unfulfilled"]:
+    COD_KEYWORDS = [
+        "contrassegno",
+        "pagamento alla consegna",
+        "cash on delivery",
+        "commissione pagamento"
+    ]
+
+    has_cod_fee = any(
+        any(kw in (item.get("title") or "").lower() for kw in COD_KEYWORDS)
+        for item in line_items
+    ) or any(
+        (line.get("title") or "").lower() == "spedizione non richiesta"
+        for line in shipping_lines
+    )
+
+    if financial_status == "PAID":
+        payment_status = "pagato"
+    elif financial_status == "PENDING" and has_cod_fee:
+        payment_status = "contrassegno"
+    else:
         print(f"⚠️ Ordine skippato: non valido per l'import.")
-        return jsonify({"status": "skipped", "reason": "not paid or already fulfilled"}), 200
+        return jsonify({"status": "skipped", "reason": "not paid or not COD"}), 200
+
+    if fulfillment_status not in [None, "unfulfilled"]:
+        print(f"⚠️ Ordine skippato: già evaso.")
+        return jsonify({"status": "skipped", "reason": "already fulfilled"}), 200
+
+
 
     exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
     if exists.data:
@@ -93,7 +120,6 @@ def handle_order_create():
 
     user_id = os.environ.get("DEFAULT_USER_ID", None)
 
-    # 👤 Recupero nome completo del cliente
     customer = payload.get("customer") or {}
     first_name = customer.get("first_name", "")
     last_name = customer.get("last_name", "")
@@ -139,8 +165,6 @@ def handle_order_create():
 
     print(f"🛒 Nuovo ordine importato: {shopify_order_id}")
     return jsonify({"status": "order created", "order_id": shopify_order_id}), 200
-
-
 
 # ✅ Webhook per order-update
 @webhook.route("/webhook/order-update", methods=["POST"])
@@ -192,8 +216,7 @@ def handle_order_update():
     print(f"🔁 Ordine aggiornato: {shopify_order_id}")
     return jsonify({"status": "updated", "order_id": order_id}), 200
 
-
-# ✅ Webhook per order-cancel
+# ✅ Webhook per order-cancel — versione corretta!
 @webhook.route("/webhook/order-cancel", methods=["POST"])
 def handle_order_cancel():
     raw_body = request.get_data()
@@ -211,16 +234,10 @@ def handle_order_cancel():
         print(f"🗑️ Ordine {shopify_order_id} non trovato → webhook ignorato.")
         return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
 
-    items = supabase.table("order_items").select("product_id, quantity").eq("order_id", order_id).execute()
-    for item in items.data:
-        if item["product_id"]:
-            inv = supabase.table("inventory").select("riservato_sito").eq("product_id", item["product_id"]).single().execute()
-            current = inv.data.get("riservato_sito") or 0
-            supabase.table("inventory").update({
-                "riservato_sito": max(0, current - item["quantity"])
-            }).eq("product_id", item["product_id"]).execute()
+    # ✅ Aggiorna solo lo status. Il trigger farà il resto.
+    supabase.table("orders").update({
+        "fulfillment_status": "annullato"
+    }).eq("id", order_id).execute()
 
-    supabase.table("orders").update({"fulfillment_status": "annullato"}).eq("id", order_id).execute()
-
-    print(f"🗑️ Ordine annullato e riservato aggiornato: {shopify_order_id}")
+    print(f"🗑️ Ordine annullato: {shopify_order_id}")
     return jsonify({"status": "cancelled", "order_id": order_id}), 200
