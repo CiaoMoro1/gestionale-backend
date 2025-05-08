@@ -135,7 +135,11 @@ def import_orders(user_id):
                         item = item_edge["node"]
                         variant = item.get("variant")
                         quantity = item.get("quantity", 1)
-                        price = float(item.get("price", 0)) if "price" in item else 0
+                        price = float(
+                            item.get("originalUnitPriceSet", {})
+                                .get("shopMoney", {})
+                                .get("amount", 0)
+                        )
                         sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
                         shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                         product_id = None
@@ -192,6 +196,8 @@ def import_orders(user_id):
                     item = item_edge["node"]
                     variant = item.get("variant")
                     quantity = item.get("quantity", 1)
+                    if quantity == 0:
+                        continue
                     price = float(item.get("price", 0)) if "price" in item else 0
                     sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
                     shopify_variant_id = normalize_gid(variant["id"]) if variant else None
