@@ -65,9 +65,11 @@ def import_orders(user_id):
                         title
                         sku
                         quantity
-                        originalUnitPrice {{
+                        originalUnitPriceSet {{
+                            shopMoney {{
                             amount
                             currencyCode
+                            }}
                         }}
                         variant {{ id }}
                         }}
