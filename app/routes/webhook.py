@@ -313,8 +313,13 @@ def handle_order_cancel():
     shopify_order_id = int(normalize_gid(payload.get("id")))
 
     try:
-        order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
-        order_id = order_resp.data["id"]
+        order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).limit(1).execute()
+        if not order_resp.data:
+            print(f"🔁 Ordine {shopify_order_id} non trovato → provo a importarlo.")
+            # ... fallback create logic ...
+        else:
+            order_id = order_resp.data[0]["id"]
+
     except Exception:
         print(f"🗑️ Ordine {shopify_order_id} non trovato → webhook ignorato.")
         return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
