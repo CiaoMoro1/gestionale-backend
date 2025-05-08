@@ -307,7 +307,8 @@ def handle_order_update():
             product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
             product_id = product.data[0]["id"] if product.data else None
 
-            existing = supabase.table("order_items").select("id").eq("order_id", order_id).eq("sku", sku).execute()
+            existing = supabase.table("order_items").select("id, quantity").eq("order_id", order_id).eq("sku", sku).single().execute()
+
             if not existing.data:
                 supabase.table("order_items").insert({
                     "order_id": order_id,
@@ -316,12 +317,21 @@ def handle_order_update():
                     "sku": sku,
                     "quantity": quantity
                 }).execute()
+                delta = quantity
+            else:
+                previous_qty = existing.data["quantity"]
+                delta = quantity - previous_qty
+                if delta != 0:
+                    supabase.table("order_items").update({
+                        "quantity": quantity
+                    }).eq("id", existing.data["id"]).execute()
 
-                if product_id:
-                    supabase.rpc("adjust_inventory_after_fulfillment", {
-                        "pid": product_id,
-                        "delta": -quantity * -1
-                    }).execute()
+            if product_id and delta != 0:
+                supabase.rpc("adjust_inventory_after_fulfillment", {
+                    "pid": product_id,
+                    "delta": delta
+                }).execute()
+
 
         if payload.get("fulfillment_status") == "fulfilled":
             supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
