@@ -175,8 +175,13 @@ def handle_order_update():
         abort(401, "Invalid HMAC")
 
     payload = json.loads(raw_body)
-    shopify_order_id = int(normalize_gid(payload.get("id")))
+    raw_id = payload.get("id")
+    if not raw_id:
+        print("❌ Webhook ricevuto senza ID ordine valido.")
+        return jsonify({"status": "skipped", "reason": "missing order ID"}), 400
 
+    shopify_order_id = int(normalize_gid(raw_id))
+    
     try:
         order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
         order_id = order_resp.data["id"]

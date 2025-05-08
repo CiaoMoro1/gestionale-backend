@@ -31,8 +31,10 @@ mutation {
             sku
             barcode
             price
-            cost
             inventoryPolicy
+            inventoryItem {
+              cost
+            }
             product {
               id
               title
@@ -194,9 +196,10 @@ def fetch_bulk_data(user_id):
                     "price": float(variant.get("price") or 0),
                     "inventory_policy": variant.get("inventoryPolicy", ""),
                     "status": product.get("status", ""),
-                    "cost": float(variant.get("cost") or 0),
+                    "cost": float(variant.get("inventoryItem", {}).get("cost") or 0),
                     "user_id": user_id
                 }
+
 
                 if upsert_variant(record):
                     count += 1
