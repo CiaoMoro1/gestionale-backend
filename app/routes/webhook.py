@@ -181,10 +181,9 @@ def handle_order_update():
 
     shopify_order_id = int(normalize_gid(raw_id))
 
-    order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
+    order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).limit(1).execute()
 
     if not order_resp.data:
-        # ➕ Ordine non esiste → tentativo di importazione se ora valido
         print(f"🔁 Ordine {shopify_order_id} non trovato → provo a importarlo.")
 
         financial_status = (payload.get("financial_status") or "").upper()
@@ -264,8 +263,7 @@ def handle_order_update():
 
         print(f"🆕 Ordine {shopify_order_id} creato da webhook update.")
     else:
-        # ✅ Ordine esiste → aggiorno articoli
-        order_id = order_resp.data["id"]
+        order_id = order_resp.data[0]["id"]
         items = payload.get("line_items", [])
 
         for item in items:
