@@ -89,8 +89,15 @@ def import_orders(user_id):
                 return jsonify({"error": "GraphQL error", "details": data["errors"]}), 500
         except Exception as e:
             import traceback
-            print("❌ ERRORE nel sync manuale:\n", traceback.format_exc())
-            return jsonify({"error": "Errore interno", "details": str(e)}), 500
+            error_details = traceback.format_exc()
+            print("❌ ERRORE nel sync manuale:\n", error_details)
+            return jsonify({
+                "status": "error",
+                "message": "Errore interno",
+                "details": str(e),
+                "trace": error_details
+            }), 500
+
 
         orders_data = data["data"]["orders"]
         has_next_page = orders_data["pageInfo"]["hasNextPage"]
