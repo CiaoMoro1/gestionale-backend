@@ -130,16 +130,18 @@ def handle_order_create():
         "created_at": payload.get("created_at"),
         "payment_status": payment_status,
         "fulfillment_status": "inevaso",
-        "total": float(payload.get("total_price", 0)),  # iniziale da Shopify
+        "total": 0,  # inizialmente 0, lo aggiorniamo sotto
         "user_id": user_id
     }).execute()
 
     order_id = order_resp.data[0]["id"]
+    totale = 0
 
     for item in line_items:
         shopify_variant_id = normalize_gid(item.get("variant_id"))
         quantity = item.get("quantity", 1)
-        sku = item.get("sku") or item.get("title") or "Senza SKU"
+        price = float(item.get("price", 0))  # 💰 Prezzo reale dell'ordine Shopify
+        sku = (item.get("sku") or item.get("title") or "Senza SKU").strip().upper()
         product_id = None
 
         product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
@@ -153,7 +155,8 @@ def handle_order_create():
             "shopify_variant_id": shopify_variant_id,
             "product_id": product_id,
             "sku": sku,
-            "quantity": quantity
+            "quantity": quantity,
+            "price": price  # se hai il campo
         }).execute()
 
         if product_id:
@@ -162,20 +165,14 @@ def handle_order_create():
                 "delta": quantity
             }).execute()
 
-    # 🔄 Ricalcola riservato_sito dopo inserimento ordine
+        totale += quantity * price
+
+    # 🔄 Ricalcola riservato_sito
     supabase.rpc("repair_riservato_by_order", {
         "ordine_id": order_id
     }).execute()
 
-    # 💰 Ricalcola totale in base ai prezzi attuali da products
-    totale = 0
-    order_items_resp = supabase.table("order_items").select("quantity, product_id").eq("order_id", order_id).execute()
-    for r in order_items_resp.data:
-        if r["product_id"]:
-            prezzo_resp = supabase.table("products").select("price").eq("id", r["product_id"]).single().execute()
-            price = float(prezzo_resp.data["price"]) if prezzo_resp.data and prezzo_resp.data["price"] else 0
-            totale += r["quantity"] * price
-
+    # 💰 Aggiorna il totale reale da Shopify
     supabase.table("orders").update({
         "total": totale
     }).eq("id", order_id).execute()
@@ -195,90 +192,69 @@ def handle_order_update():
 
     payload = json.loads(raw_body)
     raw_id = payload.get("id")
-    if not raw_id or not str(raw_id).isdigit():
-        print(f"❌ Webhook ricevuto senza ID ordine valido: {raw_id}")
-        return jsonify({"status": "skipped", "reason": "missing or invalid order ID"}), 400
+    if not raw_id:
+        print("❌ Webhook ricevuto senza ID ordine valido.")
+        return jsonify({"status": "skipped", "reason": "missing ID"}), 400
 
     shopify_order_id = int(normalize_gid(raw_id))
     order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).limit(1).execute()
 
     if not order_resp.data:
-        print(f"🔁 Ordine {shopify_order_id} non trovato → provo a importarlo.")
-        return handle_order_create()  # fallback alla create
-    else:
-        order_id = order_resp.data[0]["id"]
-        items = payload.get("line_items", [])
+        print(f"🔁 Ordine {shopify_order_id} non trovato → fallback a create.")
+        return handle_order_create()
 
-        existing_items_resp = supabase.table("order_items").select("id, sku, quantity").eq("order_id", order_id).execute()
-        existing_items = {item["sku"]: item for item in existing_items_resp.data}
-        updated_skus = set()
+    order_id = order_resp.data[0]["id"]
+    items = payload.get("line_items", [])
 
-        for item in items:
-            shopify_variant_id = normalize_gid(item.get("variant_id"))
-            sku = item.get("sku") or item.get("title") or "Senza SKU"
-            quantity = item.get("quantity", 1)
-            updated_skus.add(sku)
+    # 🔄 Cancella tutti gli articoli esistenti
+    supabase.table("order_items").delete().eq("order_id", order_id).execute()
 
-            product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
-            product_id = product.data[0]["id"] if product.data else None
-            existing = existing_items.get(sku)
-            delta = 0
+    totale = 0
 
-            if not existing:
-                supabase.table("order_items").insert({
-                    "order_id": order_id,
-                    "shopify_variant_id": shopify_variant_id,
-                    "product_id": product_id,
-                    "sku": sku,
-                    "quantity": quantity
-                }).execute()
-                delta = quantity
-            else:
-                previous_qty = existing["quantity"]
-                delta = quantity - previous_qty
-                if delta != 0:
-                    supabase.table("order_items").update({
-                        "quantity": quantity
-                    }).eq("id", existing["id"]).execute()
+    for item in items:
+        shopify_variant_id = normalize_gid(item.get("variant_id"))
+        sku = (item.get("sku") or item.get("title") or "Senza SKU").strip().upper()
+        quantity = item.get("quantity", 1)
+        price = float(item.get("price", 0))  # 💰 Prezzo preso da Shopify
 
-            if product_id and delta != 0:
-                supabase.rpc("adjust_inventory_after_fulfillment", {
-                    "pid": product_id,
-                    "delta": delta
-                }).execute()
+        product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+        product_id = product.data[0]["id"] if product.data else None
 
-        # 🔻 Rimuovi gli SKU non più presenti
-        to_delete = set(existing_items.keys()) - updated_skus
-        for sku in to_delete:
-            row = existing_items[sku]
-            supabase.table("order_items").delete().eq("id", row["id"]).execute()
-            print(f"🗑️ Rimosso SKU non più presente: {sku}")
-
-        # 📦 Evadi se necessario
-        if payload.get("fulfillment_status") == "fulfilled":
-            supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
-            print(f"✅ Ordine {shopify_order_id} evaso via webhook")
-
-        print(f"🔁 Ordine aggiornato: {shopify_order_id}")
-
-        # 🔄 Ricalcolo riservato
-        supabase.rpc("repair_riservato_by_order", {
-            "ordine_id": order_id
+        supabase.table("order_items").insert({
+            "order_id": order_id,
+            "shopify_variant_id": shopify_variant_id,
+            "product_id": product_id,
+            "sku": sku,
+            "quantity": quantity,
+            "price": price  # se hai la colonna, altrimenti rimuovi
         }).execute()
 
-        # 💰 Ricalcolo totale ordine
-        totale = 0
-        order_items_resp = supabase.table("order_items").select("quantity, product_id").eq("order_id", order_id).execute()
-        for r in order_items_resp.data:
-            if r["product_id"]:
-                prezzo = supabase.table("products").select("price").eq("id", r["product_id"]).single().execute()
-                totale += r["quantity"] * float(prezzo.data["price"] or 0)
+        if product_id:
+            supabase.rpc("adjust_inventory_after_fulfillment", {
+                "pid": product_id,
+                "delta": quantity
+            }).execute()
 
-        supabase.table("orders").update({
-            "total": totale
-        }).eq("id", order_id).execute()
+        totale += quantity * price
 
-        return jsonify({"status": "updated", "order_id": shopify_order_id}), 200
+    # 📦 Evadi se necessario
+    if payload.get("fulfillment_status") == "fulfilled":
+        supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
+        print(f"✅ Ordine {shopify_order_id} evaso via webhook")
+
+    # 🔄 Ricalcola riservato_sito
+    supabase.rpc("repair_riservato_by_order", {
+        "ordine_id": order_id
+    }).execute()
+
+    # 💰 Aggiorna totale
+    supabase.table("orders").update({
+        "total": totale
+    }).eq("id", order_id).execute()
+
+    print(f"🔁 Ordine aggiornato correttamente: {shopify_order_id}")
+    return jsonify({"status": "updated", "order_id": order_id}), 200
+
 
 
 

@@ -24,6 +24,7 @@ def normalize_gid(gid) -> str:
 def import_orders(user_id):
     imported = 0
     skipped = 0
+    updated = 0
     errors = []
     cursor = None
     has_next_page = True
@@ -63,6 +64,7 @@ def import_orders(user_id):
                       title
                       sku
                       quantity
+                      price
                       variant {{ id }}
                     }}
                   }}
@@ -74,7 +76,7 @@ def import_orders(user_id):
         """
 
         try:
-            with httpx.Client(verify=False) as client:
+            with httpx.Client(verify=certifi.where()) as client:
                 response = client.post(
                     SHOPIFY_GRAPHQL_URL,
                     headers=HEADERS,
@@ -98,22 +100,12 @@ def import_orders(user_id):
             fulfillments = order.get("fulfillments", [])
             is_fulfilled = any(f.get("status") == "FULFILLED" for f in fulfillments)
 
-            # Ordine già esistente?
             exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
-            if exists.data:
-                if is_fulfilled:
-                    order_id = exists.data[0]["id"]
-                    supabase.rpc("evadi_ordine", { "ordine_id": order_id }).execute()
-                    print(f"✅ Ordine {shopify_order_id} evaso")
-                else:
-                    skipped += 1
-                continue
 
             line_items = order["lineItems"]["edges"]
             shipping_lines = order.get("shippingLines", {}).get("edges", [])
             financial_status = order["displayFinancialStatus"]
 
-            # Rileva contrassegno
             has_cod_fee = any(
                 any(kw in (item["node"]["title"] or "").lower() for kw in COD_KEYWORDS)
                 for item in line_items
@@ -130,7 +122,56 @@ def import_orders(user_id):
                 skipped += 1
                 continue
 
-            # Crea ordine
+            if exists.data:
+                order_id = exists.data[0]["id"]
+
+                # 🔄 Cancella gli order_items esistenti
+                supabase.table("order_items").delete().eq("order_id", order_id).execute()
+                totale = 0
+
+                for item_edge in line_items:
+                    item = item_edge["node"]
+                    variant = item.get("variant")
+                    quantity = item.get("quantity", 1)
+                    price = float(item.get("price", 0)) if "price" in item else 0
+                    sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
+                    shopify_variant_id = normalize_gid(variant["id"]) if variant else None
+                    product_id = None
+
+                    if shopify_variant_id:
+                        product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+                        if product.data:
+                            product_id = product.data[0]["id"]
+
+                    supabase.table("order_items").insert({
+                        "order_id": order_id,
+                        "shopify_variant_id": shopify_variant_id,
+                        "product_id": product_id,
+                        "sku": sku,
+                        "quantity": quantity,
+                        "price": price
+                    }).execute()
+
+                    if product_id:
+                        supabase.rpc("adjust_inventory_after_fulfillment", {
+                            "pid": product_id,
+                            "delta": quantity
+                        }).execute()
+
+                    totale += quantity * price
+
+                if is_fulfilled:
+                    supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
+                    print(f"✅ Ordine aggiornato e evaso: {shopify_order_id}")
+
+                supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+                supabase.table("orders").update({"total": totale}).eq("id", order_id).execute()
+
+                updated += 1
+                print(f"🔁 Ordine aggiornato: {shopify_order_id}")
+                continue
+
+            # ✨ Ordine nuovo
             order_resp = supabase.table("orders").insert({
                 "shopify_order_id": shopify_order_id,
                 "number": order["name"],
@@ -145,12 +186,12 @@ def import_orders(user_id):
 
             order_id = order_resp.data[0]["id"]
 
-            # Aggiungi articoli (attiverà trigger riservato_sito)
             for item_edge in line_items:
                 item = item_edge["node"]
                 variant = item.get("variant")
                 quantity = item.get("quantity", 1)
-                sku = item.get("sku") or item.get("title") or "Senza SKU"
+                price = float(item.get("price", 0)) if "price" in item else 0
+                sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
                 shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                 product_id = None
 
@@ -164,16 +205,19 @@ def import_orders(user_id):
                     "shopify_variant_id": shopify_variant_id,
                     "product_id": product_id,
                     "sku": sku,
-                    "quantity": quantity
+                    "quantity": quantity,
+                    "price": price
                 }).execute()
 
-                # ✅ Non aggiornare manualmente riservato_sito! Lo farà il trigger.
+            supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
 
             imported += 1
+            print(f"🆕 Ordine importato: {shopify_order_id}")
 
     return jsonify({
         "status": "success",
         "imported": imported,
+        "updated": updated,
         "skipped": skipped,
         "errors": errors
     }), 200
