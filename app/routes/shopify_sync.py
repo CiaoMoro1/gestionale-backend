@@ -41,13 +41,13 @@ def import_orders(user_id):
             after_clause = f', after: "{cursor}"' if cursor else ""
             query = f"""
             {{
-              orders(first: 50{after_clause}, query: "(created_at:>='2025-03-01') AND (financial_status:paid OR financial_status:pending) AND fulfillment_status:unfulfilled") {{
+            orders(first: 50{after_clause}, query: "(created_at:>='2025-03-01') AND (financial_status:paid OR financial_status:pending) AND fulfillment_status:unfulfilled") {{
                 pageInfo {{
-                  hasNextPage
-                  endCursor
+                hasNextPage
+                endCursor
                 }}
                 edges {{
-                  node {{
+                node {{
                     id
                     name
                     createdAt
@@ -57,24 +57,28 @@ def import_orders(user_id):
                     customer {{ displayName }}
                     app {{ name }}
                     shippingLines(first: 5) {{
-                      edges {{ node {{ title }} }}
+                    edges {{ node {{ title }} }}
                     }}
                     lineItems(first: 50) {{
-                      edges {{
+                    edges {{
                         node {{
-                          title
-                          sku
-                          quantity
-                          price
-                          variant {{ id }}
+                        title
+                        sku
+                        quantity
+                        originalUnitPrice {{
+                            amount
+                            currencyCode
                         }}
-                      }}
+                        variant {{ id }}
+                        }}
                     }}
-                  }}
+                    }}
                 }}
-              }}
+                }}
+            }}
             }}
             """
+
 
             with httpx.Client(verify=False) as client:
                 response = client.post(
