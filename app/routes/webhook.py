@@ -44,7 +44,6 @@ def handle_product_update():
             "image_url": image_url,
             # Solo se disponibili nei webhook:
             "inventory_policy": variant.get("inventory_policy", ""),
-            "cost": float(variant.get("cost", 0)),
             "status": payload.get("status", ""),  # spesso mancante
             "user_id": user_id,
         }
@@ -181,25 +180,74 @@ def handle_order_update():
         return jsonify({"status": "skipped", "reason": "missing order ID"}), 400
 
     shopify_order_id = int(normalize_gid(raw_id))
-    
-    try:
-        order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
-        order_id = order_resp.data["id"]
-    except Exception:
-        print(f"🔁 Ordine {shopify_order_id} non trovato → webhook ignorato.")
-        return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
 
-    items = payload.get("line_items", [])
-    for item in items:
-        shopify_variant_id = normalize_gid(item.get("variant_id"))
-        sku = item.get("sku") or item.get("title") or "Senza SKU"
-        quantity = item.get("quantity", 1)
+    order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).single().execute()
 
-        product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
-        product_id = product.data[0]["id"] if product.data else None
+    if not order_resp.data:
+        # ➕ Ordine non esiste → tentativo di importazione se ora valido
+        print(f"🔁 Ordine {shopify_order_id} non trovato → provo a importarlo.")
 
-        existing = supabase.table("order_items").select("id").eq("order_id", order_id).eq("sku", sku).execute()
-        if not existing.data:
+        financial_status = (payload.get("financial_status") or "").upper()
+        fulfillment_status = payload.get("fulfillment_status")
+
+        line_items = payload.get("line_items", [])
+        shipping_lines = payload.get("shipping_lines", [])
+
+        COD_KEYWORDS = [
+            "contrassegno",
+            "pagamento alla consegna",
+            "cash on delivery",
+            "commissione pagamento"
+        ]
+
+        has_cod_fee = any(
+            any(kw in (item.get("title") or "").lower() for kw in COD_KEYWORDS)
+            for item in line_items
+        ) or any(
+            (line.get("title") or "").lower() == "spedizione non richiesta"
+            for line in shipping_lines
+        )
+
+        if financial_status == "PAID":
+            payment_status = "pagato"
+        elif financial_status == "PENDING" and has_cod_fee:
+            payment_status = "contrassegno"
+        else:
+            print(f"⚠️ Fallback: ordine ancora non valido per importazione.")
+            return jsonify({"status": "skipped", "reason": "not paid or not COD"}), 200
+
+        if fulfillment_status not in [None, "unfulfilled"]:
+            print(f"⚠️ Fallback: ordine già evaso, non importato.")
+            return jsonify({"status": "skipped", "reason": "already fulfilled"}), 200
+
+        user_id = os.environ.get("DEFAULT_USER_ID", None)
+        customer = payload.get("customer") or {}
+        first_name = customer.get("first_name", "")
+        last_name = customer.get("last_name", "")
+        customer_name = f"{first_name} {last_name}".strip() or "Ospite"
+
+        order_insert = supabase.table("orders").insert({
+            "shopify_order_id": shopify_order_id,
+            "number": payload.get("name"),
+            "customer_name": customer_name,
+            "channel": (payload.get("app") or {}).get("name", "Online Store"),
+            "created_at": payload.get("created_at"),
+            "payment_status": payment_status,
+            "fulfillment_status": "inevaso",
+            "total": float(payload.get("total_price", 0)),
+            "user_id": user_id
+        }).execute()
+
+        order_id = order_insert.data[0]["id"]
+
+        for item in line_items:
+            shopify_variant_id = normalize_gid(item.get("variant_id"))
+            quantity = item.get("quantity", 1)
+            sku = item.get("sku") or item.get("title") or "Senza SKU"
+
+            product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+            product_id = product.data[0]["id"] if product.data else None
+
             supabase.table("order_items").insert({
                 "order_id": order_id,
                 "shopify_variant_id": shopify_variant_id,
@@ -214,12 +262,44 @@ def handle_order_update():
                     "delta": -quantity * -1
                 }).execute()
 
-    if payload.get("fulfillment_status") == "fulfilled":
-        supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
-        print(f"✅ Ordine {shopify_order_id} evaso via webhook")
+        print(f"🆕 Ordine {shopify_order_id} creato da webhook update.")
+    else:
+        # ✅ Ordine esiste → aggiorno articoli
+        order_id = order_resp.data["id"]
+        items = payload.get("line_items", [])
 
-    print(f"🔁 Ordine aggiornato: {shopify_order_id}")
-    return jsonify({"status": "updated", "order_id": order_id}), 200
+        for item in items:
+            shopify_variant_id = normalize_gid(item.get("variant_id"))
+            sku = item.get("sku") or item.get("title") or "Senza SKU"
+            quantity = item.get("quantity", 1)
+
+            product = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+            product_id = product.data[0]["id"] if product.data else None
+
+            existing = supabase.table("order_items").select("id").eq("order_id", order_id).eq("sku", sku).execute()
+            if not existing.data:
+                supabase.table("order_items").insert({
+                    "order_id": order_id,
+                    "shopify_variant_id": shopify_variant_id,
+                    "product_id": product_id,
+                    "sku": sku,
+                    "quantity": quantity
+                }).execute()
+
+                if product_id:
+                    supabase.rpc("adjust_inventory_after_fulfillment", {
+                        "pid": product_id,
+                        "delta": -quantity * -1
+                    }).execute()
+
+        if payload.get("fulfillment_status") == "fulfilled":
+            supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
+            print(f"✅ Ordine {shopify_order_id} evaso via webhook")
+
+        print(f"🔁 Ordine aggiornato: {shopify_order_id}")
+
+    return jsonify({"status": "updated", "order_id": shopify_order_id}), 200
+
 
 # ✅ Webhook per order-cancel — versione corretta!
 @webhook.route("/webhook/order-cancel", methods=["POST"])

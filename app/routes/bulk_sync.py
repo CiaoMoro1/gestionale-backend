@@ -196,7 +196,6 @@ def fetch_bulk_data(user_id):
                     "price": float(variant.get("price") or 0),
                     "inventory_policy": variant.get("inventoryPolicy", ""),
                     "status": product.get("status", ""),
-                    "cost": float(variant.get("inventoryItem", {}).get("cost") or 0),
                     "user_id": user_id
                 }
 
