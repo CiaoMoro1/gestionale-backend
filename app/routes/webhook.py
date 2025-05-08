@@ -110,8 +110,6 @@ def handle_order_create():
         print(f"⚠️ Ordine skippato: già evaso.")
         return jsonify({"status": "skipped", "reason": "already fulfilled"}), 200
 
-
-
     exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
     if exists.data:
         print(f"⛔ Ordine già presente: {shopify_order_id}")
@@ -130,15 +128,15 @@ def handle_order_create():
         "customer_name": customer_name,
         "channel": (payload.get("app") or {}).get("name", "Online Store"),
         "created_at": payload.get("created_at"),
-        "payment_status": "pagato",
+        "payment_status": payment_status,
         "fulfillment_status": "inevaso",
-        "total": float(payload.get("total_price", 0)),
+        "total": float(payload.get("total_price", 0)),  # iniziale da Shopify
         "user_id": user_id
     }).execute()
 
     order_id = order_resp.data[0]["id"]
 
-    for item in payload.get("line_items", []):
+    for item in line_items:
         shopify_variant_id = normalize_gid(item.get("variant_id"))
         quantity = item.get("quantity", 1)
         sku = item.get("sku") or item.get("title") or "Senza SKU"
@@ -162,8 +160,26 @@ def handle_order_create():
                 "delta": -quantity * -1
             }).execute()
 
+    # 🔄 Ricalcola riservato_sito dopo inserimento ordine
+    supabase.rpc("repair_riservato_by_order", {
+        "ordine_id": order_id
+    }).execute()
+
+    # 💰 Ricalcola totale in base ai prezzi attuali da products
+    totale = 0
+    order_items_resp = supabase.table("order_items").select("quantity, product_id").eq("order_id", order_id).execute()
+    for r in order_items_resp.data:
+        if r["product_id"]:
+            prezzo = supabase.table("products").select("price").eq("id", r["product_id"]).single().execute()
+            totale += r["quantity"] * float(prezzo.data["price"] or 0)
+
+    supabase.table("orders").update({
+        "total": totale
+    }).eq("id", order_id).execute()
+
     print(f"🛒 Nuovo ordine importato: {shopify_order_id}")
-    return jsonify({"status": "order created", "order_id": shopify_order_id}), 200
+    return jsonify({"status": "order created", "order_id": order_id}), 200
+
 
 # ✅ Webhook per order-update
 @webhook.route("/webhook/order-update", methods=["POST"])
@@ -261,6 +277,23 @@ def handle_order_update():
                     "delta": -quantity * -1
                 }).execute()
 
+        # 🔄 Ricalcola riservato_sito
+        supabase.rpc("repair_riservato_by_order", {
+            "ordine_id": order_id
+        }).execute()
+
+        # 💰 Ricalcola totale ordine
+        totale = 0
+        order_items_resp = supabase.table("order_items").select("quantity, product_id").eq("order_id", order_id).execute()
+        for r in order_items_resp.data:
+            if r["product_id"]:
+                prezzo = supabase.table("products").select("price").eq("id", r["product_id"]).single().execute()
+                totale += r["quantity"] * float(prezzo.data["price"] or 0)
+
+        supabase.table("orders").update({
+            "total": totale
+        }).eq("id", order_id).execute()
+
         print(f"🆕 Ordine {shopify_order_id} creato da webhook update.")
     else:
         order_id = order_resp.data[0]["id"]
@@ -296,6 +329,23 @@ def handle_order_update():
 
         print(f"🔁 Ordine aggiornato: {shopify_order_id}")
 
+        # 🔄 Ricalcola riservato_sito
+        supabase.rpc("repair_riservato_by_order", {
+            "ordine_id": order_id
+        }).execute()
+
+        # 💰 Ricalcola totale ordine
+        totale = 0
+        order_items_resp = supabase.table("order_items").select("quantity, product_id").eq("order_id", order_id).execute()
+        for r in order_items_resp.data:
+            if r["product_id"]:
+                prezzo = supabase.table("products").select("price").eq("id", r["product_id"]).single().execute()
+                totale += r["quantity"] * float(prezzo.data["price"] or 0)
+
+        supabase.table("orders").update({
+            "total": totale
+        }).eq("id", order_id).execute()
+
     return jsonify({"status": "updated", "order_id": shopify_order_id}), 200
 
 
@@ -313,14 +363,14 @@ def handle_order_cancel():
     try:
         order_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).limit(1).execute()
         if not order_resp.data:
-            print(f"🔁 Ordine {shopify_order_id} non trovato → provo a importarlo.")
-            # ... fallback create logic ...
-        else:
-            order_id = order_resp.data[0]["id"]
+            print(f"🛑 Ordine {shopify_order_id} non trovato → impossibile annullarlo.")
+            return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
 
-    except Exception:
-        print(f"🗑️ Ordine {shopify_order_id} non trovato → webhook ignorato.")
-        return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
+        order_id = order_resp.data[0]["id"]
+
+    except Exception as e:
+        print(f"🗑️ Errore nel recupero ordine {shopify_order_id}: {e}")
+        return jsonify({"status": "error", "reason": "errore durante il recupero ordine"}), 500
 
     # ✅ Aggiorna solo lo status. Il trigger farà il resto.
     supabase.table("orders").update({
