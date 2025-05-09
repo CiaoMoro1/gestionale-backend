@@ -133,7 +133,15 @@ def import_orders(user_id):
                     existing_items = existing_items_resp.data or []
                     existing_map = {item["shopify_variant_id"]: item for item in existing_items}
 
-                    new_variant_ids = [normalize_gid(i["node"].get("variant", {}).get("id")) for i in line_items]
+                    new_variant_ids = []
+                    for i in line_items:
+                        node = i.get("node")
+                        if not node:
+                            continue
+                        variant = node.get("variant") or {}
+                        variant_id = normalize_gid(variant.get("id")) if variant else None
+                        if variant_id:
+                            new_variant_ids.append(variant_id)
                     for variant_id, item in existing_map.items():
                         if variant_id not in new_variant_ids and item["product_id"]:
                             supabase.table("movements").insert({
