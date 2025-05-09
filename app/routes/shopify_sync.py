@@ -1,4 +1,12 @@
-from flask import Blueprint, jsonify, request
+"""Manual sync of Shopify orders → Supabase.
+Pulito secondo le nuove regole 2025:
+- ❌ Nessuna tabella `movements`
+- ❌ Nessuna logica `delta`
+- ✅ Supporto item senza `variant_id`
+- ✅ Aggiornamento/creazione ordini + articoli + fix `riservato`
+"""
+
+from flask import Blueprint, jsonify, request, abort
 import json
 import os
 import httpx
@@ -13,27 +21,32 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 HEADERS = {
     "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
-def normalize_gid(gid) -> str:
+
+def normalize_gid(gid: str | int | None) -> str:
+    """Converte un Global ID Shopify nel suo numeric ID."""
+    if gid is None:
+        return ""
     gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
+
 
 @orders.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
 def import_orders(user_id):
     try:
-        imported = 0
-        skipped = 0
-        updated = 0
-        errors = []
-        cursor = None
-        has_next_page = True
+        imported, updated, skipped = 0, 0, 0
+        errors: list[str] = []
+        cursor: str | None = None
+        has_next_page: bool = True
 
         COD_KEYWORDS = [
-            "contrassegno", "pagamento alla consegna",
-            "cash on delivery", "commissione pagamento"
+            "contrassegno",
+            "pagamento alla consegna",
+            "cash on delivery",
+            "commissione pagamento",
         ]
 
         while has_next_page:
@@ -64,12 +77,7 @@ def import_orders(user_id):
                           title
                           sku
                           quantity
-                          originalUnitPriceSet {{
-                            shopMoney {{
-                              amount
-                              currencyCode
-                            }}
-                          }}
+                          originalUnitPriceSet {{ shopMoney {{ amount currencyCode }} }}
                           variant {{ id }}
                         }}
                       }}
@@ -80,10 +88,12 @@ def import_orders(user_id):
             }}
             """
 
-            with httpx.Client(verify=False) as client:
-                response = client.post(SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query}, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
+            with httpx.Client(verify=certifi.where(), timeout=10.0) as client:
+                resp = client.post(
+                    SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query}
+                )
+            resp.raise_for_status()
+            data = resp.json()
 
             if "errors" in data:
                 raise Exception(f"GraphQL error: {data['errors']}")
@@ -95,30 +105,23 @@ def import_orders(user_id):
             for edge in orders_data["edges"]:
                 order = edge["node"]
                 shopify_order_id = int(normalize_gid(order["id"]))
-                fulfillments = order.get("fulfillments", [])
-                is_fulfilled = any(f.get("status") == "FULFILLED" for f in fulfillments)
 
-                exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
+                fulfillment_statuses = order.get("fulfillments", [])
+                is_fulfilled = any(f.get("status") == "FULFILLED" for f in fulfillment_statuses)
+
+                exists_resp = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
+                order_exists = bool(exists_resp.data)
+                order_id = exists_resp.data[0]["id"] if order_exists else None
 
                 line_items = order["lineItems"]["edges"]
-                print(f"🔎 Ordine Shopify ID {shopify_order_id} ha {len(line_items)} item")
-                if not line_items:
-                    order_id = exists.data[0]["id"]
-                    supabase.table("order_items").delete().eq("order_id", order_id).execute()
-                    supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
-                    supabase.table("orders").update({"total": 0}).eq("id", order_id).execute()
-                    print(f"🗑️ Ordine {shopify_order_id} svuotato (0 articoli)")
-                    updated += 1
-                    continue
                 shipping_lines = order.get("shippingLines", {}).get("edges", [])
                 financial_status = order["displayFinancialStatus"]
 
                 has_cod_fee = any(
-                    any(kw in (item["node"]["title"] or "").lower() for kw in COD_KEYWORDS)
-                    for item in line_items
+                    any(kw in (i["node"].get("title") or "").lower() for kw in COD_KEYWORDS)
+                    for i in line_items
                 ) or any(
-                    (line["node"]["title"] or "").lower() == "spedizione non richiesta"
-                    for line in shipping_lines
+                    (l["node"].get("title") or "").lower() == "spedizione non richiesta" for l in shipping_lines
                 )
 
                 if financial_status == "PAID":
@@ -129,67 +132,38 @@ def import_orders(user_id):
                     skipped += 1
                     continue
 
-                # ------------------ AGGIORNA ORDINE ESISTENTE ------------------
-                if exists.data:
-                    order_id = exists.data[0]["id"]
+                # ------------------------------------------------------------------
+                # ORDINE ESISTENTE → UPDATE
+                # ------------------------------------------------------------------
+                if order_exists:
+                    # Se l'ordine in Shopify è rimasto senza articoli, svuotalo in Supabase
+                    if not line_items:
+                        supabase.table("order_items").delete().eq("order_id", order_id).execute()
+                        supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+                        supabase.table("orders").update({"total": 0}).eq("id", order_id).execute()
+                        updated += 1
+                        continue
 
-                    # 🧾 Carica articoli esistenti
-                    existing_items_resp = supabase.table("order_items") \
-                        .select("shopify_variant_id, quantity, product_id") \
-                        .eq("order_id", order_id).execute()
-                    existing_items = existing_items_resp.data or []
-                    existing_map = {item["shopify_variant_id"]: item for item in existing_items}
-
-                    # ✅ Trova variant_id attuali da Shopify
-                    new_variant_ids = []
-                    for i in line_items:
-                        node = i.get("node")
-                        if not node or node.get("quantity", 1) == 0:
-                            continue  # ✅ ignora se quantity è 0
-                        variant = node.get("variant")
-                        if not variant:
-                            continue
-                        variant_id = normalize_gid(variant.get("id"))
-                        if variant_id:
-                            new_variant_ids.append(variant_id)
-
-
-                    # 🗑️ Rimuovi articoli non più presenti
-                    for variant_id, item in existing_map.items():
-                        if variant_id not in new_variant_ids and item["product_id"]:
-                            supabase.table("movements").insert({
-                                "product_id": item["product_id"],
-                                "delta": -item["quantity"],
-                                "source": "manual-sync",
-                                "user_id": user_id
-                            }).execute()
-
-                    # 🔄 Elimina tutti i vecchi articoli
+                    # 🔄 Pulisci gli articoli esistenti e reinserisci quelli attuali
                     supabase.table("order_items").delete().eq("order_id", order_id).execute()
 
-                    # ➕ Reinserisci nuovi articoli
-                    # ➕ Reinserisci nuovi articoli (solo con quantità > 0)
                     for item_edge in line_items:
                         item = item_edge["node"]
                         quantity = item.get("quantity", 1)
-                        print("➡️ Processing item:", item.get("title"), "| Quantity:", quantity)
-                        print("🔢 RAW ITEM:", json.dumps(item, indent=2))
                         if quantity == 0:
-                            print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
                             continue
 
                         variant = item.get("variant")
-                        if not variant:
-                            continue
-                        shopify_variant_id = normalize_gid(variant.get("id"))
-                        price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
+                        variant_id_raw = variant.get("id") if variant else None
                         sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
+                        shopify_variant_id = normalize_gid(variant_id_raw) if variant_id_raw else f"no-variant-{sku}"
+                        price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
                         product_id = None
 
-                        product = supabase.table("products").select("id") \
-                            .eq("shopify_variant_id", shopify_variant_id).execute()
-                        if product.data:
-                            product_id = product.data[0]["id"]
+                        if variant_id_raw:
+                            prod_resp = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+                            if prod_resp.data:
+                                product_id = prod_resp.data[0]["id"]
 
                         supabase.table("order_items").insert({
                             "order_id": order_id,
@@ -197,41 +171,31 @@ def import_orders(user_id):
                             "product_id": product_id,
                             "sku": sku,
                             "quantity": quantity,
-                            "price": price
+                            "price": price,
                         }).execute()
 
+                        # Inventario: decrementa quantità se necessario
                         if product_id:
-                            old = existing_map.get(shopify_variant_id)
-                            delta = quantity - old["quantity"] if old else quantity
-                            if delta != 0:
-                                supabase.table("movements").insert({
-                                    "product_id": product_id,
-                                    "delta": delta,
-                                    "source": "manual-sync",
-                                    "user_id": user_id
-                                }).execute()
+                            supabase.rpc("adjust_inventory_after_fulfillment", {"pid": product_id, "delta": quantity}).execute()
 
-                            supabase.rpc("adjust_inventory_after_fulfillment", {
-                                "pid": product_id,
-                                "delta": quantity
-                            }).execute()
-
-
+                    # Evadi ordine se risultasse già fulfilled su Shopify
                     if is_fulfilled:
                         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
-                        print(f"✅ Ordine aggiornato e evaso: {shopify_order_id}")
 
-                    supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+                    # Aggiorna metadata ordine
                     supabase.table("orders").update({
-                        "total": float(order["totalPriceSet"]["shopMoney"]["amount"])
+                        "payment_status": payment_status,
+                        "fulfillment_status": "evaso" if is_fulfilled else "inevaso",
+                        "total": float(order["totalPriceSet"]["shopMoney"]["amount"]),
                     }).eq("id", order_id).execute()
 
+                    supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
                     updated += 1
-                    print(f"🔁 Ordine aggiornato: {shopify_order_id}")
                     continue
 
-
-                # ------------------ NUOVO ORDINE ------------------
+                # ------------------------------------------------------------------
+                # NUOVO ORDINE → INSERT
+                # ------------------------------------------------------------------
                 order_resp = supabase.table("orders").insert({
                     "shopify_order_id": shopify_order_id,
                     "number": order["name"],
@@ -239,9 +203,9 @@ def import_orders(user_id):
                     "channel": (order.get("app") or {}).get("name", "Online Store"),
                     "created_at": order["createdAt"],
                     "payment_status": payment_status,
-                    "fulfillment_status": "inevaso",
+                    "fulfillment_status": "evaso" if is_fulfilled else "inevaso",
                     "total": float(order["totalPriceSet"]["shopMoney"]["amount"]),
-                    "user_id": user_id
+                    "user_id": user_id,
                 }).execute()
 
                 order_id = order_resp.data[0]["id"]
@@ -249,23 +213,20 @@ def import_orders(user_id):
                 for item_edge in line_items:
                     item = item_edge["node"]
                     quantity = item.get("quantity", 1)
-                    print("➡️ Processing item:", item.get("title"), "| Quantity:", quantity)
-                    print("🔢 RAW ITEM:", json.dumps(item, indent=2))
                     if quantity == 0:
-                        print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
                         continue
 
                     variant = item.get("variant")
-                    price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
+                    variant_id_raw = variant.get("id") if variant else None
                     sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
-                    shopify_variant_id = normalize_gid(variant["id"]) if variant else None
+                    shopify_variant_id = normalize_gid(variant_id_raw) if variant_id_raw else f"no-variant-{sku}"
+                    price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
                     product_id = None
 
-                    if shopify_variant_id:
-                        product = supabase.table("products").select("id") \
-                            .eq("shopify_variant_id", shopify_variant_id).execute()
-                        if product.data:
-                            product_id = product.data[0]["id"]
+                    if variant_id_raw:
+                        prod_resp = supabase.table("products").select("id").eq("shopify_variant_id", shopify_variant_id).execute()
+                        if prod_resp.data:
+                            product_id = prod_resp.data[0]["id"]
 
                     supabase.table("order_items").insert({
                         "order_id": order_id,
@@ -273,36 +234,44 @@ def import_orders(user_id):
                         "product_id": product_id,
                         "sku": sku,
                         "quantity": quantity,
-                        "price": price
+                        "price": price,
                     }).execute()
 
+                    if product_id:
+                        supabase.rpc("adjust_inventory_after_fulfillment", {"pid": product_id, "delta": quantity}).execute()
 
                 supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
                 imported += 1
-                print(f"🆕 Ordine importato: {shopify_order_id}")
 
-        return jsonify({
-            "status": "success",
-            "imported": imported,
-            "updated": updated,
-            "skipped": skipped,
-            "errors": errors
-        }), 200
+        return (
+            jsonify(
+                {
+                    "status": "success",
+                    "imported": imported,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "errors": errors,
+                }
+            ),
+            200,
+        )
 
-    except Exception as e:
+    except Exception as exc:  # pragma: no cover — errore generico visibile nel log
         import traceback
-        error_trace = traceback.format_exc()
-        print("❌ ERRORE nel sync manuale:")
-        print("📄 Tipo:", type(e).__name__)
-        print("💬 Messaggio:", str(e))
-        print("🧵 Traceback:\\n", error_trace)
 
-        return jsonify({
-            "status": "error",
-            "message": f"Errore interno: {type(e).__name__}",
-            "details": str(e),
-            "trace": error_trace
-        }), 500
+        trace = traceback.format_exc()
+        print("❌ ERRORE manual-sync-orders:", type(exc).__name__, str(exc))
+        print(trace)
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": str(exc),
+                    "trace": trace,
+                }
+            ),
+            500,
+        )
 
 
 # 🔁 Blueprint da registrare in run.py
