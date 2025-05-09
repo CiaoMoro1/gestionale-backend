@@ -78,9 +78,7 @@ def import_orders(user_id):
                 }}
                 }}
             }}
-            }}
             """
-
 
             with httpx.Client(verify=False) as client:
                 response = client.post(
@@ -128,8 +126,23 @@ def import_orders(user_id):
 
                 if exists.data:
                     order_id = exists.data[0]["id"]
+                    existing_items_resp = supabase.table("order_items")\
+                        .select("shopify_variant_id, quantity, product_id")\
+                        .eq("order_id", order_id).execute()
+                    existing_items = existing_items_resp.data or []
+                    existing_map = {item["shopify_variant_id"]: item for item in existing_items}
+
+                    new_variant_ids = [normalize_gid(i["node"].get("variant", {}).get("id")) for i in line_items]
+                    for variant_id, item in existing_map.items():
+                        if variant_id not in new_variant_ids and item["product_id"]:
+                            supabase.table("movements").insert({
+                                "product_id": item["product_id"],
+                                "delta": -item["quantity"],
+                                "source": "manual-sync",
+                                "user_id": user_id
+                            }).execute()
+
                     supabase.table("order_items").delete().eq("order_id", order_id).execute()
-                    totale = 0
 
                     for item_edge in line_items:
                         item = item_edge["node"]
@@ -159,19 +172,37 @@ def import_orders(user_id):
                         }).execute()
 
                         if product_id:
+                            old = existing_map.get(shopify_variant_id)
+                            if old:
+                                delta = quantity - old["quantity"]
+                                if delta != 0:
+                                    supabase.table("movements").insert({
+                                        "product_id": product_id,
+                                        "delta": delta,
+                                        "source": "manual-sync",
+                                        "user_id": user_id
+                                    }).execute()
+                            else:
+                                supabase.table("movements").insert({
+                                    "product_id": product_id,
+                                    "delta": quantity,
+                                    "source": "manual-sync",
+                                    "user_id": user_id
+                                }).execute()
+
                             supabase.rpc("adjust_inventory_after_fulfillment", {
                                 "pid": product_id,
                                 "delta": quantity
                             }).execute()
-
-                        totale += quantity * price
 
                     if is_fulfilled:
                         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
                         print(f"✅ Ordine aggiornato e evaso: {shopify_order_id}")
 
                     supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
-                    supabase.table("orders").update({"total": totale}).eq("id", order_id).execute()
+                    supabase.table("orders").update({
+                        "total": float(order["totalPriceSet"]["shopMoney"]["amount"])
+                    }).eq("id", order_id).execute()
 
                     updated += 1
                     print(f"🔁 Ordine aggiornato: {shopify_order_id}")
@@ -198,7 +229,11 @@ def import_orders(user_id):
                     quantity = item.get("quantity", 1)
                     if quantity == 0:
                         continue
-                    price = float(item.get("price", 0)) if "price" in item else 0
+                    price = float(
+                        item.get("originalUnitPriceSet", {})
+                            .get("shopMoney", {})
+                            .get("amount", 0)
+                    )
                     sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
                     shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                     product_id = None
