@@ -101,7 +101,14 @@ def import_orders(user_id):
 
                 line_items = order["lineItems"]["edges"]
                 print(f"🔎 Ordine Shopify ID {shopify_order_id} ha {len(line_items)} item")
-
+                if not line_items:
+                    order_id = exists.data[0]["id"]
+                    supabase.table("order_items").delete().eq("order_id", order_id).execute()
+                    supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+                    supabase.table("orders").update({"total": 0}).eq("id", order_id).execute()
+                    print(f"🗑️ Ordine {shopify_order_id} svuotato (0 articoli)")
+                    updated += 1
+                    continue
                 shipping_lines = order.get("shippingLines", {}).get("edges", [])
                 financial_status = order["displayFinancialStatus"]
 
@@ -136,14 +143,15 @@ def import_orders(user_id):
                     new_variant_ids = []
                     for i in line_items:
                         node = i.get("node")
-                        if not node:
-                            continue
+                        if not node or node.get("quantity", 1) == 0:
+                            continue  # ✅ ignora se quantity è 0
                         variant = node.get("variant")
                         if not variant:
                             continue
                         variant_id = normalize_gid(variant.get("id"))
                         if variant_id:
                             new_variant_ids.append(variant_id)
+
 
                     # 🗑️ Rimuovi articoli non più presenti
                     for variant_id, item in existing_map.items():
@@ -159,13 +167,19 @@ def import_orders(user_id):
                     supabase.table("order_items").delete().eq("order_id", order_id).execute()
 
                     # ➕ Reinserisci nuovi articoli
+                    # ➕ Reinserisci nuovi articoli (solo con quantità > 0)
                     for item_edge in line_items:
                         item = item_edge["node"]
+                        quantity = item.get("quantity", 1)
+                        print("➡️ Processing item:", item.get("title"), "| Quantity:", quantity)
+                        if quantity == 0:
+                            print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
+                            continue
+
                         variant = item.get("variant")
                         if not variant:
                             continue
                         shopify_variant_id = normalize_gid(variant.get("id"))
-                        quantity = item.get("quantity", 1)
                         price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
                         sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
                         product_id = None
@@ -200,6 +214,7 @@ def import_orders(user_id):
                                 "delta": quantity
                             }).execute()
 
+
                     if is_fulfilled:
                         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
                         print(f"✅ Ordine aggiornato e evaso: {shopify_order_id}")
@@ -231,15 +246,14 @@ def import_orders(user_id):
 
                 for item_edge in line_items:
                     item = item_edge["node"]
-                    variant = item.get("variant")
                     quantity = item.get("quantity", 1)
+                    print("➡️ Processing item:", item.get("title"), "| Quantity:", quantity)
                     if quantity == 0:
+                        print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
                         continue
-                    price = float(
-                        item.get("originalUnitPriceSet", {})
-                            .get("shopMoney", {})
-                            .get("amount", 0)
-                    )
+
+                    variant = item.get("variant")
+                    price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
                     sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
                     shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                     product_id = None
@@ -258,6 +272,7 @@ def import_orders(user_id):
                         "quantity": quantity,
                         "price": price
                     }).execute()
+
 
                 supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
                 imported += 1

@@ -138,6 +138,9 @@ def handle_order_create():
     order_id = order_resp.data[0]["id"]
 
     for item in line_items:
+        if item.get("quantity", 1) == 0:
+            print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
+            continue
         shopify_variant_id = normalize_gid(item.get("variant_id"))
         quantity = item.get("quantity", 1)
         price = float(item.get("price", 0))
@@ -212,9 +215,12 @@ def handle_order_update():
     # ✅ Lista nuove varianti da Shopify
     new_variant_ids = []
     for item in items:
+        if item.get("quantity", 1) == 0:
+            continue  # 🔁 ignora articoli a quantità zero
         variant_id = item.get("variant_id")
         if variant_id:
             new_variant_ids.append(normalize_gid(variant_id))
+
 
     # 🗑️ Log articoli rimossi
     for variant_id, item in existing_map.items():
@@ -231,6 +237,9 @@ def handle_order_update():
 
     # ➕ Reinserisci e gestisci delta
     for item in items:
+        if item.get("quantity", 1) == 0:
+            print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
+            continue
         shopify_variant_id = normalize_gid(item.get("variant_id"))
         quantity = item.get("quantity", 1)
         price = float(item.get("price", 0))
