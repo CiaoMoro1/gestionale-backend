@@ -202,15 +202,21 @@ def handle_order_update():
     total_price = float(payload.get("total_price", 0))
     user_id = os.environ.get("DEFAULT_USER_ID", "admin-sync")
 
-    # 🧾 Leggi articoli esistenti prima della cancellazione
+    # 🧾 Carica gli articoli attuali
     existing_items_resp = supabase.table("order_items")\
         .select("shopify_variant_id, quantity, product_id")\
         .eq("order_id", order_id).execute()
     existing_items = existing_items_resp.data or []
     existing_map = {item["shopify_variant_id"]: item for item in existing_items}
 
-    # 🔍 Logga le rimozioni (varianti mancanti nei nuovi items)
-    new_variant_ids = [normalize_gid(i.get("variant_id")) for i in items]
+    # ✅ Lista nuove varianti da Shopify
+    new_variant_ids = []
+    for item in items:
+        variant_id = item.get("variant_id")
+        if variant_id:
+            new_variant_ids.append(normalize_gid(variant_id))
+
+    # 🗑️ Log articoli rimossi
     for variant_id, item in existing_map.items():
         if variant_id not in new_variant_ids and item["product_id"]:
             supabase.table("movements").insert({
@@ -220,10 +226,10 @@ def handle_order_update():
                 "user_id": user_id
             }).execute()
 
-    # 🔄 Cancella tutti gli articoli esistenti
+    # 🔄 Cancella tutti gli articoli
     supabase.table("order_items").delete().eq("order_id", order_id).execute()
 
-    # ➕ Reinserisci articoli aggiornati e logga differenze
+    # ➕ Reinserisci e gestisci delta
     for item in items:
         shopify_variant_id = normalize_gid(item.get("variant_id"))
         quantity = item.get("quantity", 1)
@@ -244,20 +250,11 @@ def handle_order_update():
 
         if product_id:
             old = existing_map.get(shopify_variant_id)
-            if old:
-                delta = quantity - old["quantity"]
-                if delta != 0:
-                    supabase.table("movements").insert({
-                        "product_id": product_id,
-                        "delta": delta,
-                        "source": "order-update",
-                        "user_id": user_id
-                    }).execute()
-            else:
-                # Nuovo articolo nell'ordine
+            delta = quantity - old["quantity"] if old else quantity
+            if delta != 0:
                 supabase.table("movements").insert({
                     "product_id": product_id,
-                    "delta": quantity,
+                    "delta": delta,
                     "source": "order-update",
                     "user_id": user_id
                 }).execute()
@@ -267,23 +264,24 @@ def handle_order_update():
                 "delta": quantity
             }).execute()
 
-    # 📦 Evadi se necessario
+    # 📦 Evadi ordine se necessario
     if payload.get("fulfillment_status") == "fulfilled":
         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
         print(f"✅ Ordine {shopify_order_id} evaso via webhook")
 
-    # 🔄 Ricalcola riservato_sito
+    # 🔄 Ricalcola riservato
     supabase.rpc("repair_riservato_by_order", {
         "ordine_id": order_id
     }).execute()
 
-    # 💰 Aggiorna totale reale da Shopify
+    # 💰 Aggiorna totale
     supabase.table("orders").update({
         "total": total_price
     }).eq("id", order_id).execute()
 
     print(f"🔁 Ordine aggiornato correttamente: {shopify_order_id}")
     return jsonify({"status": "updated", "order_id": order_id}), 200
+
 
 
 

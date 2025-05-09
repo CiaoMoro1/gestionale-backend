@@ -124,15 +124,8 @@ def import_orders(user_id):
                 # ------------------ AGGIORNA ORDINE ESISTENTE ------------------
                 if exists.data:
                     order_id = exists.data[0]["id"]
-                    if not line_items:
-                        supabase.table("order_items").delete().eq("order_id", order_id).execute()
-                        supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
-                        supabase.table("orders").update({
-                            "total": 0
-                        }).eq("id", order_id).execute()
-                        print(f"🗑️ Ordine {shopify_order_id} svuotato")
-                        updated += 1
-                        continue
+
+                    # 🧾 Carica articoli esistenti
                     existing_items_resp = supabase.table("order_items") \
                         .select("shopify_variant_id, quantity, product_id") \
                         .eq("order_id", order_id).execute()
@@ -145,8 +138,10 @@ def import_orders(user_id):
                         node = i.get("node")
                         if not node:
                             continue
-                        variant = node.get("variant") or {}
-                        variant_id = normalize_gid(variant.get("id")) if variant else None
+                        variant = node.get("variant")
+                        if not variant:
+                            continue
+                        variant_id = normalize_gid(variant.get("id"))
                         if variant_id:
                             new_variant_ids.append(variant_id)
 
@@ -160,27 +155,25 @@ def import_orders(user_id):
                                 "user_id": user_id
                             }).execute()
 
-                    # 🔄 Elimina tutti i vecchi item e reinserisci
+                    # 🔄 Elimina tutti i vecchi articoli
                     supabase.table("order_items").delete().eq("order_id", order_id).execute()
 
+                    # ➕ Reinserisci nuovi articoli
                     for item_edge in line_items:
                         item = item_edge["node"]
                         variant = item.get("variant")
+                        if not variant:
+                            continue
+                        shopify_variant_id = normalize_gid(variant.get("id"))
                         quantity = item.get("quantity", 1)
-                        price = float(
-                            item.get("originalUnitPriceSet", {})
-                                .get("shopMoney", {})
-                                .get("amount", 0)
-                        )
+                        price = float(item.get("originalUnitPriceSet", {}).get("shopMoney", {}).get("amount", 0))
                         sku = (item.get("sku") or item.get("title") or "SENZA SKU").strip().upper()
-                        shopify_variant_id = normalize_gid(variant["id"]) if variant else None
                         product_id = None
 
-                        if shopify_variant_id:
-                            product = supabase.table("products").select("id") \
-                                .eq("shopify_variant_id", shopify_variant_id).execute()
-                            if product.data:
-                                product_id = product.data[0]["id"]
+                        product = supabase.table("products").select("id") \
+                            .eq("shopify_variant_id", shopify_variant_id).execute()
+                        if product.data:
+                            product_id = product.data[0]["id"]
 
                         supabase.table("order_items").insert({
                             "order_id": order_id,
@@ -201,6 +194,7 @@ def import_orders(user_id):
                                     "source": "manual-sync",
                                     "user_id": user_id
                                 }).execute()
+
                             supabase.rpc("adjust_inventory_after_fulfillment", {
                                 "pid": product_id,
                                 "delta": quantity
@@ -218,6 +212,7 @@ def import_orders(user_id):
                     updated += 1
                     print(f"🔁 Ordine aggiornato: {shopify_order_id}")
                     continue
+
 
                 # ------------------ NUOVO ORDINE ------------------
                 order_resp = supabase.table("orders").insert({
