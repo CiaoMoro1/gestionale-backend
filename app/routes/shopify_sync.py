@@ -88,7 +88,7 @@ def import_orders(user_id):
             }}
             """
 
-            with httpx.Client(verify=certifi.where(), timeout=10.0) as client:
+            with httpx.Client(verify=False, timeout=10.0) as client:
                 resp = client.post(
                     SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query}
                 )
