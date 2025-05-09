@@ -79,7 +79,7 @@ def import_orders(user_id):
             }}
             """
 
-            with httpx.Client(verify=certifi.where()) as client:
+            with httpx.Client(verify=False) as client:
                 response = client.post(SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query}, timeout=10.0)
             response.raise_for_status()
             data = response.json()
@@ -100,6 +100,8 @@ def import_orders(user_id):
                 exists = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).execute()
 
                 line_items = order["lineItems"]["edges"]
+                print(f"🔎 Ordine Shopify ID {shopify_order_id} ha {len(line_items)} item")
+
                 shipping_lines = order.get("shippingLines", {}).get("edges", [])
                 financial_status = order["displayFinancialStatus"]
 
@@ -122,6 +124,15 @@ def import_orders(user_id):
                 # ------------------ AGGIORNA ORDINE ESISTENTE ------------------
                 if exists.data:
                     order_id = exists.data[0]["id"]
+                    if not line_items:
+                        supabase.table("order_items").delete().eq("order_id", order_id).execute()
+                        supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+                        supabase.table("orders").update({
+                            "total": 0
+                        }).eq("id", order_id).execute()
+                        print(f"🗑️ Ordine {shopify_order_id} svuotato")
+                        updated += 1
+                        continue
                     existing_items_resp = supabase.table("order_items") \
                         .select("shopify_variant_id, quantity, product_id") \
                         .eq("order_id", order_id).execute()
