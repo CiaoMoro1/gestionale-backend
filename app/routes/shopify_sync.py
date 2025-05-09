@@ -172,6 +172,7 @@ def import_orders(user_id):
                         item = item_edge["node"]
                         quantity = item.get("quantity", 1)
                         print("➡️ Processing item:", item.get("title"), "| Quantity:", quantity)
+                        print("🔢 RAW ITEM:", json.dumps(item, indent=2))
                         if quantity == 0:
                             print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
                             continue
@@ -248,6 +249,7 @@ def import_orders(user_id):
                     item = item_edge["node"]
                     quantity = item.get("quantity", 1)
                     print("➡️ Processing item:", item.get("title"), "| Quantity:", quantity)
+                    print("🔢 RAW ITEM:", json.dumps(item, indent=2))
                     if quantity == 0:
                         print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
                         continue
