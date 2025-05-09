@@ -78,6 +78,7 @@ def import_orders(user_id):
                 }}
                 }}
             }}
+            }}
             """
 
             with httpx.Client(verify=False) as client:
