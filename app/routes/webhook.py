@@ -128,7 +128,6 @@ def handle_order_create():
     line_items = payload.get("line_items", [])
     shipping_lines = payload.get("shipping_lines", [])
 
-    # Detect COD fee or similar keywords
     has_cod_fee = any(
         any(kw in (item.get("title") or "").lower() for kw in COD_KEYWORDS)
         for item in line_items
@@ -156,8 +155,18 @@ def handle_order_create():
         return jsonify({"status": "skipped", "reason": "already imported"}), 200
 
     user_id = os.environ.get("DEFAULT_USER_ID", None)
+
     customer = payload.get("customer") or {}
     customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or "Ospite"
+    customer_email = customer.get("email")
+    customer_phone = customer.get("phone")
+
+    shipping = payload.get("shipping_address") or {}
+    shipping_address = shipping.get("address1")
+    shipping_city = shipping.get("city")
+    shipping_zip = shipping.get("zip")
+    shipping_province = shipping.get("province")
+    shipping_country = shipping.get("country")
 
     order_resp = (
         supabase.table("orders")
@@ -166,6 +175,13 @@ def handle_order_create():
                 "shopify_order_id": shopify_order_id,
                 "number": payload.get("name"),
                 "customer_name": customer_name,
+                "customer_email": customer_email,
+                "customer_phone": customer_phone,
+                "shipping_address": shipping_address,
+                "shipping_city": shipping_city,
+                "shipping_zip": shipping_zip,
+                "shipping_province": shipping_province,
+                "shipping_country": shipping_country,
                 "channel": (payload.get("app") or {}).get("name", "Online Store"),
                 "created_at": payload.get("created_at"),
                 "payment_status": payment_status,
@@ -224,16 +240,10 @@ def handle_order_create():
     return jsonify({"status": "order created", "order_id": order_id}), 200
 
 
+
 @webhook.route("/webhook/order-update", methods=["POST"])
 def handle_order_update():
-    """Overwrite an existing order with Shopify's latest state.
-
-    Logic:
-    1. If order not found, fallback to create.
-    2. Remove *all* current order_items.
-    3. Insert new items (same flow as create).
-    4. Re‑run helpers to keep `riservato` and inventory in sync.
-    """
+    """Overwrite an existing order with Shopify's latest state."""
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
     if not verify_webhook(raw_body, hmac_header):
@@ -259,6 +269,19 @@ def handle_order_update():
         return handle_order_create()
 
     order_id = order_resp.data[0]["id"]
+
+    # Customer & shipping fields
+    customer = payload.get("customer") or {}
+    customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or "Ospite"
+    customer_email = customer.get("email")
+    customer_phone = customer.get("phone")
+
+    shipping = payload.get("shipping_address") or {}
+    shipping_address = shipping.get("address1")
+    shipping_city = shipping.get("city")
+    shipping_zip = shipping.get("zip")
+    shipping_province = shipping.get("province")
+    shipping_country = shipping.get("country")
 
     # ------------------------------------------------------------------
     # Reset & re‑insert items
@@ -311,12 +334,24 @@ def handle_order_update():
         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
         print(f"✅ Ordine {shopify_order_id} evaso via webhook")
 
-    # Riservato & totals
+    # Riservato & aggiornamento ordine
     supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
-    supabase.table("orders").update({"total": total_price}).eq("id", order_id).execute()
+
+    supabase.table("orders").update({
+        "customer_name": customer_name,
+        "customer_email": customer_email,
+        "customer_phone": customer_phone,
+        "shipping_address": shipping_address,
+        "shipping_city": shipping_city,
+        "shipping_zip": shipping_zip,
+        "shipping_province": shipping_province,
+        "shipping_country": shipping_country,
+        "total": total_price,
+    }).eq("id", order_id).execute()
 
     print(f"🔁 Ordine aggiornato correttamente: {shopify_order_id}")
     return jsonify({"status": "updated", "order_id": order_id}), 200
+
 
 
 @webhook.route("/webhook/order-cancel", methods=["POST"])

@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 import os
 import ssl
 import certifi  # ✅ Per risolvere problemi SSL su Windows
+from app.routes.bulk_disable_tracking import bulk_routes
+
 
 # 🔃 Carica variabili .env
 load_dotenv()
@@ -34,6 +36,9 @@ def create_app():
     app.register_blueprint(orders)
 
     app.register_blueprint(shopify)
+    
+    app.register_blueprint(bulk_routes)
+
     return app
 
 app = create_app()

@@ -24,14 +24,11 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-
 def normalize_gid(gid: str | int | None) -> str:
-    """Converte un Global ID Shopify nel suo numeric ID."""
     if gid is None:
         return ""
     gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
-
 
 @orders.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
@@ -54,10 +51,7 @@ def import_orders(user_id):
             query = f"""
             {{
               orders(first: 50{after_clause}, query: "(created_at:>='2025-03-01') AND (financial_status:paid OR financial_status:pending) AND fulfillment_status:unfulfilled") {{
-                pageInfo {{
-                  hasNextPage
-                  endCursor
-                }}
+                pageInfo {{ hasNextPage endCursor }}
                 edges {{
                   node {{
                     id
@@ -66,11 +60,10 @@ def import_orders(user_id):
                     displayFinancialStatus
                     fulfillments {{ status }}
                     totalPriceSet {{ shopMoney {{ amount }} }}
-                    customer {{ displayName }}
+                    customer {{ displayName email phone }}
+                    shippingAddress {{ address1 city zip province country }}
                     app {{ name }}
-                    shippingLines(first: 5) {{
-                      edges {{ node {{ title }} }}
-                    }}
+                    shippingLines(first: 5) {{ edges {{ node {{ title }} }} }}
                     lineItems(first: 50) {{
                       edges {{
                         node {{
@@ -89,9 +82,7 @@ def import_orders(user_id):
             """
 
             with httpx.Client(verify=False, timeout=10.0) as client:
-                resp = client.post(
-                    SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query}
-                )
+                resp = client.post(SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query})
             resp.raise_for_status()
             data = resp.json()
 
@@ -132,11 +123,20 @@ def import_orders(user_id):
                     skipped += 1
                     continue
 
-                # ------------------------------------------------------------------
-                # ORDINE ESISTENTE → UPDATE
-                # ------------------------------------------------------------------
+                customer = order.get("customer") or {}
+                shipping = order.get("shippingAddress") or {}
+
+                customer_name = customer.get("displayName") or "Ospite"
+                customer_email = customer.get("email")
+                customer_phone = customer.get("phone")
+
+                shipping_address = shipping.get("address1")
+                shipping_city = shipping.get("city")
+                shipping_zip = shipping.get("zip")
+                shipping_province = shipping.get("province")
+                shipping_country = shipping.get("country")
+
                 if order_exists:
-                    # Se l'ordine in Shopify è rimasto senza articoli, svuotalo in Supabase
                     if not line_items:
                         supabase.table("order_items").delete().eq("order_id", order_id).execute()
                         supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
@@ -144,7 +144,6 @@ def import_orders(user_id):
                         updated += 1
                         continue
 
-                    # 🔄 Pulisci gli articoli esistenti e reinserisci quelli attuali
                     supabase.table("order_items").delete().eq("order_id", order_id).execute()
 
                     for item_edge in line_items:
@@ -174,16 +173,21 @@ def import_orders(user_id):
                             "price": price,
                         }).execute()
 
-                        # Inventario: decrementa quantità se necessario
                         if product_id:
                             supabase.rpc("adjust_inventory_after_fulfillment", {"pid": product_id, "delta": quantity}).execute()
 
-                    # Evadi ordine se risultasse già fulfilled su Shopify
                     if is_fulfilled:
                         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
 
-                    # Aggiorna metadata ordine
                     supabase.table("orders").update({
+                        "customer_name": customer_name,
+                        "customer_email": customer_email,
+                        "customer_phone": customer_phone,
+                        "shipping_address": shipping_address,
+                        "shipping_city": shipping_city,
+                        "shipping_zip": shipping_zip,
+                        "shipping_province": shipping_province,
+                        "shipping_country": shipping_country,
                         "payment_status": payment_status,
                         "fulfillment_status": "evaso" if is_fulfilled else "inevaso",
                         "total": float(order["totalPriceSet"]["shopMoney"]["amount"]),
@@ -193,13 +197,17 @@ def import_orders(user_id):
                     updated += 1
                     continue
 
-                # ------------------------------------------------------------------
-                # NUOVO ORDINE → INSERT
-                # ------------------------------------------------------------------
                 order_resp = supabase.table("orders").insert({
                     "shopify_order_id": shopify_order_id,
                     "number": order["name"],
-                    "customer_name": (order.get("customer") or {}).get("displayName", "Ospite"),
+                    "customer_name": customer_name,
+                    "customer_email": customer_email,
+                    "customer_phone": customer_phone,
+                    "shipping_address": shipping_address,
+                    "shipping_city": shipping_city,
+                    "shipping_zip": shipping_zip,
+                    "shipping_province": shipping_province,
+                    "shipping_country": shipping_country,
                     "channel": (order.get("app") or {}).get("name", "Online Store"),
                     "created_at": order["createdAt"],
                     "payment_status": payment_status,
@@ -243,36 +251,24 @@ def import_orders(user_id):
                 supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
                 imported += 1
 
-        return (
-            jsonify(
-                {
-                    "status": "success",
-                    "imported": imported,
-                    "updated": updated,
-                    "skipped": skipped,
-                    "errors": errors,
-                }
-            ),
-            200,
-        )
+        return jsonify({
+            "status": "success",
+            "imported": imported,
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors,
+        }), 200
 
-    except Exception as exc:  # pragma: no cover — errore generico visibile nel log
+    except Exception as exc:
         import traceback
-
         trace = traceback.format_exc()
         print("❌ ERRORE manual-sync-orders:", type(exc).__name__, str(exc))
         print(trace)
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "message": str(exc),
-                    "trace": trace,
-                }
-            ),
-            500,
-        )
-
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": trace,
+        }), 500
 
 # 🔁 Blueprint da registrare in run.py
 shopify = orders
