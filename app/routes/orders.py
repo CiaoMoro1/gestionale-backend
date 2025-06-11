@@ -1,7 +1,8 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 import os
 import httpx
 import certifi
+import logging
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
 
@@ -15,15 +16,14 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-
 def normalize_gid(gid) -> str:
     gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
 
-
 @orders.route("/shopify/import-orders", methods=["POST"])
 @require_auth
-def import_orders(user_id):
+def import_orders():
+    user_id = g.user_id
     imported = 0
     skipped = 0
     errors = []
@@ -79,7 +79,7 @@ def import_orders(user_id):
         """
 
         try:
-            with httpx.Client(verify=False) as client:
+            with httpx.Client(verify=certifi.where()) as client:
                 response = client.post(
                     SHOPIFY_GRAPHQL_URL,
                     headers=HEADERS,
@@ -90,11 +90,11 @@ def import_orders(user_id):
             data = response.json()
 
             if "errors" in data:
-                print("❌ Shopify GraphQL error:", data["errors"])
+                logging.error("Shopify GraphQL error: %s", data["errors"])
                 return jsonify({"error": "Errore GraphQL da Shopify", "details": data["errors"]}), 500
 
         except Exception as e:
-            print(f"❌ Shopify API error: {e}")
+            logging.error("Shopify API error: %s", e)
             return jsonify({"error": "Errore nella chiamata a Shopify"}), 500
 
         orders_data = data["data"]["orders"]
@@ -177,8 +177,7 @@ def import_orders(user_id):
                         "riservato_sito": current + quantity
                     }).eq("product_id", product_id).execute()
                 else:
-                    print(f"⚠️ Riga con variante non trovata → ordine {order['name']}, SKU: {sku}, qty: {quantity}")
-
+                    logging.warning("Riga con variante non trovata → ordine %s, SKU: %s, qty: %s", order['name'], sku, quantity)
 
             imported += 1
 

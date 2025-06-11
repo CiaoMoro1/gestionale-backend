@@ -1,8 +1,9 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 import os
 import requests
 import json
 import certifi
+import logging
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
 from app.services.supabase_write import upsert_variant
@@ -12,12 +13,10 @@ bulk_sync = Blueprint("bulk_sync", __name__)
 SHOPIFY_GRAPHQL_URL = os.environ.get("SHOPIFY_GRAPHQL_URL")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
-# 🔧 Funzione per normalizzare GID Shopify
 def normalize_gid(gid) -> str:
     gid = str(gid)
     return gid.split("/")[-1] if "/" in gid else gid
 
-# 🔹 1. Bulk query (inclusi status e cost)
 BULK_QUERY = '''
 mutation {
   bulkOperationRunQuery(
@@ -65,9 +64,11 @@ mutation {
 }
 '''
 
-# 🔹 2. Avvia bulk
+# 1. Avvia bulk (meglio proteggerla con @require_auth)
 @bulk_sync.route("/shopify/bulk-launch", methods=["POST"])
+@require_auth
 def launch_bulk_sync():
+    user_id = g.user_id
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
         "Content-Type": "application/json"
@@ -78,20 +79,20 @@ def launch_bulk_sync():
             SHOPIFY_GRAPHQL_URL,
             json={"query": BULK_QUERY},
             headers=headers,
-            verify=False
+            verify=certifi.where()
         )
-
-        print("✅ Shopify response status:", response.status_code)
-        print("📦 Shopify response body:", response.text)
+        logging.info("Shopify bulk-launch da user %s, status: %s", user_id, response.status_code)
         return jsonify(response.json()), response.status_code
 
     except Exception as e:
-        print("❌ [bulk-launch ERROR]:", str(e))
+        logging.error("[bulk-launch ERROR]: %s", str(e))
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 🔹 3. Stato della bulk operation
+# 2. Stato della bulk operation (meglio proteggerla!)
 @bulk_sync.route("/shopify/bulk-status", methods=["GET"])
+@require_auth
 def get_bulk_status():
+    user_id = g.user_id
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
         "Content-Type": "application/json"
@@ -117,31 +118,33 @@ def get_bulk_status():
             SHOPIFY_GRAPHQL_URL,
             json={"query": query},
             headers=headers,
-            verify=False
+            verify=certifi.where()
         )
+        logging.info("Shopify bulk-status da user %s, status: %s", user_id, response.status_code)
         return jsonify(response.json()), response.status_code
 
     except Exception as e:
-        print("❌ [bulk-status ERROR]:", str(e))
+        logging.error("[bulk-status ERROR]: %s", str(e))
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 🔹 4. Importa e salva varianti dal file JSONL
+# 3. Importa e salva varianti dal file JSONL
 @bulk_sync.route("/shopify/bulk-fetch", methods=["POST"])
 @require_auth
-def fetch_bulk_data(user_id):
+def fetch_bulk_data():
+    user_id = g.user_id
     url = request.json.get("url")
     if not url:
         return jsonify({"error": "Missing bulk file URL"}), 400
 
-    print(f"👤 [USER] user_id: {user_id}")
-    print(f"⬇️ [FETCH] Shopify bulk file: {url}")
+    logging.info("[USER] user_id: %s", user_id)
+    logging.info("[FETCH] Shopify bulk file: %s", url)
 
     try:
-        response = requests.get(url, verify=False)
+        response = requests.get(url, verify=certifi.where())
         response.raise_for_status()
         lines = response.text.strip().split("\n")
 
-        print(f"📄 [LINES] Total: {len(lines)}")
+        logging.info("[LINES] Total: %s", len(lines))
 
         count = 0
         errors = []
@@ -168,7 +171,7 @@ def fetch_bulk_data(user_id):
             product_id = product.get("id")
 
             if not variant_id or not product_id:
-                print("⚠️ Skip: riga incompleta", obj)
+                logging.warning("Skip: riga incompleta %s", obj)
                 continue
 
             variant_rows.append({
@@ -177,8 +180,8 @@ def fetch_bulk_data(user_id):
                 "image_url": image_map.get(variant_id, "")
             })
 
-        print(f"✅ Varianti da importare: {len(variant_rows)}")
-        print(f"🖼️ Immagini associate: {len(image_map)}")
+        logging.info("Varianti da importare: %s", len(variant_rows))
+        logging.info("Immagini associate: %s", len(image_map))
 
         # Step 3: upsert in Supabase
         for entry in variant_rows:
@@ -199,14 +202,13 @@ def fetch_bulk_data(user_id):
                     "user_id": user_id
                 }
 
-
                 if upsert_variant(record):
                     count += 1
                 else:
                     errors.append(f"❌ SKU: {record['sku']} - upsert fallito")
 
             except Exception as e:
-                print(f"⚠️ [bulk-fetch ERROR]: {e}")
+                logging.error("[bulk-fetch ERROR]: %s", e)
                 errors.append(str(e))
 
         # Step 4: salva log errori su disco
@@ -214,7 +216,7 @@ def fetch_bulk_data(user_id):
             log_path = f"/tmp/shopify_import_log_{user_id}.txt"
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(errors))
-            print(f"📝 Log salvato in: {log_path}")
+            logging.info("Log salvato in: %s", log_path)
 
         msg = f"✅ {count} varianti importate con successo."
         if errors:
@@ -228,13 +230,14 @@ def fetch_bulk_data(user_id):
         }), 200
 
     except Exception as e:
-        print("❌ [bulk-fetch ERROR]:", str(e))
+        logging.error("[bulk-fetch ERROR]: %s", str(e))
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 🔹 5. Scarica log errori
+# 4. Scarica log errori
 @bulk_sync.route("/shopify/log", methods=["GET"])
 @require_auth
-def get_error_log(user_id):
+def get_error_log():
+    user_id = g.user_id
     log_path = f"/tmp/shopify_import_log_{user_id}.txt"
     if not os.path.exists(log_path):
         return jsonify({"error": "Nessun log disponibile"}), 404

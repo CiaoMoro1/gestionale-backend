@@ -4,6 +4,7 @@ import json
 import hmac
 import base64
 import hashlib
+import logging
 from app.supabase_client import supabase
 from app.services.supabase_write import upsert_variant
 from app.routes.bulk_sync import normalize_gid
@@ -26,7 +27,6 @@ def verify_webhook(data: bytes, hmac_header: str | None) -> bool:
     digest = hmac.new(secret.encode(), data, hashlib.sha256).digest()
     computed_hmac = base64.b64encode(digest).decode()
     return hmac.compare_digest(computed_hmac, hmac_header)
-
 
 # -----------------------------------------------------------------------------
 # Product Webhooks
@@ -63,9 +63,8 @@ def handle_product_update():
         }
         upsert_variant(record)
 
-    print(f"✅ Prodotto aggiornato: {product_title} ({product_id})")
+    logging.info("✅ Prodotto aggiornato: %s (%s)", product_title, product_id)
     return jsonify({"status": "success", "imported": len(variants)}), 200
-
 
 @webhook.route("/webhook/product-delete", methods=["POST"])
 def handle_product_delete():
@@ -85,9 +84,8 @@ def handle_product_delete():
         .execute()
     )
 
-    print(f"🗑️ Prodotto eliminato: {shopify_product_id} — {response}")
+    logging.info("🗑️ Prodotto eliminato: %s — %s", shopify_product_id, response)
     return jsonify({"status": "deleted", "shopify_product_id": shopify_product_id}), 200
-
 
 # -----------------------------------------------------------------------------
 # Order Webhooks
@@ -100,7 +98,6 @@ COD_KEYWORDS = [
     "commissione pagamento",
 ]
 
-
 def _payment_label(financial_status: str, has_cod_fee: bool) -> str:
     status = financial_status.upper()
     if status == "PAID":
@@ -108,7 +105,6 @@ def _payment_label(financial_status: str, has_cod_fee: bool) -> str:
     if status == "PENDING" and has_cod_fee:
         return "contrassegno"
     return ""  # invalid / ignored
-
 
 @webhook.route("/webhook/order-create", methods=["POST"])
 def handle_order_create():
@@ -137,11 +133,11 @@ def handle_order_create():
 
     payment_status = _payment_label(financial_status, has_cod_fee)
     if not payment_status:
-        print("⚠️ Ordine skippato: non valido per l'import.")
+        logging.warning("⚠️ Ordine skippato: non valido per l'import.")
         return jsonify({"status": "skipped", "reason": "not paid or not COD"}), 200
 
     if fulfillment_status not in [None, "unfulfilled"]:
-        print("⚠️ Ordine skippato: già evaso.")
+        logging.warning("⚠️ Ordine skippato: già evaso.")
         return jsonify({"status": "skipped", "reason": "already fulfilled"}), 200
 
     exists = (
@@ -151,7 +147,7 @@ def handle_order_create():
         .execute()
     )
     if exists.data:
-        print(f"⛔ Ordine già presente: {shopify_order_id}")
+        logging.info("⛔ Ordine già presente: %s", shopify_order_id)
         return jsonify({"status": "skipped", "reason": "already imported"}), 200
 
     user_id = os.environ.get("DEFAULT_USER_ID", None)
@@ -198,7 +194,7 @@ def handle_order_create():
     for item in line_items:
         quantity = item.get("quantity", 1)
         if quantity == 0:
-            print(f"⚠️ Skip articolo '{item.get('title')}' con quantità 0")
+            logging.warning("⚠️ Skip articolo '%s' con quantità 0", item.get("title"))
             continue
 
         variant_id_raw = item.get("variant_id")
@@ -236,10 +232,8 @@ def handle_order_create():
 
     supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
 
-    print(f"🛒 Nuovo ordine importato: {shopify_order_id}")
+    logging.info("🛒 Nuovo ordine importato: %s", shopify_order_id)
     return jsonify({"status": "order created", "order_id": order_id}), 200
-
-
 
 @webhook.route("/webhook/order-update", methods=["POST"])
 def handle_order_update():
@@ -252,7 +246,7 @@ def handle_order_update():
     payload = json.loads(raw_body)
     raw_id = payload.get("id")
     if not raw_id:
-        print("❌ Webhook ricevuto senza ID ordine valido.")
+        logging.error("❌ Webhook ricevuto senza ID ordine valido.")
         return jsonify({"status": "skipped", "reason": "missing ID"}), 400
 
     shopify_order_id = int(normalize_gid(raw_id))
@@ -265,7 +259,7 @@ def handle_order_update():
     )
 
     if not order_resp.data:
-        print(f"🔁 Ordine {shopify_order_id} non trovato → fallback a create.")
+        logging.info("🔁 Ordine %s non trovato → fallback a create.", shopify_order_id)
         return handle_order_create()
 
     order_id = order_resp.data[0]["id"]
@@ -332,7 +326,7 @@ def handle_order_update():
     # Fulfillment state → if fully fulfilled, mark as so
     if payload.get("fulfillment_status") == "fulfilled":
         supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
-        print(f"✅ Ordine {shopify_order_id} evaso via webhook")
+        logging.info("✅ Ordine %s evaso via webhook", shopify_order_id)
 
     # Riservato & aggiornamento ordine
     supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
@@ -349,10 +343,8 @@ def handle_order_update():
         "total": total_price,
     }).eq("id", order_id).execute()
 
-    print(f"🔁 Ordine aggiornato correttamente: {shopify_order_id}")
+    logging.info("🔁 Ordine aggiornato correttamente: %s", shopify_order_id)
     return jsonify({"status": "updated", "order_id": order_id}), 200
-
-
 
 @webhook.route("/webhook/order-cancel", methods=["POST"])
 def handle_order_cancel():
@@ -375,7 +367,7 @@ def handle_order_cancel():
         )
 
         if not order_resp.data:
-            print(f"🛑 Ordine {shopify_order_id} non trovato → impossibile annullarlo.")
+            logging.warning("🛑 Ordine %s non trovato → impossibile annullarlo.", shopify_order_id)
             return jsonify({"status": "skipped", "reason": "ordine non trovato"}), 200
 
         order = order_resp.data[0]
@@ -383,14 +375,14 @@ def handle_order_cancel():
         current_status = order["fulfillment_status"]
 
         if current_status == "annullato":
-            print(f"⚠️ Ordine {shopify_order_id} già annullato.")
+            logging.warning("⚠️ Ordine %s già annullato.", shopify_order_id)
             return jsonify({"status": "skipped", "reason": "già annullato"}), 200
 
         supabase.table("orders").update({"fulfillment_status": "annullato"}).eq("id", order_id).execute()
 
-        print(f"🗑️ Ordine annullato: {shopify_order_id}")
+        logging.info("🗑️ Ordine annullato: %s", shopify_order_id)
         return jsonify({"status": "cancelled", "order_id": order_id}), 200
 
     except Exception as exc:
-        print(f"❌ Errore durante annullamento ordine {shopify_order_id}: {exc}")
+        logging.error("❌ Errore durante annullamento ordine %s: %s", shopify_order_id, exc)
         return jsonify({"status": "error", "reason": str(exc)}), 500

@@ -1,8 +1,11 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, g
 import httpx
 import os
 import certifi
 import time
+import logging
+
+from app.utils.auth import require_auth
 
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 SHOPIFY_STORE = os.getenv("SHOP_DOMAIN")  # es: petti-artigiani-italiani-1968.myshopify.com
@@ -18,14 +21,18 @@ def shopify_request(method, path, json=None):
         url,
         headers=headers,
         json=json,
-        verify=False,
+        verify=certifi.where(),
         timeout=httpx.Timeout(30.0)  # timeout aumentato a 30s
     )
 
 bulk_routes = Blueprint("bulk_routes", __name__)
 
 @bulk_routes.route("/shopify/disable-all-inventory-tracking", methods=["POST"])
+@require_auth
 def disable_all_tracking():
+    user_id = g.user_id
+    logging.info("Richiesta di DISABILITAZIONE MASSIVA TRACKING da user %s", user_id)
+
     last_product_id = 0
     success_count = 0
     failed = []
@@ -38,7 +45,7 @@ def disable_all_tracking():
 
         for product in products:
             last_product_id = max(last_product_id, product["id"])
-            print(f"📦 Processing product: {product['title']} ({product['id']})")
+            logging.info("Processing product: %s (%s)", product['title'], product['id'])
 
             for variant in product.get("variants", []):
                 variant_id = variant["id"]
@@ -54,17 +61,17 @@ def disable_all_tracking():
                     time.sleep(0.5)  # rispetta il limite di 2 req/sec
 
                     if resp.status_code == 200:
-                        print(f"✅ Disabled tracking for variant {variant_id}")
+                        logging.info("Disabled tracking for variant %s", variant_id)
                         success_count += 1
                     else:
-                        print(f"❌ Variant {variant_id} failed: {resp.status_code} - {resp.text}")
+                        logging.error("Variant %s failed: %s - %s", variant_id, resp.status_code, resp.text)
                         failed.append({
                             "variant_id": variant_id,
                             "status": resp.status_code,
                             "error": resp.text
                         })
                 else:
-                    print(f"ℹ️ Variant {variant_id} skipped (inventory_management: {inventory_mgmt})")
+                    logging.info("Variant %s skipped (inventory_management: %s)", variant_id, inventory_mgmt)
 
     return jsonify({
         "updated_variants": success_count,

@@ -6,11 +6,12 @@ Pulito secondo le nuove regole 2025:
 - ✅ Aggiornamento/creazione ordini + articoli + fix `riservato`
 """
 
-from flask import Blueprint, jsonify, request, abort
+from flask import Blueprint, jsonify, request, abort, g
 import json
 import os
 import httpx
 import certifi
+import logging
 from app.supabase_client import supabase
 from app.utils.auth import require_auth
 
@@ -32,7 +33,8 @@ def normalize_gid(gid: str | int | None) -> str:
 
 @orders.route("/shopify/manual-sync-orders", methods=["POST"])
 @require_auth
-def import_orders(user_id):
+def import_orders():
+    user_id = g.user_id
     try:
         imported, updated, skipped = 0, 0, 0
         errors: list[str] = []
@@ -81,12 +83,13 @@ def import_orders(user_id):
             }}
             """
 
-            with httpx.Client(verify=False, timeout=10.0) as client:
+            with httpx.Client(verify=certifi.where(), timeout=10.0) as client:
                 resp = client.post(SHOPIFY_GRAPHQL_URL, headers=HEADERS, json={"query": query})
             resp.raise_for_status()
             data = resp.json()
 
             if "errors" in data:
+                logging.error("GraphQL error: %s", data['errors'])
                 raise Exception(f"GraphQL error: {data['errors']}")
 
             orders_data = data["data"]["orders"]
@@ -262,8 +265,7 @@ def import_orders(user_id):
     except Exception as exc:
         import traceback
         trace = traceback.format_exc()
-        print("❌ ERRORE manual-sync-orders:", type(exc).__name__, str(exc))
-        print(trace)
+        logging.error("❌ ERRORE manual-sync-orders: %s\n%s", str(exc), trace)
         return jsonify({
             "status": "error",
             "message": str(exc),
