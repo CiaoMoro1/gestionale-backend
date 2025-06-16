@@ -14,7 +14,6 @@ logging.basicConfig(
 from app.routes.bulk_disable_tracking import bulk_routes
 from app.routes.bulk_sync import bulk_sync
 from app.routes.webhook import webhook
-from app.routes.orders import orders
 from app.routes.shopify_sync import shopify
 from app.routes.brt import brt  # <--- AGGIUNGI QUESTA LINEA se hai creato il blueprint BRT
 from app.routes.validate_address import validate_address_bp
@@ -42,7 +41,6 @@ def create_app():
 
     app.register_blueprint(bulk_sync)
     app.register_blueprint(webhook)
-    app.register_blueprint(orders)
     app.register_blueprint(shopify)
     app.register_blueprint(bulk_routes)
     app.register_blueprint(brt)  # <--- AGGIUNGI QUI

@@ -63,7 +63,7 @@ def import_orders():
                     fulfillments {{ status }}
                     totalPriceSet {{ shopMoney {{ amount }} }}
                     customer {{ displayName email phone }}
-                    shippingAddress {{ address1 city zip province country }}
+                    shippingAddress {{ address1 city zip province country phone }}
                     app {{ name }}
                     shippingLines(first: 5) {{ edges {{ node {{ title }} }} }}
                     lineItems(first: 50) {{
@@ -131,7 +131,8 @@ def import_orders():
 
                 customer_name = customer.get("displayName") or "Ospite"
                 customer_email = customer.get("email")
-                customer_phone = customer.get("phone")
+                customer_phone = shipping.get("phone") or customer.get("phone") or None
+
 
                 shipping_address = shipping.get("address1")
                 shipping_city = shipping.get("city")
