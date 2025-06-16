@@ -15,7 +15,8 @@ _jwks_cache = {}
 def get_public_key():
     global _jwks_cache
     if not _jwks_cache:
-        resp = requests.get(JWKS_URL)
+        # Qui NON devi mai mandare header Authorization!
+        resp = requests.get(JWKS_URL, headers={})   # <-- headers vuoto
         resp.raise_for_status()
         _jwks_cache = resp.json()
     for key in _jwks_cache['keys']:
