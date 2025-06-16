@@ -9,15 +9,7 @@ from app.supabase_client import supabase
 from app.services.supabase_write import upsert_variant
 from app.routes.bulk_sync import normalize_gid
 
-# -----------------------------------------------------------------------------
-# Blueprint init
-# -----------------------------------------------------------------------------
-
 webhook = Blueprint("webhook", __name__)
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 
 def verify_webhook(data: bytes, hmac_header: str | None) -> bool:
     """Validate the HMAC signature sent by Shopify."""
@@ -34,7 +26,6 @@ def verify_webhook(data: bytes, hmac_header: str | None) -> bool:
 
 @webhook.route("/webhook/product-update", methods=["POST"])
 def handle_product_update():
-    """Create / Update product variants inside Supabase."""
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
     if not verify_webhook(raw_body, hmac_header):
@@ -68,7 +59,6 @@ def handle_product_update():
 
 @webhook.route("/webhook/product-delete", methods=["POST"])
 def handle_product_delete():
-    """Delete product + its variants from Supabase when removed from Shopify."""
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
     if not verify_webhook(raw_body, hmac_header):
@@ -108,7 +98,6 @@ def _payment_label(financial_status: str, has_cod_fee: bool) -> str:
 
 @webhook.route("/webhook/order-create", methods=["POST"])
 def handle_order_create():
-    """Insert a brand‑new order with its items, adjusting inventory."""
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
     if not verify_webhook(raw_body, hmac_header):
@@ -153,11 +142,13 @@ def handle_order_create():
     user_id = os.environ.get("DEFAULT_USER_ID", None)
 
     customer = payload.get("customer") or {}
+    shipping = payload.get("shipping_address") or {}
+
     customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or "Ospite"
     customer_email = customer.get("email")
-    customer_phone = customer.get("phone")
+    # Priorità: prima shipping_address.phone, poi customer.phone
+    customer_phone = shipping.get("phone") or customer.get("phone") or None
 
-    shipping = payload.get("shipping_address") or {}
     shipping_address = shipping.get("address1")
     shipping_city = shipping.get("city")
     shipping_zip = shipping.get("zip")
@@ -237,7 +228,6 @@ def handle_order_create():
 
 @webhook.route("/webhook/order-update", methods=["POST"])
 def handle_order_update():
-    """Overwrite an existing order with Shopify's latest state."""
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
     if not verify_webhook(raw_body, hmac_header):
@@ -264,13 +254,14 @@ def handle_order_update():
 
     order_id = order_resp.data[0]["id"]
 
-    # Customer & shipping fields
     customer = payload.get("customer") or {}
+    shipping = payload.get("shipping_address") or {}
+
     customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or "Ospite"
     customer_email = customer.get("email")
-    customer_phone = customer.get("phone")
+    # Priorità: prima shipping_address.phone, poi customer.phone
+    customer_phone = shipping.get("phone") or customer.get("phone") or None
 
-    shipping = payload.get("shipping_address") or {}
     shipping_address = shipping.get("address1")
     shipping_city = shipping.get("city")
     shipping_zip = shipping.get("zip")
@@ -348,7 +339,6 @@ def handle_order_update():
 
 @webhook.route("/webhook/order-cancel", methods=["POST"])
 def handle_order_cancel():
-    """Mark order as cancelled (no inventory roll‑back, handled by DB triggers)."""
     raw_body = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
     if not verify_webhook(raw_body, hmac_header):

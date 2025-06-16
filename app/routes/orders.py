@@ -53,8 +53,9 @@ def import_orders():
                 createdAt
                 displayFinancialStatus
                 totalPriceSet {{ shopMoney {{ amount }} }}
-                customer {{ displayName }}
+                customer {{ displayName phone }}
                 app {{ name }}
+                shippingAddress {{ phone }}
                 shippingLines(first: 5) {{
                   edges {{
                     node {{
@@ -131,12 +132,18 @@ def import_orders():
                 skipped += 1
                 continue
 
+            # 📞 TELEFONO: prima shippingAddress.phone, poi customer.phone, poi None
+            shipping_phone = (order.get("shippingAddress") or {}).get("phone")
+            customer_phone = (order.get("customer") or {}).get("phone")
+            phone = shipping_phone or customer_phone or None
+
             # ✅ Inserimento ordine
             order_resp = supabase.table("orders").insert({
                 "shopify_order_id": shopify_order_id,
                 "number": order["name"],
-                "customer_name": order["customer"]["displayName"] if order["customer"] else "Ospite",
-                "channel": order["app"]["name"] if order["app"] else "Online Store",
+                "customer_name": order["customer"]["displayName"] if order.get("customer") else "Ospite",
+                "customer_phone": phone,
+                "channel": order["app"]["name"] if order.get("app") else "Online Store",
                 "created_at": order["createdAt"],
                 "payment_status": payment_status,
                 "fulfillment_status": "inevaso",
@@ -177,7 +184,10 @@ def import_orders():
                         "riservato_sito": current + quantity
                     }).eq("product_id", product_id).execute()
                 else:
-                    logging.warning("Riga con variante non trovata → ordine %s, SKU: %s, qty: %s", order['name'], sku, quantity)
+                    logging.warning(
+                        "Riga con variante non trovata → ordine %s, SKU: %s, qty: %s",
+                        order['name'], sku, quantity
+                    )
 
             imported += 1
 
