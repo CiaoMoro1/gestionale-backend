@@ -32,7 +32,7 @@ def require_auth(fn):
                 token,
                 get_jwt_secret(),
                 algorithms=["HS256"],
-                audience=None  # imposta se vuoi controllare audience
+                options={"verify_aud": False}
             )
             user_id = decoded.get("sub")
             email = decoded.get("email")
