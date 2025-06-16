@@ -12,17 +12,21 @@ DEV_MODE = os.getenv("DEV_MODE") == "1"
 JWKS_URL = f"https://{SUPABASE_PROJECT_ID}.supabase.co/auth/v1/keys"
 _jwks_cache = {}
 
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
 def get_public_key():
     global _jwks_cache
     if not _jwks_cache:
-        # Qui NON devi mai mandare header Authorization!
-        resp = requests.get(JWKS_URL, headers={})   # <-- headers vuoto
+        # Nessun header! Deve essere una richiesta pubblica
+        resp = requests.get(JWKS_URL, headers={})
         resp.raise_for_status()
         _jwks_cache = resp.json()
     for key in _jwks_cache['keys']:
         if key['alg'] == 'RS256':
             return jwt.algorithms.RSAAlgorithm.from_jwk(key)
     raise Exception("No RS256 key found in JWKS")
+
+
 
 def require_auth(fn):
     @wraps(fn)
