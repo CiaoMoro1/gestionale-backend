@@ -187,10 +187,9 @@ def create_brt_label():
     parcel_id = parcel_ids[0] if parcel_ids else None
     parcel_number = brt_create.get("parcelNumberFrom")
 
-    # Aggiorna Supabase
     supabase.table("orders").update({
-        "stato_ordine": "etichetta",
-        "parcel_id": parcel_id,
+        "stato_ordine": "etichetta_generata",
+        "parcel_id": json.dumps(parcel_ids),  # <-- Salva TUTTI i parcelID (come array)
         "parcel_number": parcel_number,
         "numeric_sender_reference": numeric_reference,
         "label_pdf_base64": json.dumps(labels_stream),
@@ -352,3 +351,46 @@ def delete_brt_shipment():
 
     # Se non cancellata, ritorna errore
     return jsonify({"error": "Eliminazione fallita", "details": execution_msg}), 400
+
+
+
+# ----------------------------------------
+# TRACKING SPEDIZIONE BRT (MULTIPARCEL)
+# ----------------------------------------
+@brt.route("/api/brt/tracking", methods=["GET"])
+@require_auth
+def brt_tracking_multi():
+    """
+    Tracking multiplo BRT: accetta uno o più parcelId tramite query string.
+    Esempio: /api/brt/tracking?parcelIds=123,456,789
+    """
+    import os
+    import requests
+
+    parcel_ids = request.args.get("parcelIds", "")
+    if not parcel_ids:
+        return jsonify({"error": "Nessun parcelId fornito"}), 400
+
+    BRT_USER_ID = os.getenv("BRT_USER_ID")
+    BRT_PASSWORD = os.getenv("BRT_PASSWORD")
+
+    ids = [pid.strip() for pid in parcel_ids.split(",") if pid.strip()]
+    results = []
+    errors = []
+
+    for pid in ids:
+        url = f"https://api.brt.it/rest/v1/tracking/parcelID/{pid}"
+        headers = {
+            "userID": BRT_USER_ID,
+            "password": BRT_PASSWORD,
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                results.append({"parcelId": pid, "tracking": resp.json()})
+            else:
+                errors.append({"parcelId": pid, "error": resp.text, "status_code": resp.status_code})
+        except Exception as exc:
+            errors.append({"parcelId": pid, "error": str(exc), "status_code": None})
+
+    return jsonify({"results": results, "errors": errors})
