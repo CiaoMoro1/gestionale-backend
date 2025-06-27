@@ -81,34 +81,51 @@ def sync_vendor_orders():
     for po in all_orders:
         try:
             order_details = po.get("orderDetails", {})
+            items = order_details.get("items", [])
+            # Prendi total_amount e currency dal primo item se c'è almeno un item
+            total_amount = None
+            currency = None
+            if items:
+                try:
+                    # Prova a sommare tutti i netCost, se ci sono
+                    total_amount = sum(float(it.get("netCost", {}).get("amount", 0) or 0) for it in items)
+                    currency = items[0].get("netCost", {}).get("currencyCode", None)
+                except Exception:
+                    total_amount = None
+                    currency = None
+
+            delivery_window = order_details.get("deliveryWindow", None)
+            # Prendi solo la prima data se c'è il range "YYYY-MM-DDTHH:MM:SSZ--YYYY-MM-DDTHH:MM:SSZ"
+            delivery_date = None
+            if delivery_window and "--" in delivery_window:
+                delivery_date = delivery_window.split("--")[0]
+            else:
+                delivery_date = delivery_window
+
             data = {
-                "po_number": po.get("purchaseOrderNumber"),
-                "status": po.get("purchaseOrderState"),
-                "order_date": order_details.get("purchaseOrderDate"),
-                "delivery_date": order_details.get("deliveryWindow", None),
+                "po_number": po.get("purchaseOrderNumber", ""),
+                "status": po.get("purchaseOrderState", ""),
+                "order_date": order_details.get("purchaseOrderDate", None),
+                "delivery_date": delivery_date,
                 "sold_to_party": order_details.get("sellingParty", {}).get("partyId", ""),
                 "ship_to_party": order_details.get("shipToParty", {}).get("partyId", ""),
-                "total_amount": None,  # Puoi calcolare la somma dei prezzi se vuoi
-                "currency": None,
+                "total_amount": total_amount,
+                "currency": currency,
                 "creation_timestamp": datetime.utcnow().isoformat(),
-                "raw_data": po
+                "raw_data": po  # di solito è già ok
             }
-            supabase.table("ordini_vendor").upsert(data, on_conflict="po_number").execute()
+            print("DATA TO UPSERT:", data)  # Debug
 
-            # Recupera l'id dell'ordine appena inserito/aggiornato
+            result = supabase.table("ordini_vendor").upsert(data, on_conflict="po_number").execute()
+            print("SUPABASE UPSERT RESPONSE:", result)  # Debug
+
             ord = supabase.table("ordini_vendor").select("id").eq("po_number", data["po_number"]).single().execute()
             ordini_vendor_id = ord.data["id"]
 
-            # Cancella le vecchie righe item (così eviti duplicati)
             supabase.table("ordini_vendor_items").delete().eq("order_id", ordini_vendor_id).execute()
-
-            # Salva le nuove righe articolo
-            po_items = order_details.get("items", [])
-            if po_items:
-                save_vendor_order_items(data["po_number"], po_items, ordini_vendor_id)
-
+            if items:
+                save_vendor_order_items(data["po_number"], items, ordini_vendor_id)
             imported += 1
         except Exception as e:
+            print("SUPABASE UPSERT ERROR:", e)
             errors.append(f"PO {po.get('purchaseOrderNumber', 'n/a')}: {e}")
-
-    return jsonify({"status": "ok", "imported": imported, "errors": errors})
