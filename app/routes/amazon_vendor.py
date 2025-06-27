@@ -23,23 +23,23 @@ def get_spapi_access_token():
     resp.raise_for_status()
     return resp.json()["access_token"]
 
-def upsert_vendor_product(asin, access_token, awsauth, max_retries=3):
-    marketplace_id = "APJ6JRA9NG5V4"  # Amazon IT
+def upsert_vendor_product(asin, access_token, awsauth, ean_from_items=None, max_retries=3):
+    marketplace_id = "APJ6JRA9NG5V4"
     url = f"https://sellingpartnerapi-eu.amazon.com/catalog/2022-04-01/items/{asin}"
     headers = {
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
     }
     params = {"marketplaceIds": marketplace_id}
+    delay = 0.6
 
-    delay = 0.6  # 600ms per evitare quota exceeded
     for attempt in range(max_retries):
         resp = requests.get(url, headers=headers, auth=awsauth, params=params)
         print("CATALOG RESPONSE:", resp.status_code, resp.text)
         if resp.status_code == 429:
             print(f"QuotaExceeded: retry {attempt+1}/{max_retries}, sleep {delay}s...")
             time.sleep(delay)
-            delay *= 2  # exponential backoff
+            delay *= 2
             continue
         if resp.status_code == 400:
             print(f"BadRequest for ASIN {asin}, skipping...")
@@ -48,27 +48,24 @@ def upsert_vendor_product(asin, access_token, awsauth, max_retries=3):
             print(f"Error for ASIN {asin}: status {resp.status_code}")
             return
         item = resp.json()
-        attrs = item.get("attributes", {})
-        ean = attrs.get("external_product_id", [""])[0] if "external_product_id" in attrs else ""
-        model_number = attrs.get("model_number", [""])[0] if "model_number" in attrs else ""
-        title = attrs.get("title", [""])[0] if "title" in attrs else ""
-        brand = attrs.get("brand", [""])[0] if "brand" in attrs else ""
-        image_url = ""
-        if "images" in item and item["images"]:
-            image_url = item["images"][0].get("link", "")
+        summaries = item.get("summaries", [])
+        summary = summaries[0] if summaries else {}
+
+        title = summary.get("itemName", "")
+        sku = summary.get("partNumber", "")
+        ean = ean_from_items or ""
+
         data = {
             "asin": asin,
-            "ean": ean,
-            "sku": model_number,      # SKU = model_number Amazon
+            "sku": sku,
             "title": title,
-            "brand": brand,
-            "image_url": image_url,
+            "ean": ean,
             "raw_data": item,
             "updated_at": datetime.utcnow().isoformat()
         }
         print("UPSERT PRODUCT:", data)
         supabase.table("products_vendor").upsert(data, on_conflict="asin").execute()
-        return  # Success, esci dal ciclo
+        return
 
 def save_vendor_order_items(po_number, po_items, ordini_vendor_id):
     for item in po_items:
