@@ -8,7 +8,6 @@ from datetime import datetime
 bp = Blueprint('amazon_vendor', __name__)
 
 def get_spapi_access_token():
-    """Ottiene un access token Amazon SP-API via refresh_token"""
     url = "https://api.amazon.com/auth/o2/token"
     data = {
         "grant_type": "refresh_token",
@@ -17,6 +16,9 @@ def get_spapi_access_token():
         "client_secret": os.getenv("SPAPI_CLIENT_SECRET")
     }
     resp = requests.post(url, data=data)
+    print("===== AMAZON OAUTH2 DEBUG =====")
+    print("Request data:", data)
+    print("Response:", resp.status_code, resp.text)
     resp.raise_for_status()
     return resp.json()["access_token"]
 
