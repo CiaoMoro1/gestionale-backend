@@ -54,3 +54,5 @@ Werkzeug==3.1.3
 yarl==1.20.0
 requests-aws4auth
 pandas
+xlrd>=2.0.1
+openpyxl
