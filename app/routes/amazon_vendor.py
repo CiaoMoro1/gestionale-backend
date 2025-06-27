@@ -23,11 +23,6 @@ def get_spapi_access_token():
     return resp.json()["access_token"]
 
 def save_vendor_order_items(po_number, po_items, ordini_vendor_id):
-    """
-    Salva le righe dell’ordine vendor.
-    po_items: lista di item Amazon (dict)
-    ordini_vendor_id: chiave primaria tabella ordini_vendor (usata come FK)
-    """
     for item in po_items:
         data = {
             "order_id": ordini_vendor_id,
@@ -56,33 +51,48 @@ def sync_vendor_orders():
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
     }
-    params = {
-        "limit": 20,
-        "createdAfter": request.json.get("createdAfter", "2024-06-01T00:00:00Z")
-    }
-    resp = requests.get(url, auth=awsauth, headers=headers, params=params)
-    print("Amazon Vendor Orders Response:", resp.status_code, resp.text)  # <--- AGGIUNGI QUI
+    limit = request.json.get("limit", 100)
+    created_after = request.json.get("createdAfter", "2024-06-01T00:00:00Z")
 
-    resp.raise_for_status()
-    orders = resp.json().get("purchaseOrders", [])
+    params = {
+        "limit": limit,
+        "createdAfter": created_after
+    }
+
+    all_orders = []
+    next_token = None
+
+    while True:
+        if next_token:
+            params = {"nextToken": next_token}
+        resp = requests.get(url, auth=awsauth, headers=headers, params=params)
+        print("Amazon Vendor Orders Response:", resp.status_code, resp.text)
+        resp.raise_for_status()
+        payload = resp.json()["payload"]
+        orders = payload.get("orders", [])
+        all_orders.extend(orders)
+        next_token = payload.get("pagination", {}).get("nextToken")
+        if not next_token:
+            break
+
     imported = 0
     errors = []
 
-    for po in orders:
+    for po in all_orders:
         try:
+            order_details = po.get("orderDetails", {})
             data = {
                 "po_number": po.get("purchaseOrderNumber"),
                 "status": po.get("purchaseOrderState"),
-                "order_date": po.get("purchaseOrderDate"),
-                "delivery_date": po.get("deliveryDate", None),
-                "sold_to_party": po.get("soldToParty", {}).get("name", ""),
-                "ship_to_party": po.get("shipToParty", {}).get("name", ""),
-                "total_amount": po.get("orderTotal", {}).get("amount", None),
-                "currency": po.get("orderTotal", {}).get("currencyCode", None),
+                "order_date": order_details.get("purchaseOrderDate"),
+                "delivery_date": order_details.get("deliveryWindow", None),
+                "sold_to_party": order_details.get("sellingParty", {}).get("partyId", ""),
+                "ship_to_party": order_details.get("shipToParty", {}).get("partyId", ""),
+                "total_amount": None,  # Puoi calcolare la somma dei prezzi se vuoi
+                "currency": None,
                 "creation_timestamp": datetime.utcnow().isoformat(),
                 "raw_data": po
             }
-            # Upsert dell'ordine vendor
             supabase.table("ordini_vendor").upsert(data, on_conflict="po_number").execute()
 
             # Recupera l'id dell'ordine appena inserito/aggiornato
@@ -93,7 +103,7 @@ def sync_vendor_orders():
             supabase.table("ordini_vendor_items").delete().eq("order_id", ordini_vendor_id).execute()
 
             # Salva le nuove righe articolo
-            po_items = po.get("items", [])
+            po_items = order_details.get("items", [])
             if po_items:
                 save_vendor_order_items(data["po_number"], po_items, ordini_vendor_id)
 
