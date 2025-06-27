@@ -4,6 +4,7 @@ import os
 from requests_aws4auth import AWS4Auth
 from app.supabase_client import supabase
 from datetime import datetime
+import time
 
 bp = Blueprint('amazon_vendor', __name__)
 
@@ -22,15 +23,30 @@ def get_spapi_access_token():
     resp.raise_for_status()
     return resp.json()["access_token"]
 
-def upsert_vendor_product(asin, access_token, awsauth):
+def upsert_vendor_product(asin, access_token, awsauth, max_retries=3):
+    marketplace_id = "APJ6JRA9NG5V4"  # Amazon IT
     url = f"https://sellingpartnerapi-eu.amazon.com/catalog/2022-04-01/items/{asin}"
     headers = {
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
     }
-    resp = requests.get(url, headers=headers, auth=awsauth)
-    print("CATALOG RESPONSE:", resp.status_code, resp.text)
-    if resp.status_code == 200:
+    params = {"marketplaceIds": marketplace_id}
+
+    delay = 0.6  # 600ms per evitare quota exceeded
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, auth=awsauth, params=params)
+        print("CATALOG RESPONSE:", resp.status_code, resp.text)
+        if resp.status_code == 429:
+            print(f"QuotaExceeded: retry {attempt+1}/{max_retries}, sleep {delay}s...")
+            time.sleep(delay)
+            delay *= 2  # exponential backoff
+            continue
+        if resp.status_code == 400:
+            print(f"BadRequest for ASIN {asin}, skipping...")
+            return
+        if resp.status_code != 200:
+            print(f"Error for ASIN {asin}: status {resp.status_code}")
+            return
         item = resp.json()
         attrs = item.get("attributes", {})
         ean = attrs.get("external_product_id", [""])[0] if "external_product_id" in attrs else ""
@@ -52,6 +68,7 @@ def upsert_vendor_product(asin, access_token, awsauth):
         }
         print("UPSERT PRODUCT:", data)
         supabase.table("products_vendor").upsert(data, on_conflict="asin").execute()
+        return  # Success, esci dal ciclo
 
 def save_vendor_order_items(po_number, po_items, ordini_vendor_id):
     for item in po_items:
@@ -60,10 +77,10 @@ def save_vendor_order_items(po_number, po_items, ordini_vendor_id):
         data = {
             "order_id": ordini_vendor_id,
             "line_number": item.get("itemSequenceNumber"),
-            "sku": vendor_product_id,         # Vendor product ID/EAN
+            "sku": vendor_product_id,
             "product_title": item.get("itemDescription", ""),
             "ean": item.get("buyerProductIdentifier", ""),
-            "asin": asin,                     # ASIN (se aggiunto nella tabella!)
+            "asin": asin,
             "ordered_quantity": item.get("orderedQuantity", {}).get("amount", None),
             "confirmed_quantity": item.get("acknowledgedQuantity", {}).get("amount", None),
             "price": item.get("netCost", {}).get("amount", None),
@@ -166,7 +183,7 @@ def sync_vendor_catalog():
             'eu-west-1', 'execute-api',
             session_token=os.getenv("AWS_SESSION_TOKEN")
         )
-        # Prendi tutti gli ASIN unici dagli ordini_vendor_items (usa la funzione SQL oppure .select().execute())
+        # Prendi tutti gli ASIN unici dagli ordini_vendor_items
         asins_resp = supabase.table("ordini_vendor_items").select("asin").execute()
         all_asins = set([r.get("asin") for r in asins_resp.data if r.get("asin")])
         # Prendi tutti gli ASIN già in products_vendor
@@ -179,6 +196,7 @@ def sync_vendor_catalog():
             try:
                 upsert_vendor_product(asin, access_token, awsauth)
                 imported += 1
+                time.sleep(0.6)  # Rate limit: max 2 richieste/sec!
             except Exception as e:
                 errors.append(f"{asin}: {str(e)}")
     except Exception as e:
