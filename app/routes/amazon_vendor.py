@@ -61,6 +61,8 @@ def sync_vendor_orders():
         "createdAfter": request.json.get("createdAfter", "2024-06-01T00:00:00Z")
     }
     resp = requests.get(url, auth=awsauth, headers=headers, params=params)
+    print("Amazon Vendor Orders Response:", resp.status_code, resp.text)  # <--- AGGIUNGI QUI
+
     resp.raise_for_status()
     orders = resp.json().get("purchaseOrders", [])
     imported = 0
