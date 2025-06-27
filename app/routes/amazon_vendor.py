@@ -1,201 +1,87 @@
 from flask import Blueprint, jsonify, request
-import requests
-import os
-from requests_aws4auth import AWS4Auth
+import pandas as pd
+import io
 from app.supabase_client import supabase
 from datetime import datetime
-import time
 
 bp = Blueprint('amazon_vendor', __name__)
 
-def get_spapi_access_token():
-    url = "https://api.amazon.com/auth/o2/token"
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": os.getenv("SPAPI_REFRESH_TOKEN"),
-        "client_id": os.getenv("SPAPI_CLIENT_ID"),
-        "client_secret": os.getenv("SPAPI_CLIENT_SECRET")
-    }
-    resp = requests.post(url, data=data)
-    print("===== AMAZON OAUTH2 DEBUG =====")
-    print("Request data:", data)
-    print("Response:", resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {"xls", "xlsx"}
 
-def upsert_vendor_product(asin, access_token, awsauth, ean_from_items=None, max_retries=3):
-    marketplace_id = "APJ6JRA9NG5V4"
-    url = f"https://sellingpartnerapi-eu.amazon.com/catalog/2022-04-01/items/{asin}"
-    headers = {
-        "x-amz-access-token": access_token,
-        "Content-Type": "application/json"
-    }
-    params = {"marketplaceIds": marketplace_id}
-    delay = 0.6
+@bp.route('/api/amazon/vendor/orders/upload', methods=['POST'])
+def upload_vendor_orders():
+    if 'file' not in request.files:
+        return jsonify({"error": "Nessun file fornito"}), 400
 
-    for attempt in range(max_retries):
-        resp = requests.get(url, headers=headers, auth=awsauth, params=params)
-        print("CATALOG RESPONSE:", resp.status_code, resp.text)
-        if resp.status_code == 429:
-            print(f"QuotaExceeded: retry {attempt+1}/{max_retries}, sleep {delay}s...")
-            time.sleep(delay)
-            delay *= 2
-            continue
-        if resp.status_code == 400:
-            print(f"BadRequest for ASIN {asin}, skipping...")
-            return
-        if resp.status_code != 200:
-            print(f"Error for ASIN {asin}: status {resp.status_code}")
-            return
-        item = resp.json()
-        summaries = item.get("summaries", [])
-        summary = summaries[0] if summaries else {}
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "Nessun file selezionato"}), 400
 
-        title = summary.get("itemName", "")
-        sku = summary.get("partNumber", "")
-        ean = ean_from_items or ""
+    if not allowed_file(file.filename):
+        return jsonify({"error": "Formato file non valido"}), 400
 
-        data = {
-            "asin": asin,
-            "sku": sku,
-            "title": title,
-            "ean": ean,
-            "raw_data": item,
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        print("UPSERT PRODUCT:", data)
-        supabase.table("products_vendor").upsert(data, on_conflict="asin").execute()
-        return
-
-def save_vendor_order_items(po_number, po_items, ordini_vendor_id):
-    for item in po_items:
-        vendor_product_id = item.get("vendorProductIdentifier", "")
-        asin = item.get("amazonProductIdentifier", "")
-        data = {
-            "order_id": ordini_vendor_id,
-            "line_number": item.get("itemSequenceNumber"),
-            "sku": vendor_product_id,
-            "product_title": item.get("itemDescription", ""),
-            "ean": item.get("buyerProductIdentifier", ""),
-            "asin": asin,
-            "ordered_quantity": item.get("orderedQuantity", {}).get("amount", None),
-            "confirmed_quantity": item.get("acknowledgedQuantity", {}).get("amount", None),
-            "price": item.get("netCost", {}).get("amount", None),
-            "raw_data": item
-        }
-        supabase.table("ordini_vendor_items").insert(data).execute()
-
-@bp.route('/api/amazon/vendor/orders/sync', methods=['POST'])
-def sync_vendor_orders():
-    imported = 0
-    errors = []
     try:
-        access_token = get_spapi_access_token()
-        awsauth = AWS4Auth(
-            os.getenv("AWS_ACCESS_KEY"),
-            os.getenv("AWS_SECRET_KEY"),
-            'eu-west-1', 'execute-api',
-            session_token=os.getenv("AWS_SESSION_TOKEN")
-        )
-        url = "https://sellingpartnerapi-eu.amazon.com/vendor/orders/v1/purchaseOrders"
-        headers = {
-            "x-amz-access-token": access_token,
-            "Content-Type": "application/json"
-        }
-        limit = request.json.get("limit", 100)
-        created_after = request.json.get("createdAfter", "2024-06-01T00:00:00Z")
-        params = {"limit": limit, "createdAfter": created_after}
-        all_orders = []
-        next_token = None
+        excel_bytes = file.read()
+        df = pd.read_excel(io.BytesIO(excel_bytes), header=2)  # Intestazione alla riga 3 (indice 2)
 
-        while True:
-            if next_token:
-                params = {"nextToken": next_token}
-            resp = requests.get(url, auth=awsauth, headers=headers, params=params)
-            print("Amazon Vendor Orders Response:", resp.status_code, resp.text)
-            resp.raise_for_status()
-            payload = resp.json()["payload"]
-            orders = payload.get("orders", [])
-            all_orders.extend(orders)
-            next_token = payload.get("pagination", {}).get("nextToken")
-            if not next_token:
-                break
+        required_columns = [
+            'Numero ordine/ordine d’acquisto',
+            'Codice identificativo esterno',
+            'Numero di modello',
+            'ASIN',
+            'Titolo',
+            'Costo',
+            'Quantità ordinata',
+            'Quantità confermata',
+            'Inizio consegna',
+            'Termine consegna',
+            'Data di consegna prevista',
+            'Stato disponibilità',
+            'Codice fornitore',
+            'Fulfillment Center'
+        ]
+        for col in required_columns:
+            if col not in df.columns:
+                return jsonify({"error": f"Colonna mancante: {col}"}), 400
 
-        for po in all_orders:
+        importati = 0
+        po_numbers = set()
+        errors = []
+
+        for _, row in df.iterrows():
             try:
-                order_details = po.get("orderDetails", {})
-                items = order_details.get("items", [])
-
-                total_amount = None
-                currency = None
-                if items:
-                    try:
-                        total_amount = sum(float(it.get("netCost", {}).get("amount", 0) or 0) for it in items)
-                        currency = items[0].get("netCost", {}).get("currencyCode", None)
-                    except Exception:
-                        total_amount = None
-                        currency = None
-
-                delivery_window = order_details.get("deliveryWindow", None)
-                delivery_date = delivery_window.split("--")[0] if delivery_window and "--" in delivery_window else delivery_window
-
-                data = {
-                    "po_number": po.get("purchaseOrderNumber", ""),
-                    "status": po.get("purchaseOrderState", ""),
-                    "order_date": order_details.get("purchaseOrderDate", None),
-                    "delivery_date": delivery_date,
-                    "sold_to_party": order_details.get("sellingParty", {}).get("partyId", ""),
-                    "ship_to_party": order_details.get("shipToParty", {}).get("partyId", ""),
-                    "total_amount": total_amount,
-                    "currency": currency,
-                    "creation_timestamp": datetime.utcnow().isoformat(),
-                    "raw_data": po
+                ordine = {
+                    "po_number": str(row["Numero ordine/ordine d’acquisto"]).strip(),
+                    "external_code": str(row["Codice identificativo esterno"]).strip(),
+                    "sku": str(row["Numero di modello"]).strip(),
+                    "asin": str(row["ASIN"]).strip(),
+                    "title": str(row["Titolo"]).strip(),
+                    "cost": float(str(row["Costo"]).replace("€", "").replace(",", ".").strip()),
+                    "ordered_quantity": int(row["Quantità ordinata"]),
+                    "confirmed_quantity": int(row["Quantità confermata"]),
+                    "delivery_start": str(row["Inizio consegna"]).strip(),
+                    "delivery_end": str(row["Termine consegna"]).strip(),
+                    "expected_delivery": str(row["Data di consegna prevista"]).strip(),
+                    "availability": str(row["Stato disponibilità"]).strip(),
+                    "vendor_code": str(row["Codice fornitore"]).strip(),
+                    "fulfillment_center": str(row["Fulfillment Center"]).strip(),
+                    "created_at": datetime.utcnow().isoformat(),
+                    "raw_data": row.to_dict()
                 }
-                print("DATA TO UPSERT:", data)
-                result = supabase.table("ordini_vendor").upsert(data, on_conflict="po_number").execute()
-                print("SUPABASE UPSERT RESPONSE:", result)
-                ord = supabase.table("ordini_vendor").select("id").eq("po_number", data["po_number"]).single().execute()
-                ordini_vendor_id = ord.data["id"]
-                supabase.table("ordini_vendor_items").delete().eq("order_id", ordini_vendor_id).execute()
-                if items:
-                    save_vendor_order_items(data["po_number"], items, ordini_vendor_id)
-                imported += 1
-            except Exception as e:
-                print("SUPABASE UPSERT ERROR:", e)
-                errors.append(f"PO {po.get('purchaseOrderNumber', 'n/a')}: {e}")
-    except Exception as outer:
-        print("FATAL ERROR SYNC VENDOR ORDERS:", outer)
-        errors.append(str(outer))
-    return jsonify({"status": "ok", "imported": imported, "errors": errors})
+                supabase.table("ordini_vendor_items").upsert(ordine, on_conflict="po_number,sku,asin").execute()
+                po_numbers.add(ordine["po_number"])
+                importati += 1
+            except Exception as ex:
+                errors.append(f"Errore riga {row.to_dict()}: {ex}")
 
-@bp.route('/api/amazon/vendor/catalog/sync', methods=['POST'])
-def sync_vendor_catalog():
-    imported = 0
-    errors = []
-    try:
-        access_token = get_spapi_access_token()
-        awsauth = AWS4Auth(
-            os.getenv("AWS_ACCESS_KEY"),
-            os.getenv("AWS_SECRET_KEY"),
-            'eu-west-1', 'execute-api',
-            session_token=os.getenv("AWS_SESSION_TOKEN")
-        )
-        # Prendi tutti gli ASIN unici dagli ordini_vendor_items
-        asins_resp = supabase.table("ordini_vendor_items").select("asin").execute()
-        all_asins = set([r.get("asin") for r in asins_resp.data if r.get("asin")])
-        # Prendi tutti gli ASIN già in products_vendor
-        products_resp = supabase.table("products_vendor").select("asin").execute()
-        already_present = set([r["asin"] for r in products_resp.data if r.get("asin")])
-        # Solo i nuovi
-        new_asins = all_asins - already_present
+        return jsonify({
+            "status": "ok",
+            "importati": importati,
+            "po_unici": len(po_numbers),
+            "po_list": list(po_numbers),
+            "errors": errors
+        })
 
-        for asin in new_asins:
-            try:
-                upsert_vendor_product(asin, access_token, awsauth)
-                imported += 1
-                time.sleep(0.6)  # Rate limit: max 2 richieste/sec!
-            except Exception as e:
-                errors.append(f"{asin}: {str(e)}")
     except Exception as e:
-        errors.append(f"FATAL: {str(e)}")
-    return jsonify({"status": "ok", "imported": imported, "errors": errors})
+        return jsonify({"error": f"Errore durante l'importazione: {e}"}), 500
