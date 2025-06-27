@@ -175,30 +175,42 @@ def upload_vendor_orders():
 
 @bp.route('/api/amazon/vendor/orders/riepilogo/nuovi', methods=['GET'])
 def get_riepilogo_nuovi():
+    # 1. Prendi tutti i riepiloghi "nuovo"
     res = supabase.table("ordini_vendor_riepilogo").select("*").eq("stato_ordine", "nuovo").execute()
     riepiloghi = res.data if hasattr(res, 'data') else res
 
+    # 2. Raccogli tutti i PO unici
+    tutti_po = set()
+    for r in riepiloghi:
+        if r["po_list"]:
+            tutti_po.update(r["po_list"])
+
+    if not tutti_po:
+        return jsonify([])
+
+    # 3. Un'unica query per TUTTI i PO
+    dettagli = supabase.table("ordini_vendor_items") \
+        .select("po_number, qty_ordered, fulfillment_center, start_delivery") \
+        .in_("po_number", list(tutti_po)) \
+        .execute().data
+
+    # 4. Costruisci una mappa: (po_number, fc, start_delivery) => somma articoli
+    articoli_per_po = {}
+    for x in dettagli:
+        key = (x["po_number"], x["fulfillment_center"], str(x["start_delivery"])[:10])
+        articoli_per_po[key] = articoli_per_po.get(key, 0) + int(x["qty_ordered"])
+
+    # 5. Costruisci la risposta finale
     risposta = []
     for r in riepiloghi:
         po_list = []
-        # Query UNICA: tutte le righe di quel gruppo
         if not r["po_list"]:
             continue
-        dettaglio = supabase.table("ordini_vendor_items") \
-            .select("po_number, qty_ordered") \
-            .eq("fulfillment_center", r["fulfillment_center"]) \
-            .eq("start_delivery", r["start_delivery"]) \
-            .in_("po_number", r["po_list"]) \
-            .execute().data
-
-        articoli_per_po = {}
-        for x in dettaglio:
-            po_n = x["po_number"]
-            articoli_per_po[po_n] = articoli_per_po.get(po_n, 0) + int(x["qty_ordered"])
         for po in r["po_list"]:
+            key = (po, r["fulfillment_center"], str(r["start_delivery"])[:10])
             po_list.append({
                 "po_number": po,
-                "numero_articoli": articoli_per_po.get(po, 0)
+                "numero_articoli": articoli_per_po.get(key, 0)
             })
         totale_articoli = sum(x["numero_articoli"] for x in po_list)
         risposta.append({
@@ -209,3 +221,4 @@ def get_riepilogo_nuovi():
             "stato_ordine": r["stato_ordine"]
         })
     return jsonify(risposta)
+
