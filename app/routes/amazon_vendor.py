@@ -18,32 +18,23 @@ def safe_value(v):
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {"xls", "xlsx"}
 
+# ------------------ UPLOAD ORDINI -------------------
 @bp.route('/api/amazon/vendor/orders/upload', methods=['POST'])
 def upload_vendor_orders():
-    print("📥 Richiesta ricevuta su /api/amazon/vendor/orders/upload")
-    
     if 'file' not in request.files:
-        print("❌ Nessun file fornito in request.files")
         return jsonify({"error": "Nessun file fornito"}), 400
 
     file = request.files['file']
-    print(f"📄 File ricevuto: {file.filename}")
-
     if file.filename == '':
-        print("❌ File con nome vuoto")
         return jsonify({"error": "Nessun file selezionato"}), 400
 
     if not allowed_file(file.filename):
-        print(f"❌ Formato file non valido: {file.filename}")
         return jsonify({"error": "Formato file non valido"}), 400
 
     try:
         excel_bytes = file.read()
-        print(f"📊 Lettura file Excel in memoria ({len(excel_bytes)} bytes)")
-
         df = pd.read_excel(io.BytesIO(excel_bytes), header=2, sheet_name="Articoli")
         df.columns = [str(c).strip().replace('\n', ' ').replace('\r', '').replace('  ', ' ') for c in df.columns]
-        print("🔎 Colonne lette:", df.columns.tolist())
 
         required_columns = [
             'Numero ordine/ordine d’acquisto',
@@ -63,23 +54,20 @@ def upload_vendor_orders():
         ]
         for col in required_columns:
             if col not in df.columns:
-                print(f"❌ Colonna mancante nel file: {col}")
                 return jsonify({"error": f"Colonna mancante: {col}"}), 400
 
-        # Scarico chiavi esistenti per doppioni
-        print("🔍 Scarico chiavi esistenti da Supabase...")
+        # Preleva chiavi già presenti (controllo doppioni)
         res = supabase.table("ordini_vendor_items").select(
             "po_number,model_number,qty_ordered,start_delivery,fulfillment_center"
         ).execute()
         ordini_esistenti = res.data if hasattr(res, 'data') else res
-        print(f"🔍 {len(ordini_esistenti)} righe già presenti nel DB.")
 
         def is_duplicate(row):
             chiave_new = (
                 str(row["Numero ordine/ordine d’acquisto"]).strip(),
                 str(row["Numero di modello"]).strip(),
                 int(row["Quantità ordinata"]),
-                str(row["Inizio consegna"]).strip()[:10],  # solo la data
+                str(row["Inizio consegna"]).strip()[:10],
                 str(row["Fulfillment Center"]).strip()
             )
             for ord_db in ordini_esistenti:
@@ -102,9 +90,9 @@ def upload_vendor_orders():
         for _, row in df.iterrows():
             try:
                 if is_duplicate(row):
-                    msg = f"Doppione trovato: Ordine={row['Numero ordine/ordine d’acquisto']} | Modello={row['Numero di modello']} | Quantità={row['Quantità ordinata']} | Inizio consegna={row['Inizio consegna']} | FC={row['Fulfillment Center']}"
-                    print(f"⚠️ {msg}")
-                    doppioni.append(msg)
+                    doppioni.append(
+                        f"Doppione: Ordine={row['Numero ordine/ordine d’acquisto']} | Modello={row['Numero di modello']} | Quantità={row['Quantità ordinata']}"
+                    )
                     continue
 
                 ordine = {
@@ -125,22 +113,17 @@ def upload_vendor_orders():
                     "created_at": datetime.utcnow().isoformat(),
                 }
                 supabase.table("ordini_vendor_items").insert(ordine).execute()
-                print(f"📦 Inserito ordine: {ordine['po_number']} / MODEL: {ordine['model_number']}")
                 po_numbers.add(ordine["po_number"])
                 importati += 1
             except Exception as ex:
-                error_message = f"❌ Errore su riga: {row.to_dict()} → {ex}"
-                print(error_message)
-                errors.append(error_message)
+                errors.append(str(ex))
 
-        # === LOGICA DI RIEPILOGO ===
-        print("🔄 Creo riepilogo per Fulfillment Center & Data...")
+        # RIEPILOGO (aggiorna sempre!)
         ordini = supabase.table("ordini_vendor_items").select(
             "po_number, qty_ordered, fulfillment_center, start_delivery"
         ).execute().data
 
         gruppi = defaultdict(lambda: {"po_list": set(), "totale_articoli": 0})
-
         for o in ordini:
             key = (o["fulfillment_center"], str(o["start_delivery"])[:10])
             gruppi[key]["po_list"].add(o["po_number"])
@@ -154,11 +137,17 @@ def upload_vendor_orders():
                 "totale_articoli": dati["totale_articoli"],
                 "stato_ordine": "nuovo"
             }
+            # Per semplicità: cancella vecchi e inserisci nuovo riepilogo
+            res = supabase.table("ordini_vendor_riepilogo") \
+                .select("id") \
+                .eq("fulfillment_center", fc) \
+                .eq("start_delivery", data) \
+                .execute()
+            if res.data and len(res.data) > 0:
+                id_riep = res.data[0]['id']
+                supabase.table("ordini_vendor_riepilogo").delete().eq("id", id_riep).execute()
             supabase.table("ordini_vendor_riepilogo").insert(riepilogo).execute()
-        print("✅ Riepilogo ordini creato/aggiornato.")
 
-        print(f"✅ Importazione completata. Totale nuovi ordini: {importati}, PO unici: {len(po_numbers)}")
-        print(f"⚠️ Doppioni saltati: {len(doppioni)}")
         return jsonify({
             "status": "ok",
             "importati": importati,
@@ -169,38 +158,27 @@ def upload_vendor_orders():
         })
 
     except Exception as e:
-        print(f"❌ Errore generale durante l'importazione: {e}")
         return jsonify({"error": f"Errore durante l'importazione: {e}"}), 500
 
-
+# --------------- RIEPILOGO ORDINI NUOVI -------------------
 @bp.route('/api/amazon/vendor/orders/riepilogo/nuovi', methods=['GET'])
 def get_riepilogo_nuovi():
-    # 1. Prendi tutti i riepiloghi "nuovo"
     res = supabase.table("ordini_vendor_riepilogo").select("*").eq("stato_ordine", "nuovo").execute()
     riepiloghi = res.data if hasattr(res, 'data') else res
-
-    # 2. Raccogli tutti i PO unici
     tutti_po = set()
     for r in riepiloghi:
         if r["po_list"]:
             tutti_po.update(r["po_list"])
-
     if not tutti_po:
         return jsonify([])
-
-    # 3. Un'unica query per TUTTI i PO
     dettagli = supabase.table("ordini_vendor_items") \
         .select("po_number, qty_ordered, fulfillment_center, start_delivery") \
         .in_("po_number", list(tutti_po)) \
         .execute().data
-
-    # 4. Costruisci una mappa: (po_number, fc, start_delivery) => somma articoli
     articoli_per_po = {}
     for x in dettagli:
         key = (x["po_number"], x["fulfillment_center"], str(x["start_delivery"])[:10])
         articoli_per_po[key] = articoli_per_po.get(key, 0) + int(x["qty_ordered"])
-
-    # 5. Costruisci la risposta finale
     risposta = []
     for r in riepiloghi:
         po_list = []
@@ -222,3 +200,231 @@ def get_riepilogo_nuovi():
         })
     return jsonify(risposta)
 
+# --------- DETTAGLIO ARTICOLI DI UNA DESTINAZIONE+DATA ----------
+@bp.route('/api/amazon/vendor/orders/dettaglio-destinazione', methods=['GET'])
+def dettaglio_destinazione():
+    center = request.args.get("center")
+    data = request.args.get("data")
+    if not center or not data:
+        return jsonify([])
+
+    riepilogo_res = supabase.table("ordini_vendor_riepilogo") \
+        .select("id, po_list") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", data) \
+        .execute()
+    if not riepilogo_res.data or not riepilogo_res.data[0]["po_list"]:
+        return jsonify([])
+
+    po_list = riepilogo_res.data[0]["po_list"]
+    riepilogo_id = riepilogo_res.data[0]["id"]
+
+    articoli = supabase.table("ordini_vendor_items") \
+        .select("po_number, model_number, vendor_product_id, title, qty_ordered") \
+        .in_("po_number", po_list) \
+        .execute().data
+
+    return jsonify({"articoli": articoli, "riepilogo_id": riepilogo_id})
+
+# ---------- UTILITY: Recupera ID riepilogo --------------
+@bp.route('/api/amazon/vendor/riepilogo-id', methods=['GET'])
+def get_riepilogo_id():
+    center = request.args.get("center")
+    data = request.args.get("data")
+    if not center or not data:
+        return jsonify({"error": "center/data richiesti"}), 400
+
+    res = supabase.table("ordini_vendor_riepilogo")\
+        .select("id")\
+        .eq("fulfillment_center", center)\
+        .eq("start_delivery", data)\
+        .execute()
+    if res.data and len(res.data) > 0:
+        return jsonify({"riepilogo_id": res.data[0]['id']})
+    return jsonify({"riepilogo_id": None})
+
+# ----------------- LEGGI PARZIALI SPEDIZIONE ---------------
+@bp.route('/api/amazon/vendor/parziali', methods=['GET'])
+def get_parziali():
+    riepilogo_id = request.args.get('riepilogo_id')
+    if not riepilogo_id:
+        return jsonify({"error": "riepilogo_id mancante"}), 400
+    res = supabase.table("ordini_vendor_parziali")\
+        .select("*")\
+        .eq("riepilogo_id", riepilogo_id)\
+        .order("numero_parziale")\
+        .execute()
+    return jsonify(res.data if hasattr(res, 'data') else res)
+
+# -------------- SALVA NUOVO PARZIALE SPEDIZIONE ----------------
+@bp.route('/api/amazon/vendor/parziali', methods=['POST'])
+def save_parziale():
+    data = request.json
+    riepilogo_id = data.get("riepilogo_id")
+    dati = data.get("dati")  # array di {model_number, quantita, collo}
+    if not riepilogo_id or not dati:
+        return jsonify({"error": "Dati mancanti"}), 400
+
+    res = supabase.table("ordini_vendor_parziali")\
+        .select("numero_parziale")\
+        .eq("riepilogo_id", riepilogo_id)\
+        .order("numero_parziale", desc=True)\
+        .limit(1)\
+        .execute()
+    max_num = 1
+    if res.data and len(res.data) > 0:
+        max_num = int(res.data[0]["numero_parziale"]) + 1
+
+    parziale = {
+        "riepilogo_id": riepilogo_id,
+        "numero_parziale": max_num,
+        "dati": dati,
+        "confermato": False,
+    }
+    supabase.table("ordini_vendor_parziali").insert(parziale).execute()
+    return jsonify({"ok": True, "numero_parziale": max_num})
+
+
+
+@bp.route('/api/amazon/vendor/parziali/<int:riepilogo_id>', methods=['GET'])
+def get_parziali_riepilogo(riepilogo_id):
+    # Tutti i parziali NON confermati (bozza in lavorazione)
+    res = supabase.table("ordini_vendor_parziali") \
+        .select("*") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .order("numero_parziale", desc=True) \
+        .limit(1) \
+        .execute()
+    if not res.data:
+        return jsonify({"parziali": [], "confermaCollo": {}})
+    parz = res.data[0]
+    return jsonify({
+        "parziali": parz["dati"],
+        "confermaCollo": parz.get("conferma_collo", {}) # opzionale se vuoi trackare colli confermati live!
+    })
+
+@bp.route('/api/amazon/vendor/parziali/<int:riepilogo_id>', methods=['POST'])
+def post_parziali_riepilogo(riepilogo_id):
+    dati = request.json
+    # Esempio: dati = {"parziali": [...], "confermaCollo": {...}}
+    numero_parziale = dati.get("numero_parziale", 1)
+    # Aggiorna o crea (semplice upsert se esiste già NON confermato)
+    supabase.table("ordini_vendor_parziali").upsert({
+        "riepilogo_id": riepilogo_id,
+        "numero_parziale": numero_parziale,
+        "dati": dati.get("parziali", []),
+        "conferma_collo": dati.get("confermaCollo", {}),
+        "confermato": False,
+        "created_at": datetime.utcnow().isoformat()
+    }, on_conflict="riepilogo_id,numero_parziale").execute()
+    return jsonify({"ok": True})
+
+# ---- PARZIALI STORICI (confermati) ----
+@bp.route('/api/amazon/vendor/parziali-storici', methods=['GET'])
+def get_parziali_storici():
+    center = request.args.get("center")
+    data = request.args.get("data")
+    if not center or not data:
+        return jsonify([])
+
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", data) \
+        .execute().data
+    if not riepilogo:
+        return jsonify([])
+    riepilogo_id = riepilogo[0]["id"]
+    parziali = supabase.table("ordini_vendor_parziali") \
+        .select("dati") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", True) \
+        .order("numero_parziale") \
+        .execute().data
+    result = []
+    for p in parziali:
+        result.extend(p["dati"])
+    return jsonify(result)
+
+# ---- PARZIALI WIP (in lavorazione, non confermati) ----
+@bp.route('/api/amazon/vendor/parziali-wip', methods=['GET'])
+def get_parziali_wip():
+    center = request.args.get("center")
+    data = request.args.get("data")
+    if not center or not data:
+        return jsonify([])
+
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", data) \
+        .execute().data
+    if not riepilogo:
+        return jsonify([])
+    riepilogo_id = riepilogo[0]["id"]
+
+    # Prendi l’ultima bozza non confermata (se c’è)
+    parziali = supabase.table("ordini_vendor_parziali") \
+        .select("dati, numero_parziale") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", False) \
+        .order("numero_parziale", desc=True) \
+        .limit(1) \
+        .execute().data
+    if parziali and len(parziali) > 0:
+        return jsonify(parziali[0]["dati"])
+    return jsonify([])
+
+@bp.route('/api/amazon/vendor/parziali-wip', methods=['POST'])
+def save_parziali_wip():
+    center = request.args.get("center")   # <-- Prendi dalla query string
+    start_delivery = request.args.get("data")  # <-- Prendi dalla query string
+    data = request.json
+    parziali = data.get("parziali")  # array [{model_number, quantita, collo, ...}, ...]
+    conferma_collo = data.get("confermaCollo", {})
+    if not center or not start_delivery or parziali is None:
+        return jsonify({"error": "center/data/parziali richiesti"}), 400
+
+    # Trova riepilogo_id
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", start_delivery) \
+        .execute().data
+    if not riepilogo:
+        return jsonify({"error": "riepilogo non trovato"}), 400
+    riepilogo_id = riepilogo[0]["id"]
+
+    # Trova (o crea) la bozza attuale
+    res = supabase.table("ordini_vendor_parziali") \
+        .select("numero_parziale") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", False) \
+        .order("numero_parziale", desc=True) \
+        .limit(1) \
+        .execute().data
+
+    if res and len(res) > 0:
+        numero_parziale = res[0]["numero_parziale"]
+    else:
+        # Trova max numero_parziale tra i confermati
+        conf = supabase.table("ordini_vendor_parziali") \
+            .select("numero_parziale") \
+            .eq("riepilogo_id", riepilogo_id) \
+            .eq("confermato", True) \
+            .order("numero_parziale", desc=True) \
+            .limit(1) \
+            .execute().data
+        max_num = conf[0]["numero_parziale"] if conf and len(conf) > 0 else 0
+        numero_parziale = max_num + 1
+
+    # Upsert: sovrascrivi bozza corrente
+    supabase.table("ordini_vendor_parziali").upsert({
+        "riepilogo_id": riepilogo_id,
+        "numero_parziale": numero_parziale,
+        "dati": parziali,
+        "conferma_collo": conferma_collo,
+        "confermato": False,
+        "created_at": datetime.utcnow().isoformat()
+    }, on_conflict="riepilogo_id,numero_parziale").execute()
+    return jsonify({"ok": True, "numero_parziale": numero_parziale})

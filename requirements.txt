@@ -56,3 +56,5 @@ requests-aws4auth
 pandas
 xlrd>=2.0.1
 openpyxl
+marshmallow
+tenacity
