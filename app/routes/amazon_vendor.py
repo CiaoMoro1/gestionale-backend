@@ -428,3 +428,262 @@ def save_parziali_wip():
         "created_at": datetime.utcnow().isoformat()
     }, on_conflict="riepilogo_id,numero_parziale").execute()
     return jsonify({"ok": True, "numero_parziale": numero_parziale})
+
+
+@bp.route('/api/amazon/vendor/parziali-wip/conferma-parziale', methods=['POST'])
+def conferma_parziale():
+    center = request.json.get("center")
+    start_delivery = request.json.get("data")
+    if not center or not start_delivery:
+        return jsonify({"error": "center/data richiesti"}), 400
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", start_delivery) \
+        .execute().data
+    if not riepilogo:
+        return jsonify({"error": "riepilogo non trovato"}), 400
+    riepilogo_id = riepilogo[0]["id"]
+
+    # Prendi ultimo WIP
+    parziale = supabase.table("ordini_vendor_parziali") \
+        .select("*") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", False) \
+        .order("numero_parziale", desc=True) \
+        .limit(1) \
+        .execute().data
+    if not parziale:
+        return jsonify({"error": "nessun parziale da confermare"}), 400
+    num_parz = parziale[0]["numero_parziale"]
+    # Aggiorna come confermato
+    supabase.table("ordini_vendor_parziali") \
+        .update({"confermato": True}) \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("numero_parziale", num_parz) \
+        .execute()
+    # Aggiorna stato_ordine a "parziale"
+    supabase.table("ordini_vendor_riepilogo") \
+        .update({"stato_ordine": "parziale"}) \
+        .eq("id", riepilogo_id) \
+        .execute()
+    return jsonify({"ok": True})
+
+
+@bp.route('/api/amazon/vendor/parziali-wip/conferma', methods=['POST'])
+def conferma_chiudi_ordine():
+    center = request.json.get("center")
+    start_delivery = request.json.get("data")
+    if not center or not start_delivery:
+        return jsonify({"error": "center/data richiesti"}), 400
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id, po_list") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", start_delivery) \
+        .execute().data
+    if not riepilogo:
+        return jsonify({"error": "riepilogo non trovato"}), 400
+    riepilogo_id = riepilogo[0]["id"]
+    po_list = riepilogo[0]["po_list"]
+
+    # Prendi l’ULTIMO parziale NON confermato
+    wip = supabase.table("ordini_vendor_parziali") \
+        .select("*") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", False) \
+        .order("numero_parziale", desc=True) \
+        .limit(1) \
+        .execute().data
+    if not wip:
+        return jsonify({"error": "nessun parziale da confermare"}), 400
+    num_parz = wip[0]["numero_parziale"]
+    dati_wip = wip[0]["dati"]  # [{model_number, quantita, collo, ...}]
+
+    # Segna il parziale come confermato
+    supabase.table("ordini_vendor_parziali") \
+        .update({"confermato": True}) \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("numero_parziale", num_parz) \
+        .execute()
+
+    # Per ogni articolo dell’ordine: aggiorna qty_confirmed = somma di tutti i parziali (storici + wip)
+    # 1. Prendi tutti i parziali STORICI confermati (inclusi gli altri parziali di questo riepilogo)
+    parziali_storici = supabase.table("ordini_vendor_parziali") \
+        .select("dati") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", True) \
+        .order("numero_parziale") \
+        .execute().data
+    totali_sku = defaultdict(int)
+    for p in parziali_storici:
+        for r in p["dati"]:
+            totali_sku[r["model_number"]] += r["quantita"]
+    for r in dati_wip:
+        totali_sku[r["model_number"]] += r["quantita"]
+
+    # 2. Aggiorna tutte le righe articolo (qty_confirmed su tutti gli articoli della spedizione)
+    for model_number, qty in totali_sku.items():
+        # Può essere su più PO! Li aggiorni tutti.
+        supabase.table("ordini_vendor_items") \
+            .update({"qty_confirmed": qty}) \
+            .in_("po_number", po_list) \
+            .eq("model_number", model_number) \
+            .execute()
+
+    # Aggiorna stato_ordine a "parziale" o "completato"
+    stato_ordine = "parziale"
+    # TODO: se vuoi, qui puoi controllare se tutto qty_confirmed == qty_ordered => "completato"
+    supabase.table("ordini_vendor_riepilogo") \
+        .update({"stato_ordine": stato_ordine}) \
+        .eq("id", riepilogo_id) \
+        .execute()
+    return jsonify({"ok": True})
+
+
+@bp.route('/api/amazon/vendor/parziali-wip/reset', methods=['POST'])
+def reset_parziali_wip():
+    center = request.json.get("center")
+    start_delivery = request.json.get("data")
+    if not center or not start_delivery:
+        return jsonify({"error": "center/data richiesti"}), 400
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", start_delivery) \
+        .execute().data
+    if not riepilogo:
+        return jsonify({"error": "riepilogo non trovato"}), 400
+    riepilogo_id = riepilogo[0]["id"]
+    supabase.table("ordini_vendor_parziali") \
+        .delete() \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", False) \
+        .execute()
+    return jsonify({"ok": True})
+
+
+@bp.route('/api/amazon/vendor/parziali-wip/chiudi', methods=['POST'])
+def chiudi_ordine():
+    data = request.json
+    center = data.get("center")
+    start_delivery = data.get("data")
+    if not center or not start_delivery:
+        return jsonify({"error": "center/data richiesti"}), 400
+
+    # 1. Trova riepilogo_id
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id, po_list") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", start_delivery) \
+        .execute().data
+    if not riepilogo:
+        return jsonify({"error": "riepilogo non trovato"}), 400
+    riepilogo_id = riepilogo[0]["id"]
+    po_list = riepilogo[0]["po_list"]
+
+    # 2. Somma tutte le quantità confermate per ogni model_number dai parziali confermati
+    parziali = supabase.table("ordini_vendor_parziali") \
+        .select("dati") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", True) \
+        .order("numero_parziale") \
+        .execute().data
+
+    # Può esserci anche una bozza WIP da chiudere ora: prendi anche quella
+    parziali_wip = supabase.table("ordini_vendor_parziali") \
+        .select("dati") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", False) \
+        .order("numero_parziale", desc=True) \
+        .limit(1) \
+        .execute().data
+    if parziali_wip:
+        parziali.append(parziali_wip[0])
+
+    # 3. Calcola la quantità totale confermata per ogni SKU
+    qty_per_model = {}
+    for p in parziali:
+        for r in p["dati"]:
+            model = r["model_number"]
+            qty_per_model[model] = qty_per_model.get(model, 0) + int(r["quantita"])
+
+    # 4. Prendi tutti gli articoli di questo riepilogo (quelli da aggiornare)
+    articoli = supabase.table("ordini_vendor_items") \
+        .select("id, model_number") \
+        .in_("po_number", po_list) \
+        .execute().data
+
+    # 5. Aggiorna qty_confirmed per ognuno
+    for art in articoli:
+        nuova_qty = qty_per_model.get(art["model_number"], 0)
+        supabase.table("ordini_vendor_items") \
+            .update({"qty_confirmed": nuova_qty}) \
+            .eq("id", art["id"]) \
+            .execute()
+
+    # 6. Aggiorna lo stato_ordine
+    supabase.table("ordini_vendor_riepilogo") \
+        .update({"stato_ordine": "completato"}) \
+        .eq("id", riepilogo_id) \
+        .execute()
+
+    # 7. Marca anche la bozza WIP come confermata, se c’era
+    if parziali_wip:
+        numero_parziale = supabase.table("ordini_vendor_parziali") \
+            .select("numero_parziale") \
+            .eq("riepilogo_id", riepilogo_id) \
+            .eq("confermato", False) \
+            .order("numero_parziale", desc=True) \
+            .limit(1) \
+            .execute().data
+        if numero_parziale:
+            num = numero_parziale[0]["numero_parziale"]
+            supabase.table("ordini_vendor_parziali") \
+                .update({"confermato": True}) \
+                .eq("riepilogo_id", riepilogo_id) \
+                .eq("numero_parziale", num) \
+                .execute()
+
+    return jsonify({"ok": True, "qty_confirmed": qty_per_model})
+
+
+# Mostra tutti i riepiloghi con stato PARZIALE (e anche completato se vuoi)
+@bp.route('/api/amazon/vendor/orders/riepilogo/parziali', methods=['GET'])
+def get_riepilogo_parziali():
+    res = supabase.table("ordini_vendor_riepilogo")\
+        .select("*")\
+        .in_("stato_ordine", ["parziale"])\
+        .order("created_at", desc=True)\
+        .execute()
+    return jsonify(res.data if hasattr(res, 'data') else res)
+
+@bp.route('/api/amazon/vendor/items', methods=['GET'])
+def get_items_by_po():
+    po_list = request.args.get("po_list")
+    if not po_list:
+        return jsonify([])
+    pos = po_list.split(",")
+    items = supabase.table("ordini_vendor_items").select("po_number,model_number,qty_ordered,qty_confirmed").in_("po_number", pos).execute().data
+    return jsonify(items)
+
+@bp.route('/api/amazon/vendor/parziali-ordine', methods=['GET'])
+def parziali_per_ordine():
+    center = request.args.get("center")
+    data = request.args.get("data")
+    if not center or not data:
+        return jsonify([])
+    riepilogo = supabase.table("ordini_vendor_riepilogo") \
+        .select("id") \
+        .eq("fulfillment_center", center) \
+        .eq("start_delivery", data) \
+        .execute().data
+    if not riepilogo:
+        return jsonify([])
+    riepilogo_id = riepilogo[0]["id"]
+    parziali = supabase.table("ordini_vendor_parziali") \
+        .select("numero_parziale, dati, confermato, created_at, conferma_collo") \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("confermato", True) \
+        .order("numero_parziale") \
+        .execute().data
+    return jsonify(parziali)
