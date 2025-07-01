@@ -732,3 +732,24 @@ def list_vendor_pos():
     print("Amazon Vendor Orders Response:", resp.status_code, resp.text)
     # Torna semplicemente la risposta di Amazon
     return (resp.text, resp.status_code, {'Content-Type': 'application/json'})
+
+    # TEEESTTTTTTTTTT
+@bp.route('/api/amazon/vendor/asn/test', methods=['POST'])
+def test_asn_submit():
+    # Ricevi il body ASN dalla request (Thunder Client/Frontend)
+    payload = request.json
+
+    # Ottieni il token (già implementato)
+    access_token = get_spapi_access_token()
+
+    # Endpoint corretto per Direct Fulfillment Shipping (modifica se diverso)
+    url = "https://sellingpartnerapi-eu.amazon.com/vendor/directFulfillment/shipping/v1/shipmentConfirmations"
+    headers = {
+        "x-amz-access-token": access_token,
+        "Content-Type": "application/json"
+    }
+
+    # Gira la richiesta così com'è, senza modificarla
+    resp = requests.post(url, json=payload, headers=headers)
+    # Torna la risposta Amazon “grezza”
+    return (resp.text, resp.status_code, {'Content-Type': 'application/json'})
