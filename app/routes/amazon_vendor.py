@@ -5,8 +5,23 @@ from app.supabase_client import supabase
 from datetime import datetime
 import math
 from collections import defaultdict
+import os
+import requests
+from requests_aws4auth import AWS4Auth
 
 bp = Blueprint('amazon_vendor', __name__)
+
+def get_spapi_access_token():
+    url = "https://api.amazon.com/auth/o2/token"
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": os.getenv("SPAPI_REFRESH_TOKEN"),   # <-- Il tuo refresh token ottenuto prima!
+        "client_id": os.getenv("SPAPI_CLIENT_ID"),
+        "client_secret": os.getenv("SPAPI_CLIENT_SECRET"),
+    }
+    resp = requests.post(url, data=data)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
 
 def safe_value(v):
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
@@ -687,3 +702,33 @@ def parziali_per_ordine():
         .order("numero_parziale") \
         .execute().data
     return jsonify(parziali)
+
+
+@bp.route('/api/amazon/vendor/orders/list', methods=['GET'])
+def list_vendor_pos():
+    access_token = get_spapi_access_token()
+    awsauth = AWS4Auth(
+        os.getenv("AWS_ACCESS_KEY"),
+        os.getenv("AWS_SECRET_KEY"),
+        'eu-west-1', 'execute-api',
+        session_token=os.getenv("AWS_SESSION_TOKEN")
+    )
+    url = "https://sellingpartnerapi-eu.amazon.com/vendor/orders/v1/purchaseOrders"
+    # Default: ultimi 30 giorni (massimo 7gg per chiamata, puoi modificare)
+    from datetime import datetime, timedelta
+    today = datetime.utcnow()
+    seven_days_ago = today - timedelta(days=7)
+    params = {
+        "createdAfter": seven_days_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "createdBefore": today.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": request.args.get("limit", 50)
+    }
+    # Puoi aggiungere altri filtri come purchaseOrderState se vuoi
+    headers = {
+        "x-amz-access-token": access_token,
+        "Content-Type": "application/json"
+    }
+    resp = requests.get(url, auth=awsauth, headers=headers, params=params)
+    print("Amazon Vendor Orders Response:", resp.status_code, resp.text)
+    # Torna semplicemente la risposta di Amazon
+    return (resp.text, resp.status_code, {'Content-Type': 'application/json'})
