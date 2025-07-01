@@ -733,6 +733,8 @@ def list_vendor_pos():
     # Torna semplicemente la risposta di Amazon
     return (resp.text, resp.status_code, {'Content-Type': 'application/json'})
 
+
+
     # TEEESTTTTTTTTTT
 @bp.route('/api/amazon/vendor/asn/test', methods=['POST'])
 def test_asn_submit():
@@ -743,7 +745,7 @@ def test_asn_submit():
     access_token = get_spapi_access_token()
 
     # Endpoint corretto per Direct Fulfillment Shipping (modifica se diverso)
-    url = "https://sellingpartnerapi-eu.amazon.com/vendor/directFulfillment/shipping/v1/shipmentConfirmations"
+    url = "https://sellingpartnerapi-na.amazon.com/vendor/shipping/v1/shipmentConfirmations"
     headers = {
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
