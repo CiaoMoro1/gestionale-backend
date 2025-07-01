@@ -736,22 +736,48 @@ def list_vendor_pos():
 
 
     # TEEESTTTTTTTTTT
+import logging
+
 @bp.route('/api/amazon/vendor/asn/test', methods=['POST'])
 def test_asn_submit():
-    # Ricevi il body ASN dalla request (Thunder Client/Frontend)
-    payload = request.json
+    try:
+        payload = request.json
+        access_token = get_spapi_access_token()
 
-    # Ottieni il token (già implementato)
-    access_token = get_spapi_access_token()
+        url = "https://sellingpartnerapi-eu.amazon.com/vendor/directFulfillment/shipping/2021-12-28/shipmentConfirmations"
+        headers = {
+            "x-amz-access-token": access_token,
+            "Content-Type": "application/json"
+        }
 
-    # Endpoint corretto per Direct Fulfillment Shipping (modifica se diverso)
-    url = "https://sellingpartnerapi-eu.amazon.com/vendor/directFulfillment/shipping/v1/shipmentConfirmations"
-    headers = {
-        "x-amz-access-token": access_token,
-        "Content-Type": "application/json"
-    }
+        # LOGGA la richiesta completa prima di inviarla!
+        logging.warning(f"ASN SUBMIT REQUEST URL: {url}")
+        logging.warning(f"ASN SUBMIT HEADERS: {headers}")
+        logging.warning(f"ASN SUBMIT BODY: {payload}")
 
-    # Gira la richiesta così com'è, senza modificarla
-    resp = requests.post(url, json=payload, headers=headers)
-    # Torna la risposta Amazon “grezza”
-    return (resp.text, resp.status_code, {'Content-Type': 'application/json'})
+        resp = requests.post(url, json=payload, headers=headers)
+        
+        # LOGGA la response (status + text)
+        logging.warning(f"ASN SUBMIT RESPONSE STATUS: {resp.status_code}")
+        logging.warning(f"ASN SUBMIT RESPONSE TEXT: {resp.text}")
+
+        # Se la risposta non è 2xx, logga anche i dettagli
+        if resp.status_code >= 400:
+            logging.error(f"ASN ERROR RESPONSE: {resp.text}")
+
+        # Torna la risposta Amazon "grezza" con anche dettagli utili per il frontend
+        return jsonify({
+            "status_code": resp.status_code,
+            "request_url": url,
+            "request_headers": dict(headers),
+            "request_body": payload,
+            "amazon_response": resp.json() if resp.text.startswith("{") else resp.text
+        }), resp.status_code
+
+    except Exception as ex:
+        logging.exception("Errore durante la submit ASN!")
+        return jsonify({
+            "error": "Eccezione interna ASN",
+            "detail": str(ex)
+        }), 500
+
