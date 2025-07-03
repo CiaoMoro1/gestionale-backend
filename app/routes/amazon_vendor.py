@@ -944,35 +944,42 @@ def test_asn_submit():
         }), 500
 
 
-@bp.route('/api/amazon/vendor/draft-barcode', methods=['GET'])
-def draft_barcode():
-    codice = request.args.get("ean")
-    print("Draft barcode richiesto:", codice)
-    if not codice:
-        return jsonify({"error": "Codice richiesto"}), 400
+@bp.route('/api/amazon/vendor/items/by-barcode', methods=['GET'])
+def find_items_by_barcode():
+    barcode = request.args.get('barcode')
+    if not barcode:
+        return jsonify([])
 
-    rows = supabase.table("ordini_vendor_items") \
-        .select("model_number, vendor_product_id, qty_ordered, fulfillment_center, po_number, asin") \
-        .or_(
-            f"vendor_product_id.eq.{codice},"
-            f"model_number.eq.{codice},"
-            f"asin.eq.{codice}"
-        ).execute().data
+    # 1. Trova tutte le po_list per riepiloghi "nuovo/parziale"
+    riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+        .select("po_list,fulfillment_center,start_delivery") \
+        .in_("stato_ordine", ["nuovo", "parziale"]) \
+        .execute().data
 
-    print("Trovate righe:", rows)
-    if not rows:
-        return jsonify({"error": "Articolo non trovato"}), 404
-
-    articolo = {
-        "model_number": rows[0]["model_number"],
-        "vendor_product_id": rows[0]["vendor_product_id"],
-        "righe": [
-            {
+    # Crea lista di PO con info centro e data
+    po_centro_map = {}
+    for r in riepiloghi:
+        for po in r["po_list"]:
+            po_centro_map[po] = {
                 "fulfillment_center": r["fulfillment_center"],
-                "po_number": r["po_number"],
-                "qty_ordered": r["qty_ordered"]
-            } for r in rows
-        ]
-    }
-    print("Risposta JSON:", articolo)
-    return jsonify(articolo)
+                "start_delivery": r["start_delivery"],
+            }
+
+    po_list = list(po_centro_map.keys())
+    if not po_list:
+        return jsonify([])
+
+    # 2. Cerca articoli per PO, con barcode o SKU
+    articoli = supabase.table("ordini_vendor_items") \
+        .select("*") \
+        .in_("po_number", po_list) \
+        .or_(f"vendor_product_id.eq.{barcode},model_number.eq.{barcode}") \
+        .execute().data
+
+    # 3. Aggiungi info centro/data da po_centro_map (utile per frontend)
+    for a in articoli:
+        info = po_centro_map.get(a["po_number"], {})
+        a["fulfillment_center"] = info.get("fulfillment_center")
+        a["start_delivery"] = info.get("start_delivery")
+
+    return jsonify(articoli)
