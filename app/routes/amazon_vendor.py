@@ -950,7 +950,6 @@ def draft_barcode():
     if not codice:
         return jsonify({"error": "Codice richiesto"}), 400
 
-    # Cerca su tutte le colonne utili (model_number, vendor_product_id, asin, ecc)
     rows = supabase.table("ordini_vendor_items") \
         .select("model_number, vendor_product_id, qty_ordered, fulfillment_center, po_number") \
         .or_(
@@ -962,16 +961,15 @@ def draft_barcode():
     if not rows:
         return jsonify({"error": "Articolo non trovato"}), 404
 
-    # Raggruppa tutte le righe
     articolo = {
-        "sku": rows[0]["model_number"],
-        "ean": rows[0]["vendor_product_id"],
-        "righe": []
+        "model_number": rows[0]["model_number"],
+        "vendor_product_id": rows[0]["vendor_product_id"],
+        "righe": [
+            {
+                "fulfillment_center": r["fulfillment_center"],
+                "po_number": r["po_number"],
+                "qty_ordered": r["qty_ordered"]
+            } for r in rows
+        ]
     }
-    for r in rows:
-        articolo["righe"].append({
-            "fulfillment_center": r["fulfillment_center"],
-            "po_number": r["po_number"],
-            "qty_ordered": r["qty_ordered"]
-        })
     return jsonify(articolo)
