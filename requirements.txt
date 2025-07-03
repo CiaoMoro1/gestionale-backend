@@ -58,3 +58,6 @@ xlrd>=2.0.1
 openpyxl
 marshmallow
 tenacity
+fpdf2
+python-barcode
+pillow

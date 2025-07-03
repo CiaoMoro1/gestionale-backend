@@ -8,6 +8,16 @@ from collections import defaultdict
 import os
 import requests
 from requests_aws4auth import AWS4Auth
+from flask import Response
+from datetime import datetime
+from fpdf import FPDF
+from flask import Response
+from datetime import datetime
+import barcode
+from barcode.writer import ImageWriter
+from io import BytesIO
+from PIL import Image
+
 
 bp = Blueprint('amazon_vendor', __name__)
 
@@ -735,6 +745,158 @@ def list_vendor_pos():
 
 
 
+
+@bp.route('/api/amazon/vendor/orders/lista-prelievo/nuovi/pdf', methods=['GET'])
+def export_lista_prelievo_nuovi_pdf():
+    riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+        .select("fulfillment_center, start_delivery, po_list") \
+        .eq("stato_ordine", "nuovo") \
+        .execute().data
+    if not riepiloghi:
+        return Response("Nessun articolo trovato.", status=404)
+
+    po_set = set()
+    for r in riepiloghi:
+        for po in r["po_list"] or []:
+            po_set.add(po)
+    if not po_set:
+        return Response("Nessun articolo trovato.", status=404)
+
+    articoli = supabase.table("ordini_vendor_items") \
+        .select("model_number,vendor_product_id,title,qty_ordered,fulfillment_center") \
+        .in_("po_number", list(po_set)) \
+        .execute().data
+
+    sku_map = {}
+    for art in articoli:
+        sku = art["model_number"]
+        barcode_val = art.get("vendor_product_id", "")
+        centro = art["fulfillment_center"]
+        qty = int(art["qty_ordered"])
+        if sku not in sku_map:
+            sku_map[sku] = {
+                "barcode": barcode_val,
+                "centri": {},
+                "totale": 0,
+                "radice": sku.split("-")[0] if sku else "",
+            }
+        sku_map[sku]["centri"][centro] = sku_map[sku]["centri"].get(centro, 0) + qty
+        sku_map[sku]["totale"] += qty
+
+    gruppi = {}
+    for sku, dati in sku_map.items():
+        radice = dati["radice"]
+        gruppi.setdefault(radice, []).append((sku, dati))
+    for v in gruppi.values():
+        v.sort(key=lambda x: x[0])
+    sorted_radici = sorted(gruppi.items(), key=lambda x: x[0])
+
+    pdf_width = 297
+    margin = 10
+    table_width = pdf_width - 2 * margin
+
+    # Colonne
+    widths = {
+        "Barcode": 40,
+        "SKU": 55,
+        "EAN": 38,
+        "Centri": 105,
+        "Totale": 20,
+        "Riscontro": 19
+    }
+    widths_sum = sum(widths.values())
+    factor = table_width / widths_sum
+    for k in widths:
+        widths[k] = widths[k] * factor
+    header = ["Barcode", "SKU", "EAN", "Centri", "Totale", "Riscontro"]
+    row_height = 18
+
+    def add_header(pdf, radice):
+        pdf.add_page()
+        pdf.set_left_margin(margin)
+        pdf.set_right_margin(margin)
+        pdf.set_x(margin)
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(table_width, 10, "Lista Prelievo Articoli Ordini Nuovi", 0, 1, "C")
+        pdf.set_font("Arial", "B", 11)
+        pdf.set_x(margin)
+        pdf.cell(table_width, 7, f"Tipologia: {radice}", 0, 1, "L")
+        pdf.ln(2)
+        pdf.set_fill_color(210, 210, 210)
+        pdf.set_font("Arial", "B", 9)
+        pdf.set_x(margin)
+        for k in header:
+            pdf.cell(widths[k], 8, k, border=1, align="C", fill=True)
+        pdf.ln()
+        pdf.set_font("Arial", "", 8)
+
+    pdf = FPDF(orientation='L', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=False)
+    margin_bottom = 10
+
+    for idx_radice, (radice, sku_group) in enumerate(sorted_radici):
+        add_header(pdf, radice)
+
+        for sku, dati in sku_group:
+            barcode_val = str(dati["barcode"] or "")
+            centri_attivi = [f"{c}({dati['centri'][c]})" for c in sorted(dati["centri"]) if dati["centri"][c] > 0]
+            centri_str = " ".join(centri_attivi)
+            row = [
+                barcode_val,
+                sku or "",
+                barcode_val,
+                centri_str,
+                str(dati["totale"]),
+                ""
+            ]
+            # Check for space for a new row, else new page (NO header)
+            if pdf.get_y() + row_height + margin_bottom > 210:  # A4 landscape = 210mm
+                pdf.add_page()
+                pdf.set_left_margin(margin)
+                pdf.set_right_margin(margin)
+                pdf.set_x(margin)
+
+            y = pdf.get_y()
+            pdf.set_x(margin)
+            barcode_written = False
+            if barcode_val.isdigit() and 8 <= len(barcode_val) <= 13:
+                if len(barcode_val) == 13:
+                    barcode_type = 'ean13'
+                else:
+                    barcode_type = 'code128'
+                CODE = barcode.get_barcode_class(barcode_type)
+                rv = BytesIO()
+                bc = CODE(barcode_val, writer=ImageWriter())
+                bc.write(rv)
+                rv.seek(0)
+                img = Image.open(rv)
+                img_buffer = BytesIO()
+                img.save(img_buffer, format="PNG")
+                img_buffer.seek(0)
+                pdf.cell(widths["Barcode"], row_height, "", border=1, align="C")
+                img_y = y + 2
+                img_x = pdf.get_x() - widths["Barcode"] + 2
+                pdf.image(img_buffer, x=img_x, y=img_y, w=widths["Barcode"]-4, h=row_height-4)
+                pdf.set_x(pdf.get_x())
+                barcode_written = True
+            if not barcode_written:
+                pdf.cell(widths["Barcode"], row_height, barcode_val, border=1, align="C")
+
+            row_data = row[1:]
+            keys = ["SKU", "EAN", "Centri", "Totale", "Riscontro"]
+            for key, val in zip(keys, row_data):
+                pdf.cell(widths[key], row_height, val, border=1, align="C")
+            pdf.ln(row_height)
+
+    pdf_bytes = bytes(pdf.output(dest='S'))
+    return Response(
+        pdf_bytes,
+        mimetype='application/pdf',
+        headers={"Content-disposition": f"attachment; filename=lista_prelievo_{datetime.utcnow().date()}.pdf"}
+    )
+
+
+
     # TEEESTTTTTTTTTT
 import logging
 
@@ -781,3 +943,35 @@ def test_asn_submit():
             "detail": str(ex)
         }), 500
 
+
+@bp.route('/api/amazon/vendor/draft-barcode', methods=['GET'])
+def draft_barcode():
+    codice = request.args.get("ean")
+    if not codice:
+        return jsonify({"error": "Codice richiesto"}), 400
+
+    # Cerca su tutte le colonne utili (model_number, vendor_product_id, asin, ecc)
+    rows = supabase.table("ordini_vendor_items") \
+        .select("model_number, vendor_product_id, qty_ordered, fulfillment_center, po_number") \
+        .or_(
+            f"vendor_product_id.eq.{codice},"
+            f"model_number.eq.{codice},"
+            f"asin.eq.{codice}"
+        ).execute().data
+
+    if not rows:
+        return jsonify({"error": "Articolo non trovato"}), 404
+
+    # Raggruppa tutte le righe
+    articolo = {
+        "sku": rows[0]["model_number"],
+        "ean": rows[0]["vendor_product_id"],
+        "righe": []
+    }
+    for r in rows:
+        articolo["righe"].append({
+            "fulfillment_center": r["fulfillment_center"],
+            "po_number": r["po_number"],
+            "qty_ordered": r["qty_ordered"]
+        })
+    return jsonify(articolo)
