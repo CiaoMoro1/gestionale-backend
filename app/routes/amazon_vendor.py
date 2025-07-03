@@ -947,17 +947,19 @@ def test_asn_submit():
 @bp.route('/api/amazon/vendor/draft-barcode', methods=['GET'])
 def draft_barcode():
     codice = request.args.get("ean")
+    print("Draft barcode richiesto:", codice)
     if not codice:
         return jsonify({"error": "Codice richiesto"}), 400
 
     rows = supabase.table("ordini_vendor_items") \
-        .select("model_number, vendor_product_id, qty_ordered, fulfillment_center, po_number") \
+        .select("model_number, vendor_product_id, qty_ordered, fulfillment_center, po_number, asin") \
         .or_(
             f"vendor_product_id.eq.{codice},"
             f"model_number.eq.{codice},"
             f"asin.eq.{codice}"
         ).execute().data
 
+    print("Trovate righe:", rows)
     if not rows:
         return jsonify({"error": "Articolo non trovato"}), 404
 
@@ -972,4 +974,5 @@ def draft_barcode():
             } for r in rows
         ]
     }
+    print("Risposta JSON:", articolo)
     return jsonify(articolo)
