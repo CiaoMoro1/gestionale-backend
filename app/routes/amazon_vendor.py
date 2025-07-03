@@ -946,24 +946,29 @@ def test_asn_submit():
 
 @bp.route('/api/amazon/vendor/items/by-barcode', methods=['GET'])
 def find_items_by_barcode():
+    import json
+    from collections import defaultdict
+
     barcode = request.args.get('barcode')
     if not barcode:
         return jsonify([])
 
     # 1. Trova tutte le po_list per riepiloghi "nuovo/parziale"
     riepiloghi = supabase.table("ordini_vendor_riepilogo") \
-        .select("po_list,fulfillment_center,start_delivery") \
+        .select("po_list,fulfillment_center,start_delivery,id") \
         .in_("stato_ordine", ["nuovo", "parziale"]) \
         .execute().data
 
     # Crea lista di PO con info centro e data
     po_centro_map = {}
+    po_riepilogo_id_map = {}
     for r in riepiloghi:
         for po in r["po_list"]:
             po_centro_map[po] = {
                 "fulfillment_center": r["fulfillment_center"],
                 "start_delivery": r["start_delivery"],
             }
+            po_riepilogo_id_map[po] = r.get("id") 
 
     po_list = list(po_centro_map.keys())
     if not po_list:
@@ -981,5 +986,42 @@ def find_items_by_barcode():
         info = po_centro_map.get(a["po_number"], {})
         a["fulfillment_center"] = info.get("fulfillment_center")
         a["start_delivery"] = info.get("start_delivery")
+
+    # 4. Recupera TUTTI i parziali delle PO trovate (da tutti i riepilogo collegati)
+    # Prendi tutte le riepilogo_id coinvolte:
+    riepilogo_ids = list(set(po_riepilogo_id_map.get(a["po_number"]) for a in articoli if po_riepilogo_id_map.get(a["po_number"])))
+    if not riepilogo_ids:
+        for a in articoli:
+            a["qty_inserted"] = 0
+        return jsonify(articoli)
+
+    parziali = supabase.table("ordini_vendor_parziali") \
+        .select("dati") \
+        .in_("riepilogo_id", riepilogo_ids) \
+        .execute().data
+
+    # 5. Crea una mappa (po_number, model_number) -> qty_inserted
+    qty_inserted_map = defaultdict(int)
+    for p in parziali:
+        # dati può essere una lista o una stringa JSON
+        dati = p["dati"]
+        if isinstance(dati, str):
+            try:
+                dati = json.loads(dati)
+            except Exception:
+                dati = []
+        if not isinstance(dati, list):
+            continue
+        for d in dati:
+            key = (d.get("po_number"), d.get("model_number"))
+            try:
+                qty_inserted_map[key] += int(d.get("quantita", 0))
+            except Exception:
+                pass
+
+    # 6. Aggiungi qty_inserted a ciascun articolo
+    for a in articoli:
+        key = (a["po_number"], a["model_number"])
+        a["qty_inserted"] = qty_inserted_map.get(key, 0)
 
     return jsonify(articoli)
