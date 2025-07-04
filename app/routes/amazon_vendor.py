@@ -1118,3 +1118,127 @@ def riepilogo_dashboard_parziali():
                 "riepilogo_id": riepilogo_id,
             })
     return jsonify(dashboard)
+
+
+@bp.route('/api/amazon/vendor/orders/lista-ordini/nuovi/pdf', methods=['GET'])
+def export_lista_ordini_nuovi_pdf():
+    import json
+
+    # 1. Prendi tutti i riepiloghi "nuovo"
+    riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+        .select("fulfillment_center, start_delivery, po_list") \
+        .eq("stato_ordine", "nuovo") \
+        .execute().data
+    if not riepiloghi:
+        return Response("Nessun ordine trovato.", status=404)
+
+    # 2. Raggruppa per centro (destinazione)
+    centri_map = {}  # fulfillment_center -> {"start_delivery": ..., "po_list": set()}
+    for r in riepiloghi:
+        centro = r["fulfillment_center"]
+        if centro not in centri_map:
+            centri_map[centro] = {
+                "start_delivery": r["start_delivery"],
+                "po_list": set(r["po_list"] or []),
+            }
+        else:
+            centri_map[centro]["po_list"].update(r["po_list"] or [])
+
+    # 3. Prendi TUTTI gli articoli dei PO coinvolti
+    all_po = set()
+    for v in centri_map.values():
+        all_po.update(v["po_list"])
+    if not all_po:
+        return Response("Nessun articolo trovato.", status=404)
+
+    articoli = supabase.table("ordini_vendor_items") \
+        .select("model_number,vendor_product_id,title,qty_ordered,fulfillment_center") \
+        .in_("po_number", list(all_po)) \
+        .execute().data
+
+    # 4. Raggruppa articoli per centro e SKU, somma quantità
+    centri_articoli = {}
+    for centro, info in centri_map.items():
+        lista = [
+            a for a in articoli
+            if a["fulfillment_center"] == centro
+        ]
+        # Raggruppa per SKU
+        sku_map = {}
+        for art in lista:
+            sku = art["model_number"]
+            ean = art.get("vendor_product_id") or ""
+            qty = int(art.get("qty_ordered") or 0)
+            if sku not in sku_map:
+                sku_map[sku] = {
+                    "sku": sku,
+                    "ean": ean,
+                    "qty": 0,
+                }
+            sku_map[sku]["qty"] += qty
+        # Ordina per SKU
+        centri_articoli[centro] = {
+            "start_delivery": info["start_delivery"],
+            "articoli": sorted(sku_map.values(), key=lambda x: x["sku"])
+        }
+
+    # 5. Genera PDF
+    pdf = FPDF(orientation='L', unit='mm', format='A4')
+    margin = 10
+    table_width = 297 - 2 * margin
+    widths = {
+        "SKU": 58,
+        "EAN": 37,
+        "Qta": 22,
+        "Riscontro": 18
+    }
+    widths_sum = sum(widths.values())
+    factor = table_width / widths_sum
+    for k in widths:
+        widths[k] = widths[k] * factor
+    header = ["SKU", "EAN", "Qta", "Riscontro"]
+    row_height = 10
+
+    def add_header(pdf, centro, data):
+        pdf.add_page()
+        pdf.set_left_margin(margin)
+        pdf.set_right_margin(margin)
+        pdf.set_font("Arial", "B", 15)
+        pdf.cell(table_width, 10, f"Ordine {centro}" , 0, 1, "C")
+        pdf.set_font("Arial", "", 10)
+        pdf.set_font("Arial", "B", 10)
+        pdf.set_fill_color(210, 210, 210)
+        for k in header:
+            pdf.cell(widths[k], 8, k, border=1, align="C", fill=True)
+        pdf.ln()
+
+    for centro, info in centri_articoli.items():
+        add_header(pdf, centro, info["start_delivery"])
+        for art in info["articoli"]:
+            row = [
+                art["sku"],
+                art["ean"],
+                str(art["qty"]),
+                ""
+            ]
+            for key, val in zip(header, row):
+                pdf.cell(widths[key], row_height, val, border=1, align="C")
+            pdf.ln(row_height)
+
+    # 6. Output PDF
+    pdf_bytes = bytes(pdf.output(dest='S'))
+    return Response(
+        pdf_bytes,
+        mimetype='application/pdf',
+        headers={"Content-disposition": f"attachment; filename=lista_ordini_per_centro_{datetime.utcnow().date()}.pdf"}
+    )
+    
+    
+@bp.route('/api/amazon/vendor/orders/riepilogo/completati', methods=['GET'])
+def riepilogo_completati():
+    riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+        .select("*") \
+        .eq("stato_ordine", "completato") \
+        .order("created_at", desc=False) \
+        .execute().data
+    return jsonify(riepiloghi)
