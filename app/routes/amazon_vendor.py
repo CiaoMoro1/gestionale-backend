@@ -706,7 +706,7 @@ def parziali_per_ordine():
         return jsonify([])
     riepilogo_id = riepilogo[0]["id"]
     parziali = supabase.table("ordini_vendor_parziali") \
-        .select("numero_parziale, dati, confermato, created_at, conferma_collo") \
+        .select("numero_parziale, dati, confermato, gestito, created_at, conferma_collo") \
         .eq("riepilogo_id", riepilogo_id) \
         .eq("confermato", True) \
         .order("numero_parziale") \
@@ -1242,3 +1242,22 @@ def riepilogo_completati():
         .order("created_at", desc=False) \
         .execute().data
     return jsonify(riepiloghi)
+
+
+@bp.route('/api/amazon/vendor/parziali/gestito', methods=['PATCH'])
+def aggiorna_parziale_gestito():
+    data = request.json
+    riepilogo_id = data.get("riepilogo_id")
+    numero_parziale = data.get("numero_parziale")
+    gestito = data.get("gestito")
+
+    if riepilogo_id is None or numero_parziale is None or gestito is None:
+        return jsonify({"error": "Parametri mancanti"}), 400
+
+    supabase.table("ordini_vendor_parziali") \
+        .update({"gestito": gestito}) \
+        .eq("riepilogo_id", riepilogo_id) \
+        .eq("numero_parziale", numero_parziale) \
+        .execute()
+
+    return jsonify({"ok": True, "gestito": gestito})
