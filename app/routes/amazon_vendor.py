@@ -697,7 +697,7 @@ def get_items_by_po():
     if not po_list:
         return jsonify([])
     pos = po_list.split(",")
-    items = supabase.table("ordini_vendor_items").select("po_number,model_number,qty_ordered,qty_confirmed").in_("po_number", pos).execute().data
+    items = supabase.table("ordini_vendor_items").select("po_number,model_number,qty_ordered,qty_confirmed,cost").in_("po_number", pos).execute().data
     return jsonify(items)
 
 @bp.route('/api/amazon/vendor/parziali-ordine', methods=['GET'])
