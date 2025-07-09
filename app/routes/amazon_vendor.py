@@ -162,25 +162,24 @@ def upload_vendor_orders():
                 "totale_articoli": dati["totale_articoli"],
                 "stato_ordine": "nuovo"
             }
-            # Per semplicità: cancella vecchi e inserisci nuovo riepilogo
+            # Per semplicità:
             res = supabase.table("ordini_vendor_riepilogo") \
                 .select("id") \
                 .eq("fulfillment_center", fc) \
                 .eq("start_delivery", data) \
                 .execute()
             if res.data and len(res.data) > 0:
-                # Esiste già: aggiorna solo i campi variabili
+                # Esiste già: aggiorna solo po_list e totale_articoli (NON toccare stato_ordine!)
                 id_riep = res.data[0]['id']
                 supabase.table("ordini_vendor_riepilogo") \
                     .update({
                         "po_list": list(dati["po_list"]),
-                        "totale_articoli": dati["totale_articoli"],
-                        "stato_ordine": "nuovo"
+                        "totale_articoli": dati["totale_articoli"]
                     }) \
                     .eq("id", id_riep) \
                     .execute()
             else:
-                # Nuovo riepilogo
+                # Nuovo riepilogo: inserisci con stato_ordine = "nuovo"
                 supabase.table("ordini_vendor_riepilogo").insert(riepilogo).execute()
 
         return jsonify({
