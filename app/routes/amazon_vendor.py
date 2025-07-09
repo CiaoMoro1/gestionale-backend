@@ -169,9 +169,19 @@ def upload_vendor_orders():
                 .eq("start_delivery", data) \
                 .execute()
             if res.data and len(res.data) > 0:
+                # Esiste già: aggiorna solo i campi variabili
                 id_riep = res.data[0]['id']
-                supabase.table("ordini_vendor_riepilogo").delete().eq("id", id_riep).execute()
-            supabase.table("ordini_vendor_riepilogo").insert(riepilogo).execute()
+                supabase.table("ordini_vendor_riepilogo") \
+                    .update({
+                        "po_list": list(dati["po_list"]),
+                        "totale_articoli": dati["totale_articoli"],
+                        "stato_ordine": "nuovo"
+                    }) \
+                    .eq("id", id_riep) \
+                    .execute()
+            else:
+                # Nuovo riepilogo
+                supabase.table("ordini_vendor_riepilogo").insert(riepilogo).execute()
 
         return jsonify({
             "status": "ok",
