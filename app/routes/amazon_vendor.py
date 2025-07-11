@@ -757,12 +757,39 @@ def list_vendor_pos():
 
 @bp.route('/api/amazon/vendor/orders/lista-prelievo/nuovi/pdf', methods=['GET'])
 def export_lista_prelievo_nuovi_pdf():
-    riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+    # --- FILTRO PER DATA (opzionale, ?data=2025-07-21) ---
+    filtro_data = request.args.get("data")
+    query = supabase.table("ordini_vendor_riepilogo") \
         .select("fulfillment_center, start_delivery, po_list") \
-        .eq("stato_ordine", "nuovo") \
-        .execute().data
+        .eq("stato_ordine", "nuovo")
+    if filtro_data:
+        query = query.eq("start_delivery", filtro_data)
+    riepiloghi = query.execute().data
+
     if not riepiloghi:
         return Response("Nessun articolo trovato.", status=404)
+
+    # Trova tutte le date presenti nei riepiloghi (set, così sono uniche)
+    tutte_le_date = set(r["start_delivery"] for r in riepiloghi if r.get("start_delivery"))
+
+    # Funzione helper per il titolo
+    def get_titolo_data(filtro_data, tutte_le_date):
+        def format_it(dt):
+            if not dt:
+                return ""
+            parts = dt.split("-")
+            if len(parts) == 3:
+                return f"{parts[2]}-{parts[1]}-{parts[0]}"
+            return dt
+        if filtro_data:
+            return format_it(filtro_data)
+        tutte = sorted(list(tutte_le_date))
+        if len(tutte) == 1:
+            return format_it(tutte[0])
+        else:
+            return ", ".join(format_it(x) for x in tutte)
+
+    titolo_data = get_titolo_data(filtro_data, tutte_le_date)
 
     po_set = set()
     for r in riepiloghi:
@@ -826,7 +853,8 @@ def export_lista_prelievo_nuovi_pdf():
         pdf.set_right_margin(margin)
         pdf.set_x(margin)
         pdf.set_font("Arial", "B", 14)
-        pdf.cell(table_width, 10, "Lista Prelievo Articoli Ordini Nuovi", 0, 1, "C")
+        # Titolo con la data dinamica
+        pdf.cell(table_width, 10, f"Lista Prelievo Articoli {titolo_data}", 0, 1, "C")
         pdf.set_font("Arial", "B", 11)
         pdf.set_x(margin)
         pdf.cell(table_width, 7, f"Tipologia: {radice}", 0, 1, "L")
@@ -845,7 +873,6 @@ def export_lista_prelievo_nuovi_pdf():
 
     for idx_radice, (radice, sku_group) in enumerate(sorted_radici):
         add_header(pdf, radice)
-
         for sku, dati in sku_group:
             barcode_val = str(dati["barcode"] or "")
             centri_attivi = [f"{c}({dati['centri'][c]})" for c in sorted(dati["centri"]) if dati["centri"][c] > 0]
@@ -901,8 +928,9 @@ def export_lista_prelievo_nuovi_pdf():
     return Response(
         pdf_bytes,
         mimetype='application/pdf',
-        headers={"Content-disposition": f"attachment; filename=lista_prelievo_{datetime.utcnow().date()}.pdf"}
+        headers={"Content-disposition": f"attachment; filename=lista_prelievo_{titolo_data.replace(', ', '_')}_{datetime.utcnow().date()}.pdf"}
     )
+
 
 
 
