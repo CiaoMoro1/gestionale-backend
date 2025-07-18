@@ -43,6 +43,48 @@ def safe_value(v):
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {"xls", "xlsx"}
 
+
+def sync_produzione_from_prelievo(prelievo_id):
+    prelievo = supabase.table("prelievi_ordini_amazon").select("*").eq("id", prelievo_id).single().execute().data
+    if not prelievo:
+        return  # Non esiste più, non fare nulla
+
+    stato = prelievo["stato"]
+    qty = int(prelievo["qty"])
+    riscontro = int(prelievo["riscontro"] or 0)
+    plus = int(prelievo["plus"] or 0)
+    da_produrre = 0
+
+    if stato == "manca":
+        da_produrre = qty + plus
+    elif stato == "parziale":
+        da_produrre = (qty - riscontro) + plus
+    elif stato == "completo" and plus > 0:
+        da_produrre = plus
+    else:
+        # NON serve più in produzione: puoi anche cancellare (opzionale)
+        # supabase.table("produzione_vendor").delete().eq("prelievo_id", prelievo_id).execute()
+        return
+
+    row = {
+        "prelievo_id": prelievo["id"],
+        "sku": prelievo["sku"],
+        "ean": prelievo["ean"],
+        "qty": qty,
+        "riscontro": riscontro,
+        "plus": plus,
+        "radice": prelievo["radice"],
+        "start_delivery": prelievo["start_delivery"],
+        "stato": stato,
+        "stato_produzione": "Da Stampare",
+        "da_produrre": da_produrre,
+        "note": prelievo.get("note"),
+        "centri": prelievo.get("centri") or {},  # <--- AGGIUNGI QUESTA RIGA!
+        # "cavallotti": False, # default, o recupera quello già in produzione se serve
+    }
+    supabase.table("produzione_vendor").upsert(row, on_conflict="prelievo_id").execute()
+
+
 # ------------------ UPLOAD ORDINI -------------------
 @bp.route('/api/amazon/vendor/orders/upload', methods=['POST'])
 def upload_vendor_orders():
@@ -1298,3 +1340,470 @@ def aggiorna_parziale_gestito():
         .execute()
 
     return jsonify({"ok": True, "gestito": gestito})
+
+
+import datetime
+
+# --- FUNZIONE DI LOG MOVIMENTI PRODUZIONE ---
+def log_movimento_produzione(
+    produzione_row,
+    utente,
+    motivo,
+    stato_vecchio=None,
+    stato_nuovo=None,
+    qty_vecchia=None,
+    qty_nuova=None,
+    plus_vecchio=None,
+    plus_nuovo=None,
+    dettaglio=None
+):
+    supabase.table("movimenti_produzione_vendor").insert({
+        "produzione_id": produzione_row["id"],
+        "sku": produzione_row.get("sku"),
+        "ean": produzione_row.get("ean"),
+        "start_delivery": produzione_row.get("start_delivery"),
+        "stato_vecchio": stato_vecchio,
+        "stato_nuovo": stato_nuovo,
+        "qty_vecchia": qty_vecchia,
+        "qty_nuova": qty_nuova,
+        "plus_vecchio": plus_vecchio,
+        "plus_nuovo": plus_nuovo,
+        "utente": utente,
+        "motivo": motivo,
+        "dettaglio": dettaglio,
+        "created_at": datetime.datetime.now().isoformat()
+    }).execute()
+
+# --- DATE DISPONIBILI ---
+@bp.route('/api/prelievi/date-importabili', methods=['GET'])
+def date_importabili_prelievo():
+    res = supabase.table("ordini_vendor_riepilogo")\
+        .select("start_delivery")\
+        .eq("stato_ordine", "nuovo")\
+        .order("start_delivery")\
+        .execute()
+    date_set = sorted(list(set(r["start_delivery"] for r in res.data)))
+    return jsonify(date_set)
+
+# --- IMPORTA PRELIEVI ---
+@bp.route('/api/prelievi/importa', methods=['POST'])
+def importa_prelievi():
+    data = request.json.get("data")
+    if not data:
+        return jsonify({"error": "Data richiesta"}), 400
+
+    supabase.table("prelievi_ordini_amazon").delete().eq("start_delivery", data).execute()
+
+    items = supabase.table("ordini_vendor_items").select("*").eq("start_delivery", data).execute().data
+    riepiloghi = supabase.table("ordini_vendor_riepilogo")\
+        .select("fulfillment_center,start_delivery,stato_ordine")\
+        .eq("start_delivery", data)\
+        .eq("stato_ordine", "nuovo")\
+        .execute().data
+
+    centri_validi = set((r["fulfillment_center"], str(r["start_delivery"])) for r in riepiloghi)
+    articoli = [i for i in items if (i["fulfillment_center"], str(i["start_delivery"])) in centri_validi]
+
+    aggrega = {}
+    for a in articoli:
+        key = (a["model_number"], a["vendor_product_id"], str(a["start_delivery"]))
+        if key not in aggrega:
+            aggrega[key] = {
+                "sku": a["model_number"],
+                "ean": a["vendor_product_id"],
+                "radice": a["model_number"].split("-")[0] if a["model_number"] else "",
+                "start_delivery": a["start_delivery"][:10],
+                "qty": 0,
+                "centri": {}
+            }
+        centro = a["fulfillment_center"]
+        qty = int(a["qty_ordered"] or 0)
+        aggrega[key]["qty"] += qty
+        aggrega[key]["centri"][centro] = aggrega[key]["centri"].get(centro, 0) + qty
+
+    for agg in aggrega.values():
+        supabase.table("prelievi_ordini_amazon").insert({
+            "sku": agg["sku"],
+            "ean": agg["ean"],
+            "qty": agg["qty"],
+            "radice": agg["radice"],
+            "start_delivery": agg["start_delivery"],
+            "centri": agg["centri"],
+            "stato": "in verifica"
+        }).execute()
+
+    # >>> NIENTE SYNC PRODUZIONE QUI <<<
+    return jsonify({"ok": True, "count": len(aggrega)})
+
+# --- LISTA PRELIEVI ---
+@bp.route('/api/prelievi', methods=['GET'])
+def lista_prelievi():
+    data = request.args.get("data")
+    radice = request.args.get("radice")
+    search = request.args.get("search", "").strip()
+
+    query = supabase.table("prelievi_ordini_amazon").select(
+        "id,stato,sku,ean,qty,riscontro,plus,radice,note"
+    )
+    if data:
+        query = query.eq("start_delivery", data)
+    if radice:
+        query = query.eq("radice", radice)
+    if search:
+        query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
+    query = query.order("radice").order("sku")
+    prelievi = query.execute().data
+    return jsonify(prelievi)
+
+# --- FUNZIONE CENTRALE SYNC PRODUZIONE (usata SOLO su patch singolo/bulk) ---
+def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica prelievo"):
+    tutte = [
+        r for r in supabase.table("produzione_vendor").select("*").execute().data
+        if r["stato_produzione"] != "Rimossi"
+    ]
+    for p in prelievi_modificati:
+        key = (p["sku"], p.get("ean"), p.get("start_delivery"))
+        righe_attuali = [r for r in tutte if (r["sku"], r.get("ean"), r.get("start_delivery")) == key]
+        lavorato = sum(r["da_produrre"] for r in righe_attuali if r["stato_produzione"] != "Da Stampare")
+        da_stampare_righe = [r for r in righe_attuali if r["stato_produzione"] == "Da Stampare"]
+        qty = p["qty"]
+        riscontro = p.get("riscontro") or 0
+        plus = p.get("plus") or 0
+        stato = p["stato"]
+
+        # La quantità richiesta da prelievo
+        richiesta = 0
+        if stato == "manca":
+            richiesta = qty
+        elif stato == "parziale":
+            richiesta = qty - riscontro
+        elif stato == "completo":
+            richiesta = 0
+        else:
+            richiesta = qty
+
+        # Da produrre è SOLO plus se i lavorati >= richiesta
+        if lavorato >= richiesta:
+            da_produrre = plus if plus > 0 else 0
+        else:
+            da_produrre = (richiesta - lavorato) + plus
+
+        if da_stampare_righe:
+            r_da_stampare = da_stampare_righe[0]
+            if da_produrre > 0:
+                # LOG se cambia la quantità o plus
+                if r_da_stampare["da_produrre"] != da_produrre:
+                    log_movimento_produzione(
+                        r_da_stampare,
+                        utente=utente,
+                        motivo=motivo,
+                        qty_vecchia=r_da_stampare["da_produrre"],
+                        qty_nuova=da_produrre
+                    )
+                supabase.table("produzione_vendor").update({
+                    "da_produrre": da_produrre,
+                    "qty": qty,
+                    "riscontro": riscontro,
+                    "plus": plus,
+                    "stato": stato,
+                    "note": p.get("note") or "",
+                    "stato_produzione": "Da Stampare",
+                    "modificata_manualmente": False
+
+                }).eq("id", r_da_stampare["id"]).execute()
+            else:
+                # LOG eliminazione
+                log_movimento_produzione(
+                    r_da_stampare,
+                    utente=utente,
+                    motivo="Auto-eliminazione Da Stampare su sync",
+                    qty_vecchia=r_da_stampare["da_produrre"],
+                    qty_nuova=0
+                )
+                supabase.table("produzione_vendor").delete().eq("id", r_da_stampare["id"]).execute()
+        else:
+            if da_produrre > 0:
+                nuovo = {
+                    "prelievo_id": p["id"],
+                    "sku": p["sku"],
+                    "ean": p["ean"],
+                    "qty": qty,
+                    "riscontro": riscontro,
+                    "plus": plus,
+                    "radice": p["radice"],
+                    "start_delivery": p.get("start_delivery"),
+                    "stato": stato,
+                    "stato_produzione": "Da Stampare",
+                    "da_produrre": da_produrre,
+                    "cavallotti": p.get("cavallotti", False),
+                    "note": p.get("note") or "",
+                }
+                inserted = supabase.table("produzione_vendor").insert(nuovo).execute().data
+                if inserted:
+                    log_movimento_produzione(
+                        inserted[0], utente=utente,
+                        motivo="Creazione da patch prelievo",
+                        qty_nuova=da_produrre
+                    )
+        # NB: le altre righe non Da Stampare restano invariati
+
+# --- PATCH SINGOLO PRELIEVO + SYNC PRODUZIONE ---
+@bp.route('/api/prelievi/<int:id>', methods=['PATCH'])
+def patch_prelievo(id):
+    data = request.json
+    fields = {}
+    for f in ["riscontro", "plus", "note"]:
+        if f in data:
+            fields[f] = data[f]
+    if "riscontro" in data:
+        prelievo = supabase.table("prelievi_ordini_amazon").select("qty").eq("id", id).single().execute().data
+        qty = prelievo["qty"]
+        riscontro = data["riscontro"]
+        if riscontro is None:
+            stato = "in verifica"
+        elif riscontro == 0:
+            stato = "manca"
+        elif 0 < riscontro < qty:
+            stato = "parziale"
+        elif riscontro == qty:
+            stato = "completo"
+        else:
+            stato = "in verifica"
+        fields["stato"] = stato
+    if not fields:
+        return jsonify({"error": "Nessun campo da aggiornare"}), 400
+
+    supabase.table("prelievi_ordini_amazon").update(fields).eq("id", id).execute()
+    prelievo = supabase.table("prelievi_ordini_amazon").select("*").eq("id", id).single().execute().data
+    sync_produzione([prelievo], utente="operatore", motivo="Patch singolo prelievo")
+    return jsonify({"ok": True})
+
+# --- PATCH BULK PRELIEVI + SYNC PRODUZIONE ---
+@bp.route('/api/prelievi/bulk', methods=['PATCH'])
+def patch_prelievi_bulk():
+    ids = request.json.get("ids", [])
+    update_fields = request.json.get("fields", {})
+    if not ids or not update_fields:
+        return jsonify({"error": "Nessun id/campo"}), 400
+
+    stato_per_id = {}
+    if "riscontro" in update_fields:
+        riscontro_val = update_fields["riscontro"]
+        prelievi = supabase.table("prelievi_ordini_amazon").select("id,qty").in_("id", ids).execute().data
+        for p in prelievi:
+            qty = p["qty"]
+            if riscontro_val is None:
+                stato = "in verifica"
+            elif riscontro_val == 0:
+                stato = "manca"
+            elif 0 < riscontro_val < qty:
+                stato = "parziale"
+            elif riscontro_val == qty:
+                stato = "completo"
+            else:
+                stato = "in verifica"
+            stato_per_id[p["id"]] = stato
+        for stato in set(stato_per_id.values()):
+            ids_group = [pid for pid, st in stato_per_id.items() if st == stato]
+            supabase.table("prelievi_ordini_amazon").update({
+                **update_fields,
+                "stato": stato
+            }).in_("id", ids_group).execute()
+    else:
+        supabase.table("prelievi_ordini_amazon").update(update_fields).in_("id", ids).execute()
+
+    prelievi_full = supabase.table("prelievi_ordini_amazon").select("*").in_("id", ids).execute().data
+    sync_produzione(prelievi_full, utente="operatore", motivo="Patch bulk prelievi")
+    return jsonify({"ok": True, "updated_count": len(ids)})
+
+# --- LISTA PRODUZIONE ---
+@bp.route('/api/produzione', methods=['GET'])
+def lista_produzione():
+    stato = request.args.get("stato_produzione")
+    radice = request.args.get("radice")
+    search = request.args.get("search", "").strip()
+
+    query = supabase.table("produzione_vendor").select("*")
+    if stato:
+        query = query.eq("stato_produzione", stato)
+    if radice:
+        query = query.eq("radice", radice)
+    if search:
+        query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
+    query = query.order("start_delivery").order("sku")
+    rows = query.execute().data
+
+    all_rows = supabase.table("produzione_vendor").select("stato_produzione,radice").execute().data
+
+    badge_stati = {}
+    badge_radici = {}
+    for r in all_rows:
+        s = r.get("stato_produzione", "Da Stampare")
+        badge_stati[s] = badge_stati.get(s, 0) + 1
+        rd = r.get("radice") or "?"
+        badge_radici[rd] = badge_radici.get(rd, 0) + 1
+
+    return jsonify({
+        "data": rows,
+        "badge_stati": badge_stati,
+        "badge_radici": badge_radici,
+        "all_radici": sorted(set(r.get("radice") for r in all_rows if r.get("radice")))
+    })
+
+# --- PATCH SINGOLO PRODUZIONE + LOG ---
+@bp.route('/api/produzione/<int:id>', methods=['PATCH'])
+def patch_produzione(id):
+    data = request.json
+    fields = {}
+    utente = "operatore"  # Modifica se vuoi prendere da sessione/jwt
+    # Prendi vecchia riga per il log
+    old = supabase.table("produzione_vendor").select("*").eq("id", id).single().execute().data
+    log_entries = []
+
+    if "stato_produzione" in data and data["stato_produzione"] != old["stato_produzione"]:
+        fields["stato_produzione"] = data["stato_produzione"]
+        log_entries.append(dict(
+            produzione_row=old,
+            utente=utente,
+            motivo="Cambio stato",
+            stato_vecchio=old["stato_produzione"],
+            stato_nuovo=data["stato_produzione"]
+        ))
+    if "da_produrre" in data and data["da_produrre"] != old["da_produrre"]:
+        fields["da_produrre"] = data["da_produrre"]
+        fields["modificata_manualmente"] = True
+        log_entries.append(dict(
+            produzione_row=old,
+            utente=utente,
+            motivo="Modifica quantità",
+            qty_vecchia=old["da_produrre"],
+            qty_nuova=data["da_produrre"]
+        ))
+        
+    if "plus" in data and (old.get("plus") or 0) != (data.get("plus") or 0):
+        fields["plus"] = data["plus"]
+        log_entries.append(dict(
+            produzione_row=old,
+            utente=utente,
+            motivo="Modifica plus",
+            plus_vecchio=old.get("plus") or 0,
+            plus_nuovo=data["plus"]
+        ))
+    for f in ["cavallotti", "note"]:
+        if f in data:
+            fields[f] = data[f]
+
+    if "da_produrre" in data:
+        if old["stato_produzione"] != "Da Stampare":
+            if data.get("password") != "oreste":
+                return jsonify({"error": "Password richiesta per modificare la quantità in questo stato."}), 403
+
+    if not fields:
+        return jsonify({"error": "Nessun campo da aggiornare"}), 400
+
+    res = supabase.table("produzione_vendor").update(fields).eq("id", id).execute()
+
+    # LOGGA I MOVIMENTI
+    for entry in log_entries:
+        log_movimento_produzione(**entry)
+
+    return jsonify({"ok": True, "updated": res.data})
+
+# --- PATCH BULK PRODUZIONE ---
+@bp.route('/api/produzione/bulk', methods=['PATCH'])
+def patch_produzione_bulk():
+    ids = request.json.get("ids", [])
+    update_fields = request.json.get("fields", {})
+    if not ids or not update_fields:
+        return jsonify({"error": "Nessun id/campo"}), 400
+
+    utente = "operatore"
+    rows = supabase.table("produzione_vendor").select("*").in_("id", ids).execute().data
+    logs = []
+    for r in rows:
+        if "stato_produzione" in update_fields and update_fields["stato_produzione"] != r["stato_produzione"]:
+            logs.append(dict(
+                produzione_row=r,
+                utente=utente,
+                motivo="Cambio stato (bulk)",
+                stato_vecchio=r["stato_produzione"],
+                stato_nuovo=update_fields["stato_produzione"]
+            ))
+        if "da_produrre" in update_fields and update_fields["da_produrre"] != r["da_produrre"]:
+            logs.append(dict(
+                produzione_row=r,
+                utente=utente,
+                motivo="Modifica quantità (bulk)",
+                qty_vecchia=r["da_produrre"],
+                qty_nuova=update_fields["da_produrre"]
+            ))
+        if "plus" in update_fields and (r.get("plus") or 0) != (update_fields.get("plus") or 0):
+            logs.append(dict(
+                produzione_row=r,
+                utente=utente,
+                motivo="Modifica plus (bulk)",
+                plus_vecchio=r.get("plus") or 0,
+                plus_nuovo=update_fields["plus"]
+            ))
+
+    supabase.table("produzione_vendor").update(update_fields).in_("id", ids).execute()
+    for entry in logs:
+        log_movimento_produzione(**entry)
+
+    return jsonify({"ok": True, "updated_count": len(ids)})
+
+# --- GET PRODUZIONE BY ID ---
+@bp.route('/api/produzione/<int:id>', methods=['GET'])
+def get_produzione_by_id(id):
+    res = supabase.table("produzione_vendor").select("*").eq("id", id).single().execute()
+    return jsonify(res.data)
+
+# --- LOG STORICO DI UNA RIGA ---
+@bp.route('/api/produzione/<int:id>/log', methods=['GET'])
+def get_log_movimenti(id):
+    logs = supabase.table("movimenti_produzione_vendor")\
+        .select("*")\
+        .eq("produzione_id", id)\
+        .order("created_at", desc=True)\
+        .execute().data
+    return jsonify(logs)
+
+# --- BULK DELETE ---
+@bp.route('/api/produzione/bulk', methods=['DELETE'])
+def delete_produzione_bulk():
+    ids = request.json.get("ids", [])
+    if not ids:
+        return jsonify({"error": "Nessun id"}), 400
+    # Log eliminazione (opzionale)
+    rows = supabase.table("produzione_vendor").select("*").in_("id", ids).execute().data
+    for r in rows:
+        log_movimento_produzione(r, utente="operatore", motivo="Eliminazione manuale")
+    supabase.table("produzione_vendor").delete().in_("id", ids).execute()
+    return jsonify({"ok": True, "deleted_count": len(ids)})
+
+@bp.route('/api/prelievi/svuota', methods=['DELETE'])
+def svuota_prelievi():
+    supabase.table("prelievi_ordini_amazon").delete().neq("id", 0).execute()  # cancella tutto
+    return jsonify({"ok": True})
+
+@bp.route('/api/produzione/pulisci-da-stampare', methods=['POST'])
+def pulisci_da_stampare_endpoint():
+    # Prendi tutte le righe Da Stampare
+    produzione = supabase.table("produzione_vendor").select("id,sku").eq("stato_produzione", "Da Stampare").execute().data
+
+    # Prendi tutti gli SKU dei prelievi attuali
+    prelievi = supabase.table("prelievi_ordini_amazon").select("sku").execute().data
+    sku_prelievi = set(p["sku"] for p in prelievi if p["sku"])
+
+    # Cancella solo i Da Stampare che NON esistono più come SKU nei prelievi
+    ids_da_eliminare = [r["id"] for r in produzione if r["sku"] not in sku_prelievi]
+
+    if ids_da_eliminare:
+        # Logga eliminazione
+        for r_id in ids_da_eliminare:
+            riga = supabase.table("produzione_vendor").select("*").eq("id", r_id).single().execute().data
+            if riga:
+                log_movimento_produzione(riga, utente="operatore", motivo="Auto-eliminazione da pulizia prelievo")
+        supabase.table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+
+    return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
