@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, Response
 import pandas as pd
 import io
 from app.supabase_client import supabase
@@ -8,11 +8,7 @@ from collections import defaultdict
 import os
 import requests
 from requests_aws4auth import AWS4Auth
-from flask import Response
-from datetime import datetime
 from fpdf import FPDF
-from flask import Response
-from datetime import datetime
 import barcode
 from barcode.writer import ImageWriter
 from io import BytesIO
@@ -1342,7 +1338,6 @@ def aggiorna_parziale_gestito():
     return jsonify({"ok": True, "gestito": gestito})
 
 
-import datetime
 
 # --- FUNZIONE DI LOG MOVIMENTI PRODUZIONE ---
 def log_movimento_produzione(
