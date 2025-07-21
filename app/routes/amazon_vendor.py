@@ -1483,6 +1483,13 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         r for r in supabase.table("produzione_vendor").select("*").execute().data
         if r["stato_produzione"] != "Rimossi"
     ]
+
+    # Prepara liste per batch
+    to_update = []
+    to_delete = []
+    to_insert = []
+    log_entries = []
+
     for p in prelievi_modificati:
         key = (p["sku"], p.get("ean"), p.get("start_delivery"))
         righe_attuali = [r for r in tutte if (r["sku"], r.get("ean"), r.get("start_delivery")) == key]
@@ -1494,7 +1501,6 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         stato = p["stato"]
 
         # La quantità richiesta da prelievo
-        richiesta = 0
         if stato == "manca":
             richiesta = qty
         elif stato == "parziale":
@@ -1513,16 +1519,18 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         if da_stampare_righe:
             r_da_stampare = da_stampare_righe[0]
             if da_produrre > 0:
-                # LOG se cambia la quantità o plus
                 if r_da_stampare["da_produrre"] != da_produrre:
-                    log_movimento_produzione(
-                        r_da_stampare,
+                    # Raccogli log
+                    log_entries.append(dict(
+                        produzione_row=r_da_stampare,
                         utente=utente,
                         motivo=motivo,
                         qty_vecchia=r_da_stampare["da_produrre"],
                         qty_nuova=da_produrre
-                    )
-                supabase.table("produzione_vendor").update({
+                    ))
+                # Raccogli l'update in lista
+                to_update.append({
+                    "id": r_da_stampare["id"],
                     "da_produrre": da_produrre,
                     "qty": qty,
                     "riscontro": riscontro,
@@ -1531,18 +1539,18 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
                     "note": p.get("note") or "",
                     "stato_produzione": "Da Stampare",
                     "modificata_manualmente": False
-
-                }).eq("id", r_da_stampare["id"]).execute()
+                })
             else:
-                # LOG eliminazione
-                log_movimento_produzione(
-                    r_da_stampare,
+                # Raccogli log eliminazione
+                log_entries.append(dict(
+                    produzione_row=r_da_stampare,
                     utente=utente,
                     motivo="Auto-eliminazione Da Stampare su sync",
                     qty_vecchia=r_da_stampare["da_produrre"],
                     qty_nuova=0
-                )
-                supabase.table("produzione_vendor").delete().eq("id", r_da_stampare["id"]).execute()
+                ))
+                # Raccogli ID da cancellare
+                to_delete.append(r_da_stampare["id"])
         else:
             if da_produrre > 0:
                 nuovo = {
@@ -1560,14 +1568,74 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
                     "cavallotti": p.get("cavallotti", False),
                     "note": p.get("note") or "",
                 }
-                inserted = supabase.table("produzione_vendor").insert(nuovo).execute().data
-                if inserted:
-                    log_movimento_produzione(
-                        inserted[0], utente=utente,
+                to_insert.append(nuovo)
+                # log movimenti dopo insert
+
+    import logging
+    # --- BATCH UPDATE ---
+    if to_update:
+        for row in to_update:
+            id_val = row.pop("id")
+            try:
+                supabase.table("produzione_vendor").update(row).eq("id", id_val).execute()
+            except Exception as ex:
+                logging.error(f"Errore update produzione_vendor id={id_val}: {ex}")
+
+    # --- BATCH DELETE ---
+    if to_delete:
+        for id_del in to_delete:
+            try:
+                supabase.table("produzione_vendor").delete().eq("id", id_del).execute()
+            except Exception as ex:
+                logging.error(f"Errore delete produzione_vendor id={id_del}: {ex}")
+
+    # --- BATCH INSERT ---
+    if to_insert:
+        batch_size = 100  # per sicurezza, spezza in batch da 100
+        for i in range(0, len(to_insert), batch_size):
+            batch = to_insert[i:i+batch_size]
+            try:
+                inserted = supabase.table("produzione_vendor").insert(batch).execute().data
+                # Dopo insert, log movimenti di creazione
+                for irow in inserted or []:
+                    log_entries.append(dict(
+                        produzione_row=irow,
+                        utente=utente,
                         motivo="Creazione da patch prelievo",
-                        qty_nuova=da_produrre
-                    )
-        # NB: le altre righe non Da Stampare restano invariati
+                        qty_nuova=irow["da_produrre"]
+                    ))
+            except Exception as ex:
+                logging.error(f"Errore insert produzione_vendor batch={i}-{i+batch_size}: {ex}")
+
+    # --- LOG MOVIMENTI IN BATCH ---
+    if log_entries:
+        mov_rows = []
+        for entry in log_entries:
+            r = entry.get("produzione_row")
+            mov_rows.append({
+                "produzione_id": r["id"],
+                "sku": r.get("sku"),
+                "ean": r.get("ean"),
+                "start_delivery": r.get("start_delivery"),
+                "stato_vecchio": entry.get("stato_vecchio"),
+                "stato_nuovo": entry.get("stato_nuovo"),
+                "qty_vecchia": entry.get("qty_vecchia"),
+                "qty_nuova": entry.get("qty_nuova"),
+                "plus_vecchio": entry.get("plus_vecchio"),
+                "plus_nuovo": entry.get("plus_nuovo"),
+                "utente": entry.get("utente"),
+                "motivo": entry.get("motivo"),
+                "dettaglio": entry.get("dettaglio"),
+                "created_at": datetime.now().isoformat()
+            })
+        batch_size = 200
+        for i in range(0, len(mov_rows), batch_size):
+            batch = mov_rows[i:i+batch_size]
+            try:
+                supabase.table("movimenti_produzione_vendor").insert(batch).execute()
+            except Exception as ex:
+                logging.error(f"Errore insert movimenti_produzione_vendor: {ex}")
+
 
 # --- PATCH SINGOLO PRELIEVO + SYNC PRODUZIONE ---
 @bp.route('/api/prelievi/<int:id>', methods=['PATCH'])
