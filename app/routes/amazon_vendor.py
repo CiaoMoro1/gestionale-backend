@@ -1484,11 +1484,39 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         if r["stato_produzione"] != "Rimossi"
     ]
 
-    # Prepara liste per batch
+    # --- CLEANUP: elimina vecchie "Da Stampare" (stesso SKU+EAN ma con data diversa) ---
+    chiavi_nuovi = set((p["sku"], p.get("ean")) for p in prelievi_modificati)
+    date_nuove = set(p.get("start_delivery") for p in prelievi_modificati)
+
+    vecchie_da_stampare = [
+        r for r in tutte
+        if r["stato_produzione"] == "Da Stampare"
+        and (r["sku"], r.get("ean")) in chiavi_nuovi
+        and r.get("start_delivery") not in date_nuove
+    ]
+
+    log_entries = []
+    if vecchie_da_stampare:
+        ids_da_eliminare = [r["id"] for r in vecchie_da_stampare]
+        for r in vecchie_da_stampare:
+            # Log eliminazione
+            log_entries.append(dict(
+                produzione_row=r,
+                utente=utente,
+                motivo="Auto-eliminazione Da Stampare su cambio data",
+                qty_vecchia=r["da_produrre"],
+                qty_nuova=0
+            ))
+        # Elimina tutte le vecchie in batch
+        batch_size = 100
+        for i in range(0, len(ids_da_eliminare), batch_size):
+            batch = ids_da_eliminare[i:i+batch_size]
+            supabase.table("produzione_vendor").delete().in_("id", batch).execute()
+
+    # --- PROSEGUI CON LA LOGICA STANDARD ---
     to_update = []
     to_delete = []
     to_insert = []
-    log_entries = []
 
     for p in prelievi_modificati:
         key = (p["sku"], p.get("ean"), p.get("start_delivery"))
@@ -1520,7 +1548,6 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
             r_da_stampare = da_stampare_righe[0]
             if da_produrre > 0:
                 if r_da_stampare["da_produrre"] != da_produrre:
-                    # Raccogli log
                     log_entries.append(dict(
                         produzione_row=r_da_stampare,
                         utente=utente,
@@ -1528,7 +1555,6 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
                         qty_vecchia=r_da_stampare["da_produrre"],
                         qty_nuova=da_produrre
                     ))
-                # Raccogli l'update in lista
                 to_update.append({
                     "id": r_da_stampare["id"],
                     "da_produrre": da_produrre,
@@ -1541,7 +1567,6 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
                     "modificata_manualmente": False
                 })
             else:
-                # Raccogli log eliminazione
                 log_entries.append(dict(
                     produzione_row=r_da_stampare,
                     utente=utente,
@@ -1549,7 +1574,6 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
                     qty_vecchia=r_da_stampare["da_produrre"],
                     qty_nuova=0
                 ))
-                # Raccogli ID da cancellare
                 to_delete.append(r_da_stampare["id"])
         else:
             if da_produrre > 0:
@@ -1569,7 +1593,6 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
                     "note": p.get("note") or "",
                 }
                 to_insert.append(nuovo)
-                # log movimenti dopo insert
 
     import logging
     # --- BATCH UPDATE ---
@@ -1591,12 +1614,11 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
 
     # --- BATCH INSERT ---
     if to_insert:
-        batch_size = 100  # per sicurezza, spezza in batch da 100
+        batch_size = 100
         for i in range(0, len(to_insert), batch_size):
             batch = to_insert[i:i+batch_size]
             try:
                 inserted = supabase.table("produzione_vendor").insert(batch).execute().data
-                # Dopo insert, log movimenti di creazione
                 for irow in inserted or []:
                     log_entries.append(dict(
                         produzione_row=irow,
