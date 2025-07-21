@@ -1521,7 +1521,15 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
     for p in prelievi_modificati:
         key = (p["sku"], p.get("ean"), p.get("start_delivery"))
         righe_attuali = [r for r in tutte if (r["sku"], r.get("ean"), r.get("start_delivery")) == key]
-        lavorato = sum(r["da_produrre"] for r in righe_attuali if r["stato_produzione"] != "Da Stampare")
+        # <<< CAMBIA QUESTO >>>
+        righe_lavorate = [
+            r for r in tutte
+            if r["sku"] == p["sku"]
+            and r.get("ean") == p.get("ean")
+            and r["stato_produzione"] != "Da Stampare"
+        ]
+        lavorato = sum(r["da_produrre"] for r in righe_lavorate)
+        # <<< FINO QUI >>>
         da_stampare_righe = [r for r in righe_attuali if r["stato_produzione"] == "Da Stampare"]
         qty = p["qty"]
         riscontro = p.get("riscontro") or 0
@@ -1900,22 +1908,38 @@ def svuota_prelievi():
 
 @bp.route('/api/produzione/pulisci-da-stampare', methods=['POST'])
 def pulisci_da_stampare_endpoint():
-    # Prendi tutte le righe Da Stampare
-    produzione = supabase.table("produzione_vendor").select("id,sku").eq("stato_produzione", "Da Stampare").execute().data
+    # Prendi tutte le righe Da Stampare in produzione
+    produzione = supabase.table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute().data
 
-    # Prendi tutti gli SKU dei prelievi attuali
-    prelievi = supabase.table("prelievi_ordini_amazon").select("sku").execute().data
-    sku_prelievi = set(p["sku"] for p in prelievi if p["sku"])
+    # Prendi tutti i prelievi attuali
+    prelievi = supabase.table("prelievi_ordini_amazon").select("sku,ean,start_delivery").execute().data
 
-    # Cancella solo i Da Stampare che NON esistono più come SKU nei prelievi
-    ids_da_eliminare = [r["id"] for r in produzione if r["sku"] not in sku_prelievi]
+    # Mappa di (sku, ean) -> data più recente nei prelievi
+    from collections import defaultdict
+    max_data_per_sku_ean = defaultdict(str)
+    for p in prelievi:
+        chiave = (p["sku"], p.get("ean"))
+        data = str(p.get("start_delivery"))[:10] if p.get("start_delivery") else ""
+        if data and (data > max_data_per_sku_ean[chiave]):
+            max_data_per_sku_ean[chiave] = data
+
+    # Solo le righe "giuste" devono rimanere: cioè, solo la data più nuova per quello SKU/EAN
+    ids_da_eliminare = []
+    for r in produzione:
+        chiave = (r["sku"], r.get("ean"))
+        data_riga = str(r.get("start_delivery"))[:10] if r.get("start_delivery") else ""
+        # Se questa riga NON è la data più nuova di quel SKU/EAN, elimina!
+        if max_data_per_sku_ean[chiave] and data_riga != max_data_per_sku_ean[chiave]:
+            ids_da_eliminare.append(r["id"])
+        # Se proprio non esiste più nei prelievi, elimina lo stesso!
+        elif chiave not in max_data_per_sku_ean:
+            ids_da_eliminare.append(r["id"])
 
     if ids_da_eliminare:
-        # Logga eliminazione
         for r_id in ids_da_eliminare:
             riga = supabase.table("produzione_vendor").select("*").eq("id", r_id).single().execute().data
             if riga:
-                log_movimento_produzione(riga, utente="operatore", motivo="Auto-eliminazione da pulizia prelievo")
+                log_movimento_produzione(riga, utente="operatore", motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)")
         supabase.table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
 
     return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
