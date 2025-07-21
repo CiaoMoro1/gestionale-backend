@@ -1366,7 +1366,7 @@ def log_movimento_produzione(
         "utente": utente,
         "motivo": motivo,
         "dettaglio": dettaglio,
-        "created_at": datetime.datetime.now().isoformat()
+        "created_at": datetime.now().isoformat()
     }).execute()
 
 # --- DATE DISPONIBILI ---
