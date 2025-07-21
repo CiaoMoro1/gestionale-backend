@@ -13,7 +13,8 @@ import barcode
 from barcode.writer import ImageWriter
 from io import BytesIO
 from PIL import Image
-
+import time
+import logging
 
 bp = Blueprint('amazon_vendor', __name__)
 
@@ -1381,6 +1382,8 @@ def date_importabili_prelievo():
     return jsonify(date_set)
 
 # --- IMPORTA PRELIEVI ---
+import logging
+
 @bp.route('/api/prelievi/importa', methods=['POST'])
 def importa_prelievi():
     data = request.json.get("data")
@@ -1416,8 +1419,9 @@ def importa_prelievi():
         aggrega[key]["qty"] += qty
         aggrega[key]["centri"][centro] = aggrega[key]["centri"].get(centro, 0) + qty
 
+    lista_to_insert = []
     for agg in aggrega.values():
-        supabase.table("prelievi_ordini_amazon").insert({
+        lista_to_insert.append({
             "sku": agg["sku"],
             "ean": agg["ean"],
             "qty": agg["qty"],
@@ -1425,10 +1429,33 @@ def importa_prelievi():
             "start_delivery": agg["start_delivery"],
             "centri": agg["centri"],
             "stato": "in verifica"
-        }).execute()
+        })
 
-    # >>> NIENTE SYNC PRODUZIONE QUI <<<
-    return jsonify({"ok": True, "count": len(aggrega)})
+    batch_size = 200  # sicurezza anche per limiti futuri
+    batch_results = []
+    errors = []
+    inserted_total = 0
+
+    for i in range(0, len(lista_to_insert), batch_size):
+        batch = lista_to_insert[i:i+batch_size]
+        try:
+            result = supabase.table("prelievi_ordini_amazon").insert(batch).execute()
+            # Se vuoi, puoi controllare che result.data contenga batch intero
+            inserted_total += len(batch)
+            batch_results.append({"start": i, "end": i+len(batch)-1, "ok": True})
+        except Exception as ex:
+            logging.error(f"Errore batch import prelievo [{i}-{i+len(batch)-1}]: {ex}")
+            errors.append({"start": i, "end": i+len(batch)-1, "error": str(ex)})
+            batch_results.append({"start": i, "end": i+len(batch)-1, "ok": False, "error": str(ex)})
+
+    return jsonify({
+        "ok": inserted_total == len(lista_to_insert),
+        "importati": inserted_total,
+        "totali": len(lista_to_insert),
+        "batch_results": batch_results,
+        "errors": errors
+    })
+
 
 # --- LISTA PRELIEVI ---
 @bp.route('/api/prelievi', methods=['GET'])
