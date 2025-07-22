@@ -1908,38 +1908,50 @@ def svuota_prelievi():
 
 @bp.route('/api/produzione/pulisci-da-stampare', methods=['POST'])
 def pulisci_da_stampare_endpoint():
-    # Prendi tutte le righe Da Stampare in produzione
-    produzione = supabase.table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute().data
+    def norm(x):
+        # Normalizza SKU/EAN: lowercase, strip, senza spazi
+        return (
+            (x.get("sku") or "").strip().lower().replace(" ", ""),
+            (x.get("ean") or "").strip().lower().replace(" ", "")
+        )
 
-    # Prendi tutti i prelievi attuali
+    # 1. Prendi tutte le righe "Da Stampare" in produzione
+    produzione = supabase.table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute().data
+    # 2. Prendi tutti i prelievi attuali
     prelievi = supabase.table("prelievi_ordini_amazon").select("sku,ean,start_delivery").execute().data
 
-    # Mappa di (sku, ean) -> data più recente nei prelievi
+    # 3. Mappa normalizzata di (sku, ean) --> data più recente
     from collections import defaultdict
     max_data_per_sku_ean = defaultdict(str)
     for p in prelievi:
-        chiave = (p["sku"], p.get("ean"))
-        data = str(p.get("start_delivery"))[:10] if p.get("start_delivery") else ""
+        chiave = norm(p)
+        # Assicurati che la data sia stringa YYYY-MM-DD
+        data = str(p.get("start_delivery") or "")[:10]
         if data and (data > max_data_per_sku_ean[chiave]):
             max_data_per_sku_ean[chiave] = data
 
-    # Solo le righe "giuste" devono rimanere: cioè, solo la data più nuova per quello SKU/EAN
+    # 4. Calcola gli ID da eliminare (righe con data NON più recente o assente)
     ids_da_eliminare = []
     for r in produzione:
-        chiave = (r["sku"], r.get("ean"))
-        data_riga = str(r.get("start_delivery"))[:10] if r.get("start_delivery") else ""
-        # Se questa riga NON è la data più nuova di quel SKU/EAN, elimina!
-        if max_data_per_sku_ean[chiave] and data_riga != max_data_per_sku_ean[chiave]:
+        chiave = norm(r)
+        data_riga = str(r.get("start_delivery") or "")[:10]
+        # Se non è la data più nuova per quello SKU/EAN --> elimina
+        if max_data_per_sku_ean.get(chiave) and data_riga != max_data_per_sku_ean[chiave]:
             ids_da_eliminare.append(r["id"])
-        # Se proprio non esiste più nei prelievi, elimina lo stesso!
+        # Se non esiste più nei prelievi --> elimina
         elif chiave not in max_data_per_sku_ean:
             ids_da_eliminare.append(r["id"])
 
+    # 5. Log & elimina in batch
     if ids_da_eliminare:
-        for r_id in ids_da_eliminare:
-            riga = supabase.table("produzione_vendor").select("*").eq("id", r_id).single().execute().data
-            if riga:
-                log_movimento_produzione(riga, utente="operatore", motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)")
+        # Fai il log PRIMA (puoi anche commentare se non vuoi il log)
+        rows_log = supabase.table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute().data
+        for riga in rows_log:
+            log_movimento_produzione(
+                riga, utente="operatore",
+                motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)"
+            )
+        # Cancella tutte in batch
         supabase.table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
 
     return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})

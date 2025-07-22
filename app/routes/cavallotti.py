@@ -64,12 +64,19 @@ def cavallotto_html():
             <div class="cav-img">
                 <img src="{image_url}" alt="Immagine prodotto" />
             </div>
-            <div class="cav-info">
+            <div class="cav-info-outer">
+              <div class="cav-info">
                 <img class="cav-logo" src="{LOGO_BASE64}" alt="Logo" />
-                <div class="cav-title">{product_title or sku}</div>
+                <div class="cav-titlebox">
+                  <div class="cav-title">{product_title or sku}</div>
+                </div>
                 <div class="cav-variant">{variant_title}</div>
-                <div class="cav-bar" style="font-size: {1.8 * font_scale}em; color: #1e1e1e; font-weight: 700;">{sku}</div>
+                <div class="cav-bar" style="font-size: {1.1 * font_scale}em; color: #1e1e1e; font-weight: 700;">{sku}</div>
                 <div class="cav-barcode">{f'<img src="{barcode64}" />' if barcode64 else ""}</div>
+                <div class="cav-wash">
+                  <img src="/static/lavaggio.png" alt="Simboli lavaggio" />
+                </div>
+              </div>
             </div>
         </div>
     """
@@ -133,20 +140,31 @@ def cavallotto_html():
           border: 1.5px solid #bbb;
           object-fit: contain;
         }}
-        .cav-info {{
+        .cav-info-outer {{
           flex: 1 1 40%;
+          display: flex;
+          align-items: stretch;
+          justify-content: stretch;
+          height: 80%;
+          padding: 0;
+          margin: 0;
+          box-sizing: border-box;
+          /* Qui puoi mettere eventuali padding o background extra */
+        }}
+        .cav-info {{
           display: flex;
           flex-direction: column;
           align-items: center;
-          justify-content: space-between;   /* Centra SOLO tra il 3% sopra e 3% sotto */
+          justify-content: space-between;
+          width: 100%;
           height: 100%;
           padding-top: 7%;
           padding-bottom: 7%;
           padding-left: 20px;
           padding-right: 20px;
-          box-sizing: border-box;
           background: transparent;
           text-align: center;
+          box-sizing: border-box;
         }}
         .cav-logo {{
           width: 80%;
