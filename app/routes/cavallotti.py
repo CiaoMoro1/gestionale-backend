@@ -25,11 +25,14 @@ def cavallotto_html():
     produzione = produzione[0]
     ean = produzione.get("ean") or ""
     sku = produzione.get("sku") or ""
+
     # 2. Prendi anche dati prodotti (immagine, titoli)
-    prodotto = supabase.table("products").select("*").eq("sku", sku).single().execute().data
+    prodotto_q = supabase.table("products").select("*").eq("sku", sku).limit(1).execute().data
+    prodotto = prodotto_q[0] if prodotto_q else {}
     image_url = prodotto.get("image_url") if prodotto else ""
     product_title = prodotto.get("product_title") if prodotto else ""
     variant_title = prodotto.get("variant_title") if prodotto else ""
+
     # 3. Barcode EAN in base64 (PNG)
     barcode64 = ""
     if ean and len(ean) in [8, 12, 13]:
@@ -42,19 +45,29 @@ def cavallotto_html():
         except Exception:
             barcode64 = ""
 
-    # 4. Formati (dimensioni e scala font proporzionale)
+    # 4. Formati (dimensioni e scale)
     if formato == "A3":
         larghezza = 42
         altezza = 29.7
-        font_scale = 1.5
+        font_scale = 2.5
+        logo_maxwidth = "10cm"
+        lavaggio_maxwidth = "10cm"
+        barcode_maxwidth = "12cm"
     elif formato == "A4":
         larghezza = 29.7
         altezza = 21
-        font_scale = 1.15
+        font_scale = 1.5
+        logo_maxwidth = "8cm"
+        lavaggio_maxwidth = "7cm"
+        barcode_maxwidth = "7cm"
     else:  # A5 o default
         larghezza = 21
         altezza = 14.8
-        font_scale = 0.85
+        font_scale = 1
+        logo_maxwidth = "5cm"
+        lavaggio_maxwidth = "7cm"
+        barcode_maxwidth = "5cm"
+
     larghezza_str = f"{larghezza}cm"
     altezza_str = f"{altezza}cm"
 
@@ -74,7 +87,7 @@ def cavallotto_html():
                 <div class="cav-bar" style="font-size: {1.1 * font_scale}em; color: #1e1e1e; font-weight: 700;">{sku}</div>
                 <div class="cav-barcode">{f'<img src="{barcode64}" />' if barcode64 else ""}</div>
                 <div class="cav-wash">
-                  <img src="/static/lavaggio.png" alt="Simboli lavaggio" />
+                  <img src="/static/lavaggio.png" alt="Simboli lavaggio" class="cav-wash-img" />
                 </div>
               </div>
             </div>
@@ -91,45 +104,43 @@ def cavallotto_html():
       <title>Cavallotti {sku} x{num_copie}</title>
       <style>
         html, body {{
-          width:100vw; height:100vh;
-          margin:0; padding:0;
-          background:#f8fafc;
+          width: 100vw; height: 100vh;
+          margin: 0; padding: 0;
+          background: #f8fafc;
         }}
         @media print {{
           html, body {{
-            margin:0 !important; padding:0 !important; background:white !important;
-            overflow:hidden;
+            margin: 0 !important; padding: 0 !important; background: white !important;
+            overflow: hidden;
           }}
           .no-print {{ display: none !important; }}
         }}
         body {{
-          margin:0; padding:0;
+          margin: 0; padding: 0;
           font-family: 'Segoe UI', Arial, sans-serif;
         }}
         .cav-main {{
           width: {larghezza_str}; height: {altezza_str};
           min-width: {larghezza_str}; min-height: {altezza_str};
           max-width: {larghezza_str}; max-height: {altezza_str};
+          display: flex;
+          flex-direction: row;
           box-sizing: border-box;
           border-radius: 28px;
           box-shadow: 0 2px 24px 0 #bbb4;
-          background-color: #fff;
-          background-image: {SVG_BG};
-          background-size: 50px 50px;   /* fissa come A5 */
+          background: #fff {SVG_BG};
+          background-size: 50px 50px;
           background-repeat: repeat;
-          display: flex;
-          flex-direction: row;
           overflow: hidden;
           position: relative;
           margin: 0 auto 18px auto;
-          page-break-after: always;   /* OGNI CAVALLOTTO SU UNA PAGINA */
+          page-break-after: always;
         }}
         .cav-img {{
           flex: 1 1 60%;
           display: flex;
           align-items: center;
           justify-content: center;
-          background: transparent;
           height: 100%;
           min-width: 0;
           padding-left: 3%;
@@ -139,17 +150,17 @@ def cavallotto_html():
           border-radius: 18px;
           border: 1.5px solid #bbb;
           object-fit: contain;
+          background: #f5f5f5;
         }}
         .cav-info-outer {{
           flex: 1 1 40%;
+          height: 80%;
+          margin-top: auto;
+          margin-bottom: auto;
           display: flex;
           align-items: stretch;
           justify-content: stretch;
-          height: 80%;
-          padding: 0;
-          margin: 0;
           box-sizing: border-box;
-          /* Qui puoi mettere eventuali padding o background extra */
         }}
         .cav-info {{
           display: flex;
@@ -158,27 +169,40 @@ def cavallotto_html():
           justify-content: space-between;
           width: 100%;
           height: 100%;
-          padding-top: 7%;
-          padding-bottom: 7%;
-          padding-left: 20px;
-          padding-right: 20px;
+          padding: 0.7cm 0.6cm;
           background: transparent;
           text-align: center;
           box-sizing: border-box;
         }}
         .cav-logo {{
-          width: 80%;
-          max-width: 400px;
-          min-width: 200px;
+          width: 78%;
+          max-width: {logo_maxwidth};
+          min-width: 1.7cm;
           height: auto;
-          margin-bottom: 1em;
+          margin-bottom: 0.5em;
           margin-top: 0;
         }}
+        .cav-titlebox {{
+          height: 29%;
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          overflow: hidden;
+          min-height: 1.2cm;
+          max-height: 3.5cm;
+        }}
         .cav-title {{
-          font-size: {2.2 * font_scale}em;
+          width: 100%;
+          white-space: normal;
+          text-align: center;
           font-weight: 800;
-          margin-bottom: {int(10 * font_scale)}px;
           color: #998468;
+          line-height: 1.08;
+          letter-spacing: 0.01em;
+          overflow: hidden;
+          word-break: break-word;
+          display: block;
         }}
         .cav-variant {{
           font-size: {1.1 * font_scale}em;
@@ -190,13 +214,24 @@ def cavallotto_html():
           font-size: {1 * font_scale}em;
           color: #222;
           margin-bottom: {int(6 * font_scale)}px;
+          font-family: monospace;
         }}
         .cav-barcode {{
           margin-top: {int(18 * font_scale)}px;
           margin-bottom: {int(8 * font_scale)}px;
         }}
         .cav-barcode img {{
-          max-width: {int(170 * font_scale)}px;
+          max-width: {barcode_maxwidth};
+          display: block;
+          margin: 0 auto;
+        }}
+        .cav-wash-img {{
+          width: 80%;
+          max-width: {lavaggio_maxwidth};
+          height: auto;
+          display: block;
+          margin: 0.3cm auto 0 auto;
+          background: #f9f9f9;
         }}
         .print-btn {{
           position: fixed; top: 12px; right: 18px; z-index: 999;
@@ -205,6 +240,25 @@ def cavallotto_html():
           font-weight: bold; font-size: 18px;
         }}
       </style>
+      <script>
+        // JS: Font-size dinamico del titolo (sempre dentro il box!)
+        window.onload = function() {{
+          document.querySelectorAll('.cav-titlebox').forEach(function(box) {{
+            var title = box.querySelector('.cav-title');
+            if (!title) return;
+            let max = Math.floor(box.offsetHeight * 0.85);
+            let min = 10;
+            let fs = max;
+            title.style.fontSize = fs + "px";
+            title.style.visibility = "hidden";
+            while ((title.scrollHeight > box.offsetHeight || title.scrollWidth > box.offsetWidth) && fs > min) {{
+              fs -= 1;
+              title.style.fontSize = fs + "px";
+            }}
+            title.style.visibility = "visible";
+          }});
+        }};
+      </script>
     </head>
     <body>
       <button class="print-btn no-print" onclick="window.print()">🖨️ Stampa</button>

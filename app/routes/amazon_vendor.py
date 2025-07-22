@@ -1955,3 +1955,62 @@ def pulisci_da_stampare_endpoint():
         supabase.table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
 
     return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
+
+@bp.route('/api/produzione/pulisci-da-stampare-parziale', methods=['POST'])
+def pulisci_da_stampare_parziale():
+    data = request.json
+    radice = data.get("radice")
+    ids = data.get("ids", [])
+
+    def norm(x):
+        return (
+            (x.get("sku") or "").strip().lower().replace(" ", ""),
+            (x.get("ean") or "").strip().lower().replace(" ", "")
+        )
+
+    # 1. Prendi tutte le righe "Da Stampare" con filtro su radice o id
+    produzione_query = supabase.table("produzione_vendor").select("id,sku,ean,start_delivery,prelievo_id")
+    if ids:
+        produzione_query = produzione_query.in_("prelievo_id", ids)
+    elif radice:
+        produzione_query = produzione_query.eq("radice", radice)
+    produzione = produzione_query.eq("stato_produzione", "Da Stampare").execute().data
+
+    # 2. Prendi prelievi filtrati allo stesso modo
+    prelievi_query = supabase.table("prelievi_ordini_amazon").select("id,sku,ean,start_delivery")
+    if ids:
+        prelievi_query = prelievi_query.in_("id", ids)
+    elif radice:
+        prelievi_query = prelievi_query.eq("radice", radice)
+    prelievi = prelievi_query.execute().data
+
+    # 3. Costruisci mappa di data massima per (sku, ean)
+    from collections import defaultdict
+    max_data_per_sku_ean = defaultdict(str)
+    for p in prelievi:
+        chiave = norm(p)
+        data = str(p.get("start_delivery") or "")[:10]
+        if data and (data > max_data_per_sku_ean[chiave]):
+            max_data_per_sku_ean[chiave] = data
+
+    # 4. Calcola ID da eliminare (logica come pulisci-da-stampare)
+    ids_da_eliminare = []
+    for r in produzione:
+        chiave = norm(r)
+        data_riga = str(r.get("start_delivery") or "")[:10]
+        if max_data_per_sku_ean.get(chiave) and data_riga != max_data_per_sku_ean[chiave]:
+            ids_da_eliminare.append(r["id"])
+        elif chiave not in max_data_per_sku_ean:
+            ids_da_eliminare.append(r["id"])
+
+    # 5. Log & elimina in batch
+    if ids_da_eliminare:
+        rows_log = supabase.table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute().data
+        for riga in rows_log:
+            log_movimento_produzione(
+                riga, utente="operatore",
+                motivo="Auto-eliminazione da pulizia parziale prelievo"
+            )
+        supabase.table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+
+    return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
