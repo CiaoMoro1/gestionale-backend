@@ -47,21 +47,26 @@ def allowed_file(filename):
 
 def get_all_items_by_po(po_list):
     all_items = []
-    offset = 0
-    limit = 500  # puoi regolare il batch
-    while True:
-        batch = supabase.table("ordini_vendor_items") \
-            .select("po_number, qty_ordered, fulfillment_center, start_delivery") \
-            .in_("po_number", po_list) \
-            .range(offset, offset+limit-1) \
-            .execute().data
-        if not batch:
-            break
-        all_items.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
+    BATCH_SIZE = 50  # Limita il numero di PO per singola query
+    for i in range(0, len(po_list), BATCH_SIZE):
+        batch_po = po_list[i:i+BATCH_SIZE]
+        offset = 0
+        limit = 500
+        while True:
+            batch = supabase.table("ordini_vendor_items") \
+                .select("po_number, qty_ordered, fulfillment_center, start_delivery") \
+                .in_("po_number", batch_po) \
+                .range(offset, offset+limit-1) \
+                .execute().data
+            if not batch:
+                break
+            all_items.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += limit
+        time.sleep(0.1)  # Pausa per non saturare Supabase tra un batch e l'altro
     return all_items
+
 
 
 
@@ -1275,96 +1280,111 @@ def find_items_by_barcode():
 
 @bp.route('/api/amazon/vendor/orders/riepilogo/dashboard', methods=['GET'])
 def riepilogo_dashboard_parziali():
-    try:
-        offset = int(request.args.get("offset", 0))
-        limit = int(request.args.get("limit", 100))
-        dashboard = []
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            offset = int(request.args.get("offset", 0))
+            limit = int(request.args.get("limit", 100))
+            dashboard = []
 
-        # Prendi max 100 riepiloghi "nuovo/parziale" (con paginazione)
-        riepiloghi = supabase.table("ordini_vendor_riepilogo") \
-            .select("*") \
-            .in_("stato_ordine", ["nuovo", "parziale"]) \
-            .order("created_at", desc=True) \
-            .range(offset, offset+limit-1) \
-            .execute().data
+            # Prendi max 100 riepiloghi "nuovo/parziale" (con paginazione)
+            riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+                .select("*") \
+                .in_("stato_ordine", ["nuovo", "parziale"]) \
+                .order("created_at", desc=True) \
+                .range(offset, offset+limit-1) \
+                .execute().data
 
-        if not riepiloghi:
-            return jsonify([])
+            if not riepiloghi:
+                return jsonify([])
 
-        riepilogo_ids = [r.get("id") or r.get("riepilogo_id") for r in riepiloghi]
-        parziali = supabase.table("ordini_vendor_parziali") \
-            .select("riepilogo_id,numero_parziale,dati,conferma_collo") \
-            .in_("riepilogo_id", riepilogo_ids) \
-            .execute().data
+            riepilogo_ids = [r.get("id") or r.get("riepilogo_id") for r in riepiloghi]
+            parziali = supabase.table("ordini_vendor_parziali") \
+                .select("riepilogo_id,numero_parziale,dati,conferma_collo") \
+                .in_("riepilogo_id", riepilogo_ids) \
+                .execute().data
 
-        parziali_per_riep = defaultdict(list)
-        for p in parziali:
-            parziali_per_riep[p["riepilogo_id"]].append(p)
+            from collections import defaultdict
+            parziali_per_riep = defaultdict(list)
+            for p in parziali:
+                parziali_per_riep[p["riepilogo_id"]].append(p)
 
-        for r in riepiloghi:
-            fulfillment_center = r["fulfillment_center"]
-            start_delivery = r["start_delivery"]
-            stato_ordine = r["stato_ordine"]
-            po_list = r["po_list"]
-            riepilogo_id = r.get("id") or r.get("riepilogo_id")
+            import json
+            for r in riepiloghi:
+                fulfillment_center = r["fulfillment_center"]
+                start_delivery = r["start_delivery"]
+                stato_ordine = r["stato_ordine"]
+                po_list = r["po_list"]
+                riepilogo_id = r.get("id") or r.get("riepilogo_id")
 
-            my_parziali = parziali_per_riep.get(riepilogo_id, [])
+                my_parziali = parziali_per_riep.get(riepilogo_id, [])
 
-            if not my_parziali:
-                dashboard.append({
-                    "fulfillment_center": fulfillment_center,
-                    "start_delivery": start_delivery,
-                    "stato_ordine": stato_ordine,
-                    "numero_parziale": None,
-                    "colli_totali": 0,
-                    "colli_confermati": 0,
-                    "po_list": po_list,
-                    "riepilogo_id": riepilogo_id,
-                })
-                continue
+                if not my_parziali:
+                    dashboard.append({
+                        "fulfillment_center": fulfillment_center,
+                        "start_delivery": start_delivery,
+                        "stato_ordine": stato_ordine,
+                        "numero_parziale": None,
+                        "colli_totali": 0,
+                        "colli_confermati": 0,
+                        "po_list": po_list,
+                        "riepilogo_id": riepilogo_id,
+                    })
+                    continue
 
-            for p in my_parziali:
-                numero_parziale = p.get("numero_parziale") or 1
-                dati = p["dati"]
-                if isinstance(dati, str):
-                    try:
-                        dati = json.loads(dati)
-                    except Exception:
-                        dati = []
-                colli_totali_set = set()
-                if isinstance(dati, list):
-                    for d in dati:
-                        collo = d.get("collo")
-                        if collo is not None:
-                            colli_totali_set.add(collo)
-                conferma_collo = p.get("conferma_collo")
-                if isinstance(conferma_collo, str):
-                    try:
-                        conferma_collo = json.loads(conferma_collo)
-                    except Exception:
-                        conferma_collo = {}
-                colli_confermati_set = set()
-                if isinstance(conferma_collo, dict):
-                    for k, v in conferma_collo.items():
-                        if v:
-                            try:
-                                colli_confermati_set.add(int(k))
-                            except Exception:
-                                pass
-                dashboard.append({
-                    "fulfillment_center": fulfillment_center,
-                    "start_delivery": start_delivery,
-                    "stato_ordine": stato_ordine,
-                    "numero_parziale": numero_parziale,
-                    "colli_totali": len(colli_totali_set),
-                    "colli_confermati": len(colli_confermati_set),
-                    "po_list": po_list,
-                    "riepilogo_id": riepilogo_id,
-                })
-        return jsonify(dashboard)
-    except Exception as ex:
-        logging.exception("[riepilogo_dashboard_parziali] Errore dashboard parziali")
-        return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
+                for p in my_parziali:
+                    numero_parziale = p.get("numero_parziale") or 1
+                    dati = p["dati"]
+                    if isinstance(dati, str):
+                        try:
+                            dati = json.loads(dati)
+                        except Exception:
+                            dati = []
+                    colli_totali_set = set()
+                    if isinstance(dati, list):
+                        for d in dati:
+                            collo = d.get("collo")
+                            if collo is not None:
+                                colli_totali_set.add(collo)
+                    conferma_collo = p.get("conferma_collo")
+                    if isinstance(conferma_collo, str):
+                        try:
+                            conferma_collo = json.loads(conferma_collo)
+                        except Exception:
+                            conferma_collo = {}
+                    colli_confermati_set = set()
+                    if isinstance(conferma_collo, dict):
+                        for k, v in conferma_collo.items():
+                            if v:
+                                try:
+                                    colli_confermati_set.add(int(k))
+                                except Exception:
+                                    pass
+                    dashboard.append({
+                        "fulfillment_center": fulfillment_center,
+                        "start_delivery": start_delivery,
+                        "stato_ordine": stato_ordine,
+                        "numero_parziale": numero_parziale,
+                        "colli_totali": len(colli_totali_set),
+                        "colli_confermati": len(colli_confermati_set),
+                        "po_list": po_list,
+                        "riepilogo_id": riepilogo_id,
+                    })
+            return jsonify(dashboard)
+        except Exception as ex:
+            import httpx
+            import time
+            import logging
+            if isinstance(ex, httpx.RemoteProtocolError):
+                logging.warning(f"[riepilogo_dashboard_parziali] Connessione interrotta verso Supabase (tentativo {attempt+1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    logging.exception("[riepilogo_dashboard_parziali] Errore definitivo")
+                    return jsonify({"error": "Connessione a Supabase interrotta. Riprova tra poco."}), 503
+            logging.exception("[riepilogo_dashboard_parziali] Errore dashboard parziali")
+            return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
 
 
 @bp.route('/api/amazon/vendor/orders/lista-ordini/nuovi/pdf', methods=['GET'])
@@ -2223,10 +2243,11 @@ def delete_produzione_bulk():
         if not ids:
             return jsonify({"error": "Nessun id"}), 400
 
-        # Carica righe da loggare PRIMA di cancellare!
+        # Carica solo le righe realmente esistenti!
         rows = supabase.table("produzione_vendor").select("*").in_("id", ids).execute().data
+        ids_esistenti = {r["id"] for r in rows}
 
-        # --- LOG MOVIMENTI IN BULK (con stato e qty pre-eliminazione) ---
+        # --- LOG MOVIMENTI IN BULK solo per gli esistenti ---
         now = datetime.now().isoformat()
         movimenti = []
         for r in rows:
@@ -2236,7 +2257,7 @@ def delete_produzione_bulk():
                 "ean": r.get("ean"),
                 "start_delivery": r.get("start_delivery"),
                 "stato_vecchio": r.get("stato_produzione"),
-                "stato_nuovo": None,  # Per delete bulk non ha senso
+                "stato_nuovo": None,
                 "qty_vecchia": r.get("da_produrre"),
                 "qty_nuova": None,
                 "plus_vecchio": r.get("plus"),
@@ -2249,16 +2270,17 @@ def delete_produzione_bulk():
         if movimenti:
             supabase.table("movimenti_produzione_vendor").insert(movimenti).execute()
 
-        # --- DELETE IN BATCH ---
+        # --- DELETE SOLO sugli ID esistenti ---
         BATCH_SIZE = 100
         for i in range(0, len(ids), BATCH_SIZE):
-            batch_ids = ids[i:i+BATCH_SIZE]
-            supabase.table("produzione_vendor").delete().in_("id", batch_ids).execute()
-            time.sleep(0.1)  # Pausa per evitare saturazione
+            batch_ids = [id_ for id_ in ids[i:i+BATCH_SIZE] if id_ in ids_esistenti]
+            if batch_ids:
+                supabase.table("produzione_vendor").delete().in_("id", batch_ids).execute()
+                time.sleep(0.1)  # Pausa per evitare saturazione
 
         return jsonify({
             "ok": True,
-            "deleted_count": len(ids),
+            "deleted_count": len(ids_esistenti),
             "movimenti_loggati": len(movimenti)
         })
     except Exception as ex:
@@ -2379,3 +2401,20 @@ def pulisci_da_stampare_parziale():
     except Exception as ex:
         logging.exception("[pulisci_da_stampare_parziale] Errore pulizia parziale da stampare")
         return jsonify({"error": f"Errore pulizia parziale: {str(ex)}"}), 500
+    
+
+@bp.route('/api/amazon/vendor/orders/badge-counts', methods=['GET'])
+def badge_counts():
+    try:
+        n_nuovi = supabase.table("ordini_vendor_riepilogo")\
+            .select("id", count='exact')\
+            .eq("stato_ordine", "nuovo")\
+            .execute().count or 0
+        n_parziali = supabase.table("ordini_vendor_riepilogo")\
+            .select("id", count='exact')\
+            .eq("stato_ordine", "parziale")\
+            .execute().count or 0
+        return jsonify({"nuovi": n_nuovi, "parziali": n_parziali})
+    except Exception as ex:
+        logging.exception("Errore badge_counts")
+        return jsonify({"nuovi": 0, "parziali": 0}), 200
