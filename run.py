@@ -20,6 +20,8 @@ from app.routes.validate_address import validate_address_bp
 from app.routes.amazon_vendor import bp as amazon_vendor_bp
 from app.routes.oauth_callback import bp as amazon_oauth_bp
 from app.routes import cavallotti
+from app.routes.jobs import bp as jobs_bp
+
 
 load_dotenv()
 
@@ -51,6 +53,7 @@ def create_app():
     app.register_blueprint(amazon_vendor_bp)
     app.register_blueprint(amazon_oauth_bp)
     app.register_blueprint(cavallotti.bp)
+    app.register_blueprint(jobs_bp)
     logging.info("App Flask avviata. Blueprint registrati: bulk_sync, webhook, orders, shopify, bulk_routes, brt")
     return app
 
