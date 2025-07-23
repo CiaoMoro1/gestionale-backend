@@ -1204,78 +1204,93 @@ def test_asn_submit():
 
 @bp.route('/api/amazon/vendor/items/by-barcode', methods=['GET'])
 def find_items_by_barcode():
-    try:
-        barcode = request.args.get('barcode')
-        if not barcode:
-            return jsonify([])
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            barcode = request.args.get('barcode')
+            if not barcode:
+                return jsonify([])
 
-        riepiloghi = supabase.table("ordini_vendor_riepilogo") \
-            .select("po_list,fulfillment_center,start_delivery,id") \
-            .in_("stato_ordine", ["nuovo", "parziale"]) \
-            .execute().data
+            riepiloghi = supabase.table("ordini_vendor_riepilogo") \
+                .select("po_list,fulfillment_center,start_delivery,id") \
+                .in_("stato_ordine", ["nuovo", "parziale"]) \
+                .execute().data
 
-        po_centro_map = {}
-        po_riepilogo_id_map = {}
-        for r in riepiloghi:
-            for po in r["po_list"]:
-                po_centro_map[po] = {
-                    "fulfillment_center": r["fulfillment_center"],
-                    "start_delivery": r["start_delivery"],
-                }
-                po_riepilogo_id_map[po] = r.get("id") 
+            po_centro_map = {}
+            po_riepilogo_id_map = {}
+            for r in riepiloghi:
+                for po in r["po_list"]:
+                    po_centro_map[po] = {
+                        "fulfillment_center": r["fulfillment_center"],
+                        "start_delivery": r["start_delivery"],
+                    }
+                    po_riepilogo_id_map[po] = r.get("id") 
 
-        po_list = list(po_centro_map.keys())
-        if not po_list:
-            return jsonify([])
+            po_list = list(po_centro_map.keys())
+            if not po_list:
+                return jsonify([])
 
-        articoli = supabase.table("ordini_vendor_items") \
-            .select("*") \
-            .in_("po_number", po_list) \
-            .or_(f"vendor_product_id.eq.{barcode},model_number.eq.{barcode}") \
-            .execute().data
+            # Limit per evitare carico inutile!
+            articoli = supabase.table("ordini_vendor_items") \
+                .select("*") \
+                .in_("po_number", po_list) \
+                .or_(f"vendor_product_id.eq.{barcode},model_number.eq.{barcode}") \
+                .limit(30) \
+                .execute().data
 
-        for a in articoli:
-            info = po_centro_map.get(a["po_number"], {})
-            a["fulfillment_center"] = info.get("fulfillment_center")
-            a["start_delivery"] = info.get("start_delivery")
-
-        riepilogo_ids = list(set(po_riepilogo_id_map.get(a["po_number"]) for a in articoli if po_riepilogo_id_map.get(a["po_number"])))
-        if not riepilogo_ids:
             for a in articoli:
-                a["qty_inserted"] = 0
+                info = po_centro_map.get(a["po_number"], {})
+                a["fulfillment_center"] = info.get("fulfillment_center")
+                a["start_delivery"] = info.get("start_delivery")
+
+            riepilogo_ids = list(set(po_riepilogo_id_map.get(a["po_number"]) for a in articoli if po_riepilogo_id_map.get(a["po_number"])))
+            if not riepilogo_ids:
+                for a in articoli:
+                    a["qty_inserted"] = 0
+                return jsonify(articoli)
+
+            parziali = supabase.table("ordini_vendor_parziali") \
+                .select("dati") \
+                .in_("riepilogo_id", riepilogo_ids) \
+                .execute().data
+
+            from collections import defaultdict
+            import json
+            qty_inserted_map = defaultdict(int)
+            for p in parziali:
+                dati = p["dati"]
+                if isinstance(dati, str):
+                    try:
+                        dati = json.loads(dati)
+                    except Exception:
+                        dati = []
+                if not isinstance(dati, list):
+                    continue
+                for d in dati:
+                    key = (d.get("po_number"), d.get("model_number"))
+                    try:
+                        qty_inserted_map[key] += int(d.get("quantita", 0))
+                    except Exception:
+                        pass
+
+            for a in articoli:
+                key = (a["po_number"], a["model_number"])
+                a["qty_inserted"] = qty_inserted_map.get(key, 0)
+
             return jsonify(articoli)
 
-        parziali = supabase.table("ordini_vendor_parziali") \
-            .select("dati") \
-            .in_("riepilogo_id", riepilogo_ids) \
-            .execute().data
-
-        qty_inserted_map = defaultdict(int)
-        for p in parziali:
-            dati = p["dati"]
-            if isinstance(dati, str):
-                try:
-                    dati = json.loads(dati)
-                except Exception:
-                    dati = []
-            if not isinstance(dati, list):
+        except httpx.RemoteProtocolError:
+            import time
+            logging.warning(f"[find_items_by_barcode] Errore di rete verso Supabase (tentativo {attempt+1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(1)
                 continue
-            for d in dati:
-                key = (d.get("po_number"), d.get("model_number"))
-                try:
-                    qty_inserted_map[key] += int(d.get("quantita", 0))
-                except Exception:
-                    pass
+            else:
+                return jsonify({"error": "Errore di connessione a Supabase. Riprova."}), 503
+        except Exception as ex:
+            logging.exception("[find_items_by_barcode] Errore nella ricerca per barcode")
+            return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
 
-        for a in articoli:
-            key = (a["po_number"], a["model_number"])
-            a["qty_inserted"] = qty_inserted_map.get(key, 0)
-
-        return jsonify(articoli)
-
-    except Exception as ex:
-        logging.exception("[find_items_by_barcode] Errore nella ricerca per barcode")
-        return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
 
 
 @bp.route('/api/amazon/vendor/orders/riepilogo/dashboard', methods=['GET'])
@@ -2148,8 +2163,18 @@ def patch_produzione(id):
         if not fields:
             return jsonify({"error": "Nessun campo da aggiornare"}), 400
 
-        # Update produzione_vendor
-        res = supabase.table("produzione_vendor").update(fields).eq("id", id).execute()
+        # -------- PATCH CON RETRY ----------
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                res = supabase.table("produzione_vendor").update(fields).eq("id", id).execute()
+                break
+            except Exception as ex:
+                logging.warning(f"[patch_produzione] Errore update tentativo {attempt+1}/{max_retries}: {ex}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
 
         # Logga i movimenti
         for entry in log_entries:
@@ -2160,6 +2185,7 @@ def patch_produzione(id):
     except Exception as ex:
         logging.exception("[patch_produzione] Errore patch produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
     
     
 # --- PATCH BULK PRODUZIONE ---
@@ -2200,7 +2226,19 @@ def patch_produzione_bulk():
                     plus_nuovo=update_fields["plus"]
                 ))
 
-        supabase.table("produzione_vendor").update(update_fields).in_("id", ids).execute()
+        # -------- PATCH BULK CON RETRY ----------
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                supabase.table("produzione_vendor").update(update_fields).in_("id", ids).execute()
+                break
+            except Exception as ex:
+                logging.warning(f"[patch_produzione_bulk] Errore update bulk tentativo {attempt+1}/{max_retries}: {ex}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+
         for entry in logs:
             log_movimento_produzione(**entry)
 
@@ -2208,6 +2246,7 @@ def patch_produzione_bulk():
     except Exception as ex:
         logging.exception("[patch_produzione_bulk] Errore PATCH bulk produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
 
 # --- GET PRODUZIONE BY ID ---
 @bp.route('/api/produzione/<int:id>', methods=['GET'])
