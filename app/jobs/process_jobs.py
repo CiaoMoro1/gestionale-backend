@@ -10,6 +10,17 @@ load_dotenv()
 import os
 from datetime import datetime, timezone
 
+
+def fix_date(val):
+    if pd.isna(val):
+        return None
+    if hasattr(val, "date"):
+        return val.date().isoformat()
+    s = str(val).strip()
+    if "T" in s:
+        return s.split("T")[0]
+    return s
+
 # Configura qui il client Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -99,19 +110,6 @@ def process_import_vendor_orders_job(job):
                         f"Doppione: Ordine={row['Numero ordine/ordine d’acquisto']} | Modello={row['Numero di modello']} | Quantità={row['Quantità ordinata']}"
                     )
                     continue
-
-                def fix_date(val):
-                    if pd.isna(val):
-                        return None
-                    # Se è un pandas.Timestamp o datetime, prendi solo la parte data
-                    if hasattr(val, "date"):
-                        return val.date().isoformat()
-                    # Se è una stringa tipo "2025-07-23T00:00:00", prendi solo la parte data
-                    s = str(val).strip()
-                    if "T" in s:
-                        return s.split("T")[0]
-                    return s
-
 
                 ordine = {
                     "po_number": str(row["Numero ordine/ordine d’acquisto"]).strip(),
