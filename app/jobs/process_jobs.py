@@ -8,6 +8,7 @@ from supabase import create_client
 from dotenv import load_dotenv
 load_dotenv()
 import os
+from datetime import datetime, timezone
 
 # Configura qui il client Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -127,7 +128,7 @@ def process_import_vendor_orders_job(job):
                     "status": row["Stato disponibilità"],
                     "vendor_code": row["Codice fornitore"],
                     "fulfillment_center": row["Fulfillment Center"],
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": datetime.now(timezone.utc).isoformat()
                 }
 
                 supabase.table("ordini_vendor_items").insert(ordine).execute()
