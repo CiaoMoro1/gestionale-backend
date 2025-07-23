@@ -99,6 +99,13 @@ def process_import_vendor_orders_job(job):
                     )
                     continue
 
+                def fix_timestamp(val):
+                    if pd.isna(val):
+                        return None
+                    if hasattr(val, "isoformat"):
+                        return val.isoformat()
+                    return str(val).strip()
+
                 ordine = {
                     "po_number": str(row["Numero ordine/ordine d’acquisto"]).strip(),
                     "vendor_product_id": str(row["Codice identificativo esterno"]).strip(),
@@ -108,14 +115,15 @@ def process_import_vendor_orders_job(job):
                     "cost": row["Costo"],
                     "qty_ordered": row["Quantità ordinata"],
                     "qty_confirmed": row["Quantità confermata"],
-                    "start_delivery": row["Inizio consegna"],
-                    "end_delivery": row["Termine consegna"],
-                    "delivery_date": row["Data di consegna prevista"],
+                    "start_delivery": fix_timestamp(row["Inizio consegna"]),
+                    "end_delivery": fix_timestamp(row["Termine consegna"]),
+                    "delivery_date": fix_timestamp(row["Data di consegna prevista"]),
                     "status": row["Stato disponibilità"],
                     "vendor_code": row["Codice fornitore"],
                     "fulfillment_center": row["Fulfillment Center"],
                     "created_at": datetime.utcnow().isoformat(),
                 }
+
                 supabase.table("ordini_vendor_items").insert(ordine).execute()
                 po_numbers.add(ordine["po_number"])
                 importati += 1
