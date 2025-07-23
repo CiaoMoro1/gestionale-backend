@@ -99,12 +99,18 @@ def process_import_vendor_orders_job(job):
                     )
                     continue
 
-                def fix_timestamp(val):
+                def fix_date(val):
                     if pd.isna(val):
                         return None
-                    if hasattr(val, "isoformat"):
-                        return val.isoformat()
-                    return str(val).strip()
+                    # Se è un pandas.Timestamp o datetime, prendi solo la parte data
+                    if hasattr(val, "date"):
+                        return val.date().isoformat()
+                    # Se è una stringa tipo "2025-07-23T00:00:00", prendi solo la parte data
+                    s = str(val).strip()
+                    if "T" in s:
+                        return s.split("T")[0]
+                    return s
+
 
                 ordine = {
                     "po_number": str(row["Numero ordine/ordine d’acquisto"]).strip(),
@@ -115,9 +121,9 @@ def process_import_vendor_orders_job(job):
                     "cost": row["Costo"],
                     "qty_ordered": row["Quantità ordinata"],
                     "qty_confirmed": row["Quantità confermata"],
-                    "start_delivery": fix_timestamp(row["Inizio consegna"]),
-                    "end_delivery": fix_timestamp(row["Termine consegna"]),
-                    "delivery_date": fix_timestamp(row["Data di consegna prevista"]),
+                    "start_delivery": fix_date(row["Inizio consegna"]),
+                    "end_delivery": fix_date(row["Termine consegna"]),
+                    "delivery_date": fix_date(row["Data di consegna prevista"]),
                     "status": row["Stato disponibilità"],
                     "vendor_code": row["Codice fornitore"],
                     "fulfillment_center": row["Fulfillment Center"],
