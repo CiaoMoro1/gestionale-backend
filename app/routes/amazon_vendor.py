@@ -331,10 +331,18 @@ import logging
 @bp.route('/api/amazon/vendor/parziali', methods=['GET'])
 def get_parziali():
     riepilogo_id = request.args.get('riepilogo_id')
-    offset = int(request.args.get("offset", 0))
-    limit = int(request.args.get("limit", 100))
+    try:
+        offset = int(request.args.get("offset", 0))
+        limit = int(request.args.get("limit", 100))
+    except Exception:
+        return jsonify({"error": "Offset/limit non validi"}), 400
+
     if not riepilogo_id:
         return jsonify({"error": "riepilogo_id mancante"}), 400
+    if limit > 200:
+        return jsonify({"error": "Limit troppo alto (max 200)"}), 400
+    if offset < 0:
+        return jsonify({"error": "Offset non valido"}), 400
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -349,9 +357,11 @@ def get_parziali():
         except Exception as ex:
             logging.exception(f"[get_parziali] Errore tentativo {attempt+1}/{max_retries}")
             if attempt < max_retries - 1:
-                time.sleep(1)
+                import time
+                time.sleep(0.7)
             else:
                 return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
 
 
 import logging
@@ -896,6 +906,12 @@ def get_riepilogo_parziali():
         logging.exception("Errore in get_riepilogo_parziali")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
+MAX_BATCH = 30  # O anche 20 per essere sicuri
+
+def chunked(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
+
 @bp.route('/api/amazon/vendor/items', methods=['GET'])
 def get_items_by_po():
     try:
@@ -903,28 +919,29 @@ def get_items_by_po():
         if not po_list:
             return jsonify([])
         pos = [p.strip().upper() for p in po_list.split(",")]
-        offset = 0
-        limit = 200
         all_items = []
         seen = set()
-        while True:
-            items = supabase.table("ordini_vendor_items")\
-                .select("po_number,model_number,qty_ordered,qty_confirmed,cost")\
-                .in_("po_number", pos)\
-                .order("po_number")\
-                .order("model_number")\
-                .range(offset, offset + limit - 1)\
-                .execute().data
-            if not items:
-                break
-            for item in items:
-                key = (item["po_number"], item["model_number"])
-                if key not in seen:
-                    all_items.append(item)
-                    seen.add(key)
-            if len(items) < limit:
-                break
-            offset += limit
+        for batch in chunked(pos, MAX_BATCH):
+            offset = 0
+            limit = 200
+            while True:
+                items = supabase.table("ordini_vendor_items")\
+                    .select("po_number,model_number,qty_ordered,qty_confirmed,cost")\
+                    .in_("po_number", batch)\
+                    .order("po_number")\
+                    .order("model_number")\
+                    .range(offset, offset + limit - 1)\
+                    .execute().data
+                if not items:
+                    break
+                for item in items:
+                    key = (item["po_number"], item["model_number"])
+                    if key not in seen:
+                        all_items.append(item)
+                        seen.add(key)
+                if len(items) < limit:
+                    break
+                offset += limit
         return jsonify(all_items)
     except Exception as ex:
         import logging
