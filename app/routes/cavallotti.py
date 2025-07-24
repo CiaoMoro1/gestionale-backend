@@ -18,16 +18,24 @@ def cavallotto_html():
     formato = request.args.get("formato", "A5").upper()
     num_copie = int(request.args.get("copie", 1))  # Parametro copie
 
-    # 1. Cerca la riga produzione_vendor
+    # 1. Prova a prendere produzione_vendor
     produzione = supabase.table("produzione_vendor").select("*").eq("sku", sku).limit(1).execute().data
-    if not produzione:
-        return "Articolo non trovato in produzione", 404
-    produzione = produzione[0]
-    ean = produzione.get("ean") or ""
-    sku = produzione.get("sku") or ""
-
-    # 2. Prendi anche dati prodotti (immagine, titoli)
-    prodotto_q = supabase.table("products").select("*").eq("sku", sku).limit(1).execute().data
+    if produzione:
+        produzione = produzione[0]
+        ean = produzione.get("ean") or ""
+        sku_value = produzione.get("sku") or sku
+    else:
+        # Prendi da products (ma con fallback)
+        prodotto_q = supabase.table("products").select("*").eq("sku", sku).limit(1).execute().data
+        if not prodotto_q:
+            return "Articolo non trovato", 404
+        prodotto = prodotto_q[0]
+        sku_value = prodotto.get("sku") or sku
+        ean = prodotto.get("ean") or ""
+        produzione = {}
+    
+    # 2. Dati prodotto (sempre prova a prenderli)
+    prodotto_q = supabase.table("products").select("*").eq("sku", sku_value).limit(1).execute().data
     prodotto = prodotto_q[0] if prodotto_q else {}
     image_url = prodotto.get("image_url") if prodotto else ""
     product_title = prodotto.get("product_title") if prodotto else ""
@@ -81,10 +89,10 @@ def cavallotto_html():
               <div class="cav-info">
                 <img class="cav-logo" src="{LOGO_BASE64}" alt="Logo" />
                 <div class="cav-titlebox">
-                  <div class="cav-title">{product_title or sku}</div>
+                  <div class="cav-title">{product_title or sku_value}</div>
                 </div>
                 <div class="cav-variant">{variant_title}</div>
-                <div class="cav-bar" style="font-size: {1.1 * font_scale}em; color: #1e1e1e; font-weight: 700;">{sku}</div>
+                <div class="cav-bar" style="font-size: {1.1 * font_scale}em; color: #1e1e1e; font-weight: 700;">{sku_value}</div>
                 <div class="cav-barcode">{f'<img src="{barcode64}" />' if barcode64 else ""}</div>
                 <div class="cav-wash">
                   <img src="/static/lavaggio.png" alt="Simboli lavaggio" class="cav-wash-img" />
@@ -94,7 +102,6 @@ def cavallotto_html():
         </div>
     """
 
-    # 6. Duplica per quante copie servono!
     cavallotti_html = cavallotto_block * num_copie
 
     # 7. HTML completo
@@ -260,7 +267,7 @@ def cavallotto_html():
         }};
       </script>
     </head>
-    <body>
+    <body>get_items_by_po
       <button class="print-btn no-print" onclick="window.print()">🖨️ Stampa</button>
       {cavallotti_html}
     </body>

@@ -1965,10 +1965,9 @@ def patch_prelievo(id):
             note = fields["note"] or ""
             if len(note) > 255:
                 return jsonify({"error": "Nota troppo lunga (max 255 caratteri)"}), 400
-            # Solo caratteri accettati (puoi modificare la regex secondo le tue policy)
-            if not re.match(r'^[\w\s.,;:!?"\'àèéìòù()\-_/]*$', note):
-                return jsonify({"error": "Caratteri non validi nelle note"}), 400
+            # Togli il controllo sui caratteri consentiti!
             fields["note"] = note.strip()
+
 
         if "riscontro" in data:
             prelievo = supabase.table("prelievi_ordini_amazon").select("qty").eq("id", id).single().execute().data
@@ -2282,49 +2281,27 @@ def delete_produzione_bulk():
         if not ids:
             return jsonify({"error": "Nessun id"}), 400
 
-        # Carica solo le righe realmente esistenti!
-        rows = supabase.table("produzione_vendor").select("*").in_("id", ids).execute().data
-        ids_esistenti = {r["id"] for r in rows}
-
-        # --- LOG MOVIMENTI IN BULK solo per gli esistenti ---
-        now = datetime.now().isoformat()
-        movimenti = []
-        for r in rows:
-            movimenti.append({
-                "produzione_id": r["id"],
-                "sku": r.get("sku"),
-                "ean": r.get("ean"),
-                "start_delivery": r.get("start_delivery"),
-                "stato_vecchio": r.get("stato_produzione"),
-                "stato_nuovo": None,
-                "qty_vecchia": r.get("da_produrre"),
-                "qty_nuova": None,
-                "plus_vecchio": r.get("plus"),
-                "plus_nuovo": None,
-                "utente": "operatore",
-                "motivo": "Eliminazione manuale",
-                "dettaglio": None,
-                "created_at": now
-            })
-        if movimenti:
-            supabase.table("movimenti_produzione_vendor").insert(movimenti).execute()
-
-        # --- DELETE SOLO sugli ID esistenti ---
+        # Elimina PRIMA tutti i movimenti collegati
         BATCH_SIZE = 100
         for i in range(0, len(ids), BATCH_SIZE):
-            batch_ids = [id_ for id_ in ids[i:i+BATCH_SIZE] if id_ in ids_esistenti]
-            if batch_ids:
-                supabase.table("produzione_vendor").delete().in_("id", batch_ids).execute()
-                time.sleep(0.1)  # Pausa per evitare saturazione
+            batch_ids = ids[i:i+BATCH_SIZE]
+            supabase.table("movimenti_produzione_vendor").delete().in_("produzione_id", batch_ids).execute()
+            time.sleep(0.05)  # micro pausa, opzionale
+
+        # Poi elimina le righe di produzione_vendor
+        for i in range(0, len(ids), BATCH_SIZE):
+            batch_ids = ids[i:i+BATCH_SIZE]
+            supabase.table("produzione_vendor").delete().in_("id", batch_ids).execute()
+            time.sleep(0.05)
 
         return jsonify({
             "ok": True,
-            "deleted_count": len(ids_esistenti),
-            "movimenti_loggati": len(movimenti)
+            "deleted_count": len(ids)
         })
     except Exception as ex:
         logging.exception("[delete_produzione_bulk] Errore DELETE bulk produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
 
 
 

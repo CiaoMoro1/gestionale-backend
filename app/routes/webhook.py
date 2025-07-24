@@ -5,11 +5,30 @@ import hmac
 import base64
 import hashlib
 import logging
+import time
+import httpx
 from app.supabase_client import supabase
 from app.services.supabase_write import upsert_variant
 from app.routes.bulk_sync import normalize_gid
 
 webhook = Blueprint("webhook", __name__)
+
+# ------------------------------------------------------------------
+# Utility: Retry per errori di rete Supabase
+# ------------------------------------------------------------------
+
+def safe_execute(builder, retries=3, sleep=0.7):
+    """Esegue una query Supabase con retry su errori di rete temporanei."""
+    for attempt in range(retries):
+        try:
+            return builder.execute()
+        except httpx.RemoteProtocolError as ex:
+            if attempt < retries - 1:
+                logging.warning("Retry Supabase (tentativo %s/%s): %s", attempt+1, retries, ex)
+                time.sleep(sleep)
+            else:
+                logging.error("Errore Supabase non recuperabile: %s", ex, exc_info=True)
+                raise
 
 def verify_webhook(data: bytes, hmac_header: str | None) -> bool:
     """Validate the HMAC signature sent by Shopify."""
@@ -38,6 +57,7 @@ def handle_product_update():
     image_url = (payload.get("image") or {}).get("src", "")
     user_id = os.environ.get("DEFAULT_USER_ID", "admin-sync")
 
+    imported = 0
     for variant in variants:
         record = {
             "shopify_product_id": normalize_gid(product_id),
@@ -52,10 +72,13 @@ def handle_product_update():
             "status": payload.get("status", ""),
             "user_id": user_id,
         }
-        upsert_variant(record)
-
+        try:
+            upsert_variant(record)
+            imported += 1
+        except Exception as ex:
+            logging.error("❌ Exception in upsert_variant for SKU %s: %s", record.get("sku"), ex, exc_info=True)
     logging.info("✅ Prodotto aggiornato: %s (%s)", product_title, product_id)
-    return jsonify({"status": "success", "imported": len(variants)}), 200
+    return jsonify({"status": "success", "imported": imported}), 200
 
 @webhook.route("/webhook/product-delete", methods=["POST"])
 def handle_product_delete():
@@ -67,11 +90,10 @@ def handle_product_delete():
     payload = json.loads(raw_body)
     shopify_product_id = normalize_gid(payload.get("id"))
 
-    response = (
+    response = safe_execute(
         supabase.table("products")
         .delete()
         .eq("shopify_product_id", shopify_product_id)
-        .execute()
     )
 
     logging.info("🗑️ Prodotto eliminato: %s — %s", shopify_product_id, response)
@@ -89,7 +111,7 @@ COD_KEYWORDS = [
 ]
 
 def _payment_label(financial_status: str, has_cod_fee: bool) -> str:
-    status = financial_status.upper()
+    status = (financial_status or "").upper()
     if status == "PAID":
         return "pagato"
     if status == "PENDING" and has_cod_fee:
@@ -129,11 +151,10 @@ def handle_order_create():
         logging.warning("⚠️ Ordine skippato: già evaso.")
         return jsonify({"status": "skipped", "reason": "already fulfilled"}), 200
 
-    exists = (
+    exists = safe_execute(
         supabase.table("orders")
         .select("id")
         .eq("shopify_order_id", shopify_order_id)
-        .execute()
     )
     if exists.data:
         logging.info("⛔ Ordine già presente: %s", shopify_order_id)
@@ -146,7 +167,6 @@ def handle_order_create():
 
     customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or "Ospite"
     customer_email = customer.get("email")
-    # Priorità: prima shipping_address.phone, poi customer.phone
     customer_phone = shipping.get("phone") or customer.get("phone") or None
 
     shipping_address = shipping.get("address1")
@@ -155,7 +175,7 @@ def handle_order_create():
     shipping_province = shipping.get("province")
     shipping_country = shipping.get("country")
 
-    order_resp = (
+    order_resp = safe_execute(
         supabase.table("orders")
         .insert(
             {
@@ -177,7 +197,6 @@ def handle_order_create():
                 "user_id": user_id,
             }
         )
-        .execute()
     )
 
     order_id = order_resp.data[0]["id"]
@@ -185,7 +204,6 @@ def handle_order_create():
     for item in line_items:
         quantity = item.get("quantity", 1)
         if quantity == 0:
-            logging.warning("⚠️ Skip articolo '%s' con quantità 0", item.get("title"))
             continue
 
         variant_id_raw = item.get("variant_id")
@@ -195,33 +213,36 @@ def handle_order_create():
         product_id = None
 
         if variant_id_raw:
-            product = (
+            product = safe_execute(
                 supabase.table("products")
                 .select("id")
                 .eq("shopify_variant_id", shopify_variant_id)
-                .execute()
             )
             if product.data:
                 product_id = product.data[0]["id"]
 
-        supabase.table("order_items").insert(
-            {
-                "order_id": order_id,
-                "shopify_variant_id": shopify_variant_id,
-                "product_id": product_id,
-                "sku": sku,
-                "quantity": quantity,
-                "price": price,
-            }
-        ).execute()
+        safe_execute(
+            supabase.table("order_items").insert(
+                {
+                    "order_id": order_id,
+                    "shopify_variant_id": shopify_variant_id,
+                    "product_id": product_id,
+                    "sku": sku,
+                    "quantity": quantity,
+                    "price": price,
+                }
+            )
+        )
 
         if product_id:
-            supabase.rpc(
-                "adjust_inventory_after_fulfillment",
-                {"pid": product_id, "delta": quantity},
-            ).execute()
+            safe_execute(
+                supabase.rpc(
+                    "adjust_inventory_after_fulfillment",
+                    {"pid": product_id, "delta": quantity},
+                )
+            )
 
-    supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+    safe_execute(supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}))
 
     logging.info("🛒 Nuovo ordine importato: %s", shopify_order_id)
     return jsonify({"status": "order created", "order_id": order_id}), 200
@@ -237,15 +258,14 @@ def handle_order_update():
     raw_id = payload.get("id")
     if not raw_id:
         logging.error("❌ Webhook ricevuto senza ID ordine valido.")
-        return jsonify({"status": "skipped", "reason": "missing ID"}), 400
+        return jsonify({"status": "skipped", "reason": "missing ID"}), 200
 
     shopify_order_id = int(normalize_gid(raw_id))
-    order_resp = (
+    order_resp = safe_execute(
         supabase.table("orders")
         .select("id")
         .eq("shopify_order_id", shopify_order_id)
         .limit(1)
-        .execute()
     )
 
     if not order_resp.data:
@@ -259,7 +279,6 @@ def handle_order_update():
 
     customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or "Ospite"
     customer_email = customer.get("email")
-    # Priorità: prima shipping_address.phone, poi customer.phone
     customer_phone = shipping.get("phone") or customer.get("phone") or None
 
     shipping_address = shipping.get("address1")
@@ -268,11 +287,10 @@ def handle_order_update():
     shipping_province = shipping.get("province")
     shipping_country = shipping.get("country")
 
-    # ------------------------------------------------------------------
     # Reset & re‑insert items
-    # ------------------------------------------------------------------
-
-    supabase.table("order_items").delete().eq("order_id", order_id).execute()
+    safe_execute(
+        supabase.table("order_items").delete().eq("order_id", order_id)
+    )
 
     total_price = float(payload.get("total_price", 0))
 
@@ -288,51 +306,56 @@ def handle_order_update():
         product_id = None
 
         if variant_id_raw:
-            product = (
+            product = safe_execute(
                 supabase.table("products")
                 .select("id")
                 .eq("shopify_variant_id", shopify_variant_id)
-                .execute()
             )
             if product.data:
                 product_id = product.data[0]["id"]
 
-        supabase.table("order_items").insert(
-            {
-                "order_id": order_id,
-                "shopify_variant_id": shopify_variant_id,
-                "product_id": product_id,
-                "sku": sku,
-                "quantity": quantity,
-                "price": price,
-            }
-        ).execute()
+        safe_execute(
+            supabase.table("order_items").insert(
+                {
+                    "order_id": order_id,
+                    "shopify_variant_id": shopify_variant_id,
+                    "product_id": product_id,
+                    "sku": sku,
+                    "quantity": quantity,
+                    "price": price,
+                }
+            )
+        )
 
         if product_id:
-            supabase.rpc(
-                "adjust_inventory_after_fulfillment",
-                {"pid": product_id, "delta": quantity},
-            ).execute()
+            safe_execute(
+                supabase.rpc(
+                    "adjust_inventory_after_fulfillment",
+                    {"pid": product_id, "delta": quantity},
+                )
+            )
 
     # Fulfillment state → if fully fulfilled, mark as so
     if payload.get("fulfillment_status") == "fulfilled":
-        supabase.rpc("evadi_ordine", {"ordine_id": order_id}).execute()
+        safe_execute(supabase.rpc("evadi_ordine", {"ordine_id": order_id}))
         logging.info("✅ Ordine %s evaso via webhook", shopify_order_id)
 
     # Riservato & aggiornamento ordine
-    supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}).execute()
+    safe_execute(supabase.rpc("repair_riservato_by_order", {"ordine_id": order_id}))
 
-    supabase.table("orders").update({
-        "customer_name": customer_name,
-        "customer_email": customer_email,
-        "customer_phone": customer_phone,
-        "shipping_address": shipping_address,
-        "shipping_city": shipping_city,
-        "shipping_zip": shipping_zip,
-        "shipping_province": shipping_province,
-        "shipping_country": shipping_country,
-        "total": total_price,
-    }).eq("id", order_id).execute()
+    safe_execute(
+        supabase.table("orders").update({
+            "customer_name": customer_name,
+            "customer_email": customer_email,
+            "customer_phone": customer_phone,
+            "shipping_address": shipping_address,
+            "shipping_city": shipping_city,
+            "shipping_zip": shipping_zip,
+            "shipping_province": shipping_province,
+            "shipping_country": shipping_country,
+            "total": total_price,
+        }).eq("id", order_id)
+    )
 
     logging.info("🔁 Ordine aggiornato correttamente: %s", shopify_order_id)
     return jsonify({"status": "updated", "order_id": order_id}), 200
@@ -348,12 +371,11 @@ def handle_order_cancel():
     shopify_order_id = int(normalize_gid(payload.get("id")))
 
     try:
-        order_resp = (
+        order_resp = safe_execute(
             supabase.table("orders")
             .select("id, fulfillment_status")
             .eq("shopify_order_id", shopify_order_id)
             .limit(1)
-            .execute()
         )
 
         if not order_resp.data:
@@ -368,11 +390,14 @@ def handle_order_cancel():
             logging.warning("⚠️ Ordine %s già annullato.", shopify_order_id)
             return jsonify({"status": "skipped", "reason": "già annullato"}), 200
 
-        supabase.table("orders").update({"fulfillment_status": "annullato"}).eq("id", order_id).execute()
+        safe_execute(
+            supabase.table("orders").update({"fulfillment_status": "annullato"}).eq("id", order_id)
+        )
 
         logging.info("🗑️ Ordine annullato: %s", shopify_order_id)
         return jsonify({"status": "cancelled", "order_id": order_id}), 200
 
     except Exception as exc:
-        logging.error("❌ Errore durante annullamento ordine %s: %s", shopify_order_id, exc)
-        return jsonify({"status": "error", "reason": str(exc)}), 500
+        logging.error("❌ Errore durante annullamento ordine %s: %s", shopify_order_id, exc, exc_info=True)
+        return jsonify({"status": "error", "reason": str(exc)}), 200  # 200 per Shopify
+
