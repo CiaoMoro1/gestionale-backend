@@ -900,18 +900,34 @@ def get_riepilogo_parziali():
 def get_items_by_po():
     try:
         po_list = request.args.get("po_list")
-        offset = int(request.args.get("offset", 0))
-        limit = int(request.args.get("limit", 200))
         if not po_list:
             return jsonify([])
-        pos = po_list.split(",")
-        items = supabase.table("ordini_vendor_items")\
-            .select("po_number,model_number,qty_ordered,qty_confirmed,cost")\
-            .in_("po_number", pos)\
-            .range(offset, offset+limit-1)\
-            .execute().data
-        return jsonify(items)
+        pos = [p.strip().upper() for p in po_list.split(",")]
+        offset = 0
+        limit = 200
+        all_items = []
+        seen = set()
+        while True:
+            items = supabase.table("ordini_vendor_items")\
+                .select("po_number,model_number,qty_ordered,qty_confirmed,cost")\
+                .in_("po_number", pos)\
+                .order("po_number")\
+                .order("model_number")\
+                .range(offset, offset + limit - 1)\
+                .execute().data
+            if not items:
+                break
+            for item in items:
+                key = (item["po_number"], item["model_number"])
+                if key not in seen:
+                    all_items.append(item)
+                    seen.add(key)
+            if len(items) < limit:
+                break
+            offset += limit
+        return jsonify(all_items)
     except Exception as ex:
+        import logging
         logging.exception("Errore in get_items_by_po")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
