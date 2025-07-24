@@ -906,12 +906,6 @@ def get_riepilogo_parziali():
         logging.exception("Errore in get_riepilogo_parziali")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
-MAX_BATCH = 30  # O anche 20 per essere sicuri
-
-def chunked(iterable, size):
-    for i in range(0, len(iterable), size):
-        yield iterable[i:i + size]
-
 @bp.route('/api/amazon/vendor/items', methods=['GET'])
 def get_items_by_po():
     try:
@@ -919,29 +913,28 @@ def get_items_by_po():
         if not po_list:
             return jsonify([])
         pos = [p.strip().upper() for p in po_list.split(",")]
+        offset = 0
+        limit = 200
         all_items = []
         seen = set()
-        for batch in chunked(pos, MAX_BATCH):
-            offset = 0
-            limit = 200
-            while True:
-                items = supabase.table("ordini_vendor_items")\
-                    .select("po_number,model_number,qty_ordered,qty_confirmed,cost")\
-                    .in_("po_number", batch)\
-                    .order("po_number")\
-                    .order("model_number")\
-                    .range(offset, offset + limit - 1)\
-                    .execute().data
-                if not items:
-                    break
-                for item in items:
-                    key = (item["po_number"], item["model_number"])
-                    if key not in seen:
-                        all_items.append(item)
-                        seen.add(key)
-                if len(items) < limit:
-                    break
-                offset += limit
+        while True:
+            items = supabase.table("ordini_vendor_items")\
+                .select("po_number,model_number,qty_ordered,qty_confirmed,cost")\
+                .in_("po_number", pos)\
+                .order("po_number")\
+                .order("model_number")\
+                .range(offset, offset + limit - 1)\
+                .execute().data
+            if not items:
+                break
+            for item in items:
+                key = (item["po_number"], item["model_number"])
+                if key not in seen:
+                    all_items.append(item)
+                    seen.add(key)
+            if len(items) < limit:
+                break
+            offset += limit
         return jsonify(all_items)
     except Exception as ex:
         import logging
