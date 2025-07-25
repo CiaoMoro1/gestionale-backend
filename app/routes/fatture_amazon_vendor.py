@@ -37,48 +37,62 @@ def crea_fattura_amazon_vendor():
 # 2. LISTA FATTURE (per tabella frontend)
 @bp.route('/api/fatture_amazon_vendor/list', methods=['GET'])
 def lista_fatture_amazon_vendor():
-    # Puoi aggiungere filtri tramite query params (es: centro, data, stato)
-    query = supabase.table("fatture_amazon_vendor").select("*")
-    centro = request.args.get("centro")
-    stato = request.args.get("stato")
-    if centro:
-        query = query.eq("centro", centro)
-    if stato:
-        query = query.eq("stato", stato)
-    res = query.order("data_fattura", desc=True).limit(100).execute()
-    return jsonify(res.data)
+    try:
+        query = supabase.table("fatture_amazon_vendor").select("*")
+        centro = request.args.get("centro")
+        stato = request.args.get("stato")
+        if centro:
+            query = query.eq("centro", centro)
+        if stato:
+            query = query.eq("stato", stato)
+        res = query.order("data_fattura", desc=True).limit(100).execute()
+        return jsonify(res.data)
+    except Exception as e:
+        # logga errore dettagliato su console/server
+        print(f"ERRORE su /api/fatture_amazon_vendor/list: {e}")
+        return jsonify({"error": "Errore nel recupero delle fatture", "details": str(e)}), 500
+
 
 # 3. DOWNLOAD FATTURA (link diretto o via Flask)
 @bp.route('/api/fatture_amazon_vendor/download/<int:fattura_id>', methods=['GET'])
 def download_fattura_amazon_vendor(fattura_id):
-    fattura = supabase.table("fatture_amazon_vendor").select("*").eq("id", fattura_id).single().execute().data
-    if not fattura:
-        return jsonify({"error": "Fattura non trovata"}), 404
-    xml_url = fattura.get("xml_url")
-    if not xml_url:
-        return jsonify({"error": "Fattura senza XML"}), 404
+    try:
+        fattura = supabase.table("fatture_amazon_vendor").select("*").eq("id", fattura_id).single().execute().data
+        if not fattura:
+            return jsonify({"error": "Fattura non trovata"}), 404
+        xml_url = fattura.get("xml_url")
+        if not xml_url:
+            return jsonify({"error": "Fattura senza XML"}), 404
 
-    # Serve il file XML come download:
-    bucket, *file_path_parts = xml_url.split('/', 1)
-    file_path = file_path_parts[0] if file_path_parts else ""
-    file_resp = supabase.storage.from_(bucket).download(file_path)
-    if not file_resp:
-        return jsonify({"error": "File non trovato"}), 404
+        # Serve il file XML come download:
+        bucket, *file_path_parts = xml_url.split('/', 1)
+        file_path = file_path_parts[0] if file_path_parts else ""
+        file_resp = supabase.storage.from_(bucket).download(file_path)
+        if not file_resp:
+            return jsonify({"error": "File non trovato"}), 404
 
-    import io
-    return send_file(
-        io.BytesIO(file_resp),
-        download_name=f"Fattura_{fattura['numero_fattura']}.xml",
-        as_attachment=True,
-        mimetype="application/xml"
-    )
+        import io
+        return send_file(
+            io.BytesIO(file_resp),
+            download_name=f"Fattura_{fattura['numero_fattura']}.xml",
+            as_attachment=True,
+            mimetype="application/xml"
+        )
+    except Exception as e:
+        print(f"ERRORE su /api/fatture_amazon_vendor/download: {e}")
+        return jsonify({"error": "Errore durante il download", "details": str(e)}), 500
 
 # 4. DETTAGLIO FATTURA (facoltativo, per anteprima o info)
 @bp.route('/api/fatture_amazon_vendor/<int:fattura_id>', methods=['GET'])
 def dettaglio_fattura_amazon_vendor(fattura_id):
-    fattura = supabase.table("fatture_amazon_vendor").select("*").eq("id", fattura_id).single().execute().data
-    if not fattura:
-        return jsonify({"error": "Fattura non trovata"}), 404
-    return jsonify(fattura)
+    try:
+        fattura = supabase.table("fatture_amazon_vendor").select("*").eq("id", fattura_id).single().execute().data
+        if not fattura:
+            return jsonify({"error": "Fattura non trovata"}), 404
+        return jsonify(fattura)
+    except Exception as e:
+        print(f"ERRORE su /api/fatture_amazon_vendor/{fattura_id}: {e}")
+        return jsonify({"error": "Errore nel recupero della fattura", "details": str(e)}), 500
+
 
 
