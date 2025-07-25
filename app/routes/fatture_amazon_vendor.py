@@ -58,13 +58,20 @@ def download_fattura_amazon_vendor(fattura_id):
     if not xml_url:
         return jsonify({"error": "Fattura senza XML"}), 404
 
-    # Se vuoi restituire direttamente il link al frontend (consigliato)
-    return jsonify({"download_url": xml_url})
+    # Serve il file XML come download:
+    bucket, *file_path_parts = xml_url.split('/', 1)
+    file_path = file_path_parts[0] if file_path_parts else ""
+    file_resp = supabase.storage.from_(bucket).download(file_path)
+    if not file_resp:
+        return jsonify({"error": "File non trovato"}), 404
 
-    # --- oppure, se vuoi servire il file come allegato tramite Flask ---
-    # bucket, file_path = xml_url.split("/", 1)
-    # file_resp = supabase.storage.from_(bucket).download(file_path)
-    # return send_file(io.BytesIO(file_resp), download_name=f"Fattura_{fattura['numero_fattura']}.xml", as_attachment=True, mimetype="application/xml")
+    import io
+    return send_file(
+        io.BytesIO(file_resp),
+        download_name=f"Fattura_{fattura['numero_fattura']}.xml",
+        as_attachment=True,
+        mimetype="application/xml"
+    )
 
 # 4. DETTAGLIO FATTURA (facoltativo, per anteprima o info)
 @bp.route('/api/fatture_amazon_vendor/<int:fattura_id>', methods=['GET'])

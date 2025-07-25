@@ -267,7 +267,7 @@ def cavallotto_html():
         }};
       </script>
     </head>
-    <body>get_items_by_po
+    <body>
       <button class="print-btn no-print" onclick="window.print()">🖨️ Stampa</button>
       {cavallotti_html}
     </body>

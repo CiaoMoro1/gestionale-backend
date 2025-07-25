@@ -218,6 +218,9 @@ def process_genera_fattura_amazon_vendor_job(job):
         imponibile = sum(float(a.get("cost", 0)) * int(a.get("qty_confirmed", a.get("qty_ordered", 0))) for a in articoli)
         iva = round(imponibile * 0.22, 2)
         totale = round(imponibile + iva, 2)
+        
+        articoli_ordinati = sum(int(a.get("qty_ordered", 0)) for a in articoli)
+        articoli_confermati = sum(int(a.get("qty_confirmed", 0)) for a in articoli)
 
         # 3. Genera il numero fattura e la data fattura
         data_fattura = datetime.now(timezone.utc).date().isoformat()
@@ -256,6 +259,9 @@ def process_genera_fattura_amazon_vendor_job(job):
             "start_delivery": start_delivery,
             "po_list": po_list,
             "totale_fattura": totale,
+            "imponibile": imponibile,
+            "articoli_ordinati": articoli_ordinati,
+            "articoli_confermati": articoli_confermati,
             "xml_url": xml_url,
             "stato": "pronta",
             "job_id": job["id"],
