@@ -486,6 +486,7 @@ def generate_sdi_xml(dati):
 
 
 def main_loop():
+    print("WORKER AVVIATO - SONO IL VERO WORKER!")  # <-- stampa subito all'avvio
     while True:
         jobs = supabase.table("jobs").select("*").eq("status", "pending").execute().data
         if not jobs:
