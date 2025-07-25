@@ -268,6 +268,12 @@ def process_genera_fattura_amazon_vendor_job(job):
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
 
+        supabase.table("ordini_vendor_riepilogo") \
+            .update({"fatturato": True}) \
+            .eq("fulfillment_center", centro) \
+            .eq("start_delivery", start_delivery) \
+            .execute()
+
         # 7. Aggiorna job come DONE
         supabase.table("jobs").update({
             "status": "done",
