@@ -623,6 +623,7 @@ def save_parziali_wip():
         logging.exception("[save_parziali_wip] Errore salvataggio parziali wip")
         return jsonify({"error": f"Errore salvataggio: {str(ex)}"}), 500
 
+
 @bp.route('/api/amazon/vendor/parziali-wip/conferma-parziale', methods=['POST'])
 def conferma_parziale():
     max_retries = 3
@@ -632,6 +633,7 @@ def conferma_parziale():
         if not center or not start_delivery:
             return jsonify({"error": "center/data richiesti"}), 400
 
+        # 1. Trova riepilogo
         for attempt in range(max_retries):
             try:
                 riepilogo = supabase.table("ordini_vendor_riepilogo") \
@@ -642,6 +644,17 @@ def conferma_parziale():
                 if not riepilogo:
                     return jsonify({"error": "riepilogo non trovato"}), 400
                 riepilogo_id = riepilogo[0]["id"]
+                break
+            except Exception as ex:
+                logging.warning(f"[conferma_parziale] Errore riepilogo tentativo {attempt+1}/{max_retries}: {ex}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+
+        # 2. Trova il parziale da confermare
+        for attempt in range(max_retries):
+            try:
                 parziale = supabase.table("ordini_vendor_parziali") \
                     .select("*") \
                     .eq("riepilogo_id", riepilogo_id) \
@@ -652,25 +665,60 @@ def conferma_parziale():
                 if not parziale:
                     return jsonify({"error": "nessun parziale da confermare"}), 400
                 num_parz = parziale[0]["numero_parziale"]
+                break
+            except Exception as ex:
+                logging.warning(f"[conferma_parziale] Errore parziale tentativo {attempt+1}/{max_retries}: {ex}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+
+        # 3. Update parziale (confermato = True)
+        for attempt in range(max_retries):
+            try:
                 supabase.table("ordini_vendor_parziali") \
                     .update({"confermato": True}) \
                     .eq("riepilogo_id", riepilogo_id) \
                     .eq("numero_parziale", num_parz) \
                     .execute()
-                supabase.table("ordini_vendor_riepilogo") \
-                    .update({"stato_ordine": "parziale"}) \
-                    .eq("id", riepilogo_id) \
-                    .execute()
-                return jsonify({"ok": True})
+                break
             except Exception as ex:
-                logging.warning(f"[conferma_parziale] Errore tentativo {attempt+1}/{max_retries}: {ex}")
+                logging.warning(f"[conferma_parziale] Errore update parziale tentativo {attempt+1}/{max_retries}: {ex}")
                 if attempt < max_retries - 1:
                     time.sleep(1)
                 else:
                     raise
+
+        # 4. Update stato_ordine ("parziale")
+        for attempt in range(max_retries):
+            try:
+                supabase.table("ordini_vendor_riepilogo") \
+                    .update({"stato_ordine": "parziale"}) \
+                    .eq("id", riepilogo_id) \
+                    .execute()
+                break
+            except Exception as ex:
+                logging.warning(f"[conferma_parziale] Errore update stato_ordine tentativo {attempt+1}/{max_retries}: {ex}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+
+        # 5. Consistency check (controlla che lo stato sia veramente "parziale")
+        check_riepilogo = supabase.table("ordini_vendor_riepilogo") \
+            .select("stato_ordine") \
+            .eq("id", riepilogo_id) \
+            .single().execute().data
+        if not check_riepilogo or check_riepilogo.get("stato_ordine") != "parziale":
+            logging.error(f"[conferma_parziale] Stato ordine NON aggiornato a 'parziale' dopo 3 tentativi!")
+            return jsonify({"error": "Stato ordine non aggiornato, riprova o segnala errore a supporto."}), 500
+
+        return jsonify({"ok": True})
+
     except Exception as ex:
         logging.exception("Errore conferma parziale")
         return jsonify({"error": f"Errore conferma: {str(ex)}"}), 500
+
 
 
 @bp.route('/api/amazon/vendor/parziali-wip/conferma', methods=['POST'])

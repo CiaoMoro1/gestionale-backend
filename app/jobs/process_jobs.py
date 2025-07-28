@@ -343,7 +343,7 @@ def generate_sdi_xml(dati):
 
     causale = f"Ordine Amazon centro {centro} - Data consegna {start_delivery}. Basato su PO: {', '.join(po_list)}."
 
-    # ==== RIGHE XML (SKU + ASIN) ====
+    # ==== RIGHE XML (SKU + ASIN, descrizione sempre valorizzata) ====
     dettaglio_linee = ""
     for idx, a in enumerate(articoli, 1):
         qty = float(a.get("qty_confirmed") or a.get("qty_ordered") or 0)
@@ -351,6 +351,7 @@ def generate_sdi_xml(dati):
         totale_riga = "{:.2f}".format(cost * qty)
         sku = a.get("model_number", "")
         asin = a.get("asin", "")
+        descrizione = a['title'] if a.get('title') and str(a['title']).lower() != "none" else f"Articolo {sku}"
         dettaglio_linee += f"""
         <DettaglioLinee>
           <NumeroLinea>{idx}</NumeroLinea>
@@ -362,7 +363,7 @@ def generate_sdi_xml(dati):
             <CodiceTipo>ASIN</CodiceTipo>
             <CodiceValore>{asin}</CodiceValore>
           </CodiceArticolo>''' if asin else ""}
-          <Descrizione>{a.get('title', 'Articolo')}</Descrizione>
+          <Descrizione>{descrizione}</Descrizione>
           <Quantita>{qty:.2f}</Quantita>
           <PrezzoUnitario>{cost:.6f}</PrezzoUnitario>
           <PrezzoTotale>{totale_riga}</PrezzoTotale>
@@ -389,7 +390,7 @@ def generate_sdi_xml(dati):
         <IdPaese>IT</IdPaese>
         <IdCodice>{fornitore['piva']}</IdCodice>
       </IdTrasmittente>
-      <ProgressivoInvio>1</ProgressivoInvio>
+      <ProgressivoInvio>{numero_fattura}</ProgressivoInvio>
       <FormatoTrasmissione>FPR12</FormatoTrasmissione>
       <CodiceDestinatario>{intestatario['codice_destinatario']}</CodiceDestinatario>
       <PECDestinatario>{intestatario['pec']}</PECDestinatario>
@@ -472,6 +473,7 @@ def generate_sdi_xml(dati):
 """.replace("    ", " ").replace("  ", " ").strip()
 
     return xml
+
 
 
 
