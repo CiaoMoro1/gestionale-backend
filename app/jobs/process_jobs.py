@@ -312,7 +312,7 @@ def generate_sdi_xml(dati):
     iva = "{:.2f}".format(dati["iva"])
     totale = "{:.2f}".format(dati["totale"])
 
-    # ==== HEADER E DATI FISSI AMAZON ====
+    # ==== DATI AMAZON (fissi) ====
     intestatario = {
         "denominazione": "AMAZON EU SARL, SUCCURSALE ITALIANA",
         "indirizzo": "VIALE MONTE GRAPPA",
@@ -326,54 +326,42 @@ def generate_sdi_xml(dati):
         "pec": "amazoneu@legalmail.it"
     }
 
-    # ==== INTESTATARIO FORNITORE: ADATTA QUI SE SERVE ====
+    # ==== I TUOI DATI (REALISTICI E CONFORMI SDI) ====
     fornitore = {
-        "denominazione": "TUO_NOME_AZIENDA",   # <-- Modifica con la tua ragione sociale
-        "piva": "ITXXXXXXXXXXX",               # <-- Modifica con la tua P.IVA
-        "codice_fiscale": "XXXXXXXXXXX",       # <-- Modifica se serve
-        "indirizzo": "Tuo Indirizzo",
-        "cap": "00000",
-        "comune": "Tua Citta",
-        "provincia": "XX",
+        "denominazione": "CYBORG",
+        "piva": "09780071214",
+        "codice_fiscale": "09780071214",
+        "indirizzo": "Via G. D' Annunzio 58",
+        "cap": "80053",
+        "comune": "Castellammare di Stabia",
+        "provincia": "NA",
         "nazione": "IT",
-        "regime_fiscale": "RF01"
+        "regime_fiscale": "RF01",
+        "cod_eori": "IT09780071214",
+        "riferimento_amministrazione": "7401713799"
     }
 
-    # ==== CAUSALE ====
     causale = f"Ordine Amazon centro {centro} - Data consegna {start_delivery}. Basato su PO: {', '.join(po_list)}."
 
-    # ==== RIGHE XML ====
+    # ==== RIGHE XML (SKU + ASIN) ====
     dettaglio_linee = ""
     for idx, a in enumerate(articoli, 1):
-        qty = int(a.get("qty_confirmed") or a.get("qty_ordered") or 0)
+        qty = float(a.get("qty_confirmed") or a.get("qty_ordered") or 0)
         cost = float(a.get("cost", 0))
         totale_riga = "{:.2f}".format(cost * qty)
-        codici_articolo = []
-        if a.get("vendor_product_id"):
-            codici_articolo.append(f"""
-            <CodiceArticolo>
-              <CodiceTipo>EAN</CodiceTipo>
-              <CodiceValore>{a['vendor_product_id']}</CodiceValore>
-            </CodiceArticolo>
-            """)
-        if a.get("asin"):
-            codici_articolo.append(f"""
-            <CodiceArticolo>
-              <CodiceTipo>ASIN</CodiceTipo>
-              <CodiceValore>{a['asin']}</CodiceValore>
-            </CodiceArticolo>
-            """)
-        if a.get("model_number"):
-            codici_articolo.append(f"""
-            <CodiceArticolo>
-              <CodiceTipo>SKU</CodiceTipo>
-              <CodiceValore>{a['model_number']}</CodiceValore>
-            </CodiceArticolo>
-            """)
+        sku = a.get("model_number", "")
+        asin = a.get("asin", "")
         dettaglio_linee += f"""
         <DettaglioLinee>
           <NumeroLinea>{idx}</NumeroLinea>
-          {''.join(codici_articolo)}
+          <CodiceArticolo>
+            <CodiceTipo>SKU</CodiceTipo>
+            <CodiceValore>{sku}</CodiceValore>
+          </CodiceArticolo>
+          {f'''<CodiceArticolo>
+            <CodiceTipo>ASIN</CodiceTipo>
+            <CodiceValore>{asin}</CodiceValore>
+          </CodiceArticolo>''' if asin else ""}
           <Descrizione>{a.get('title', 'Articolo')}</Descrizione>
           <Quantita>{qty:.2f}</Quantita>
           <PrezzoUnitario>{cost:.6f}</PrezzoUnitario>
@@ -394,12 +382,12 @@ def generate_sdi_xml(dati):
 
     # ==== XML FINALE ====
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<FatturaElettronica versione="FPR12" xmlns="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2">
+<FatturaElettronica xmlns="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2" versione="FPR12">
   <FatturaElettronicaHeader>
     <DatiTrasmissione>
       <IdTrasmittente>
         <IdPaese>IT</IdPaese>
-        <IdCodice>{fornitore['piva'].replace('IT','')}</IdCodice>
+        <IdCodice>{fornitore['piva']}</IdCodice>
       </IdTrasmittente>
       <ProgressivoInvio>1</ProgressivoInvio>
       <FormatoTrasmissione>FPR12</FormatoTrasmissione>
@@ -410,11 +398,12 @@ def generate_sdi_xml(dati):
       <DatiAnagrafici>
         <IdFiscaleIVA>
           <IdPaese>IT</IdPaese>
-          <IdCodice>{fornitore['piva'].replace('IT','')}</IdCodice>
+          <IdCodice>{fornitore['piva']}</IdCodice>
         </IdFiscaleIVA>
         <CodiceFiscale>{fornitore['codice_fiscale']}</CodiceFiscale>
         <Anagrafica>
           <Denominazione>{fornitore['denominazione']}</Denominazione>
+          <CodEORI>{fornitore['cod_eori']}</CodEORI>
         </Anagrafica>
         <RegimeFiscale>{fornitore['regime_fiscale']}</RegimeFiscale>
       </DatiAnagrafici>
@@ -425,6 +414,7 @@ def generate_sdi_xml(dati):
         <Provincia>{fornitore['provincia']}</Provincia>
         <Nazione>{fornitore['nazione']}</Nazione>
       </Sede>
+      <RiferimentoAmministrazione>{fornitore['riferimento_amministrazione']}</RiferimentoAmministrazione>
     </CedentePrestatore>
     <CessionarioCommittente>
       <DatiAnagrafici>
@@ -482,6 +472,8 @@ def generate_sdi_xml(dati):
 """.replace("    ", " ").replace("  ", " ").strip()
 
     return xml
+
+
 
 
 
