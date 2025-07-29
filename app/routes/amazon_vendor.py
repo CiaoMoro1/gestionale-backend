@@ -74,7 +74,6 @@ def sync_produzione_from_prelievo(prelievo_id):
     """
     Sincronizza produzione_vendor a partire dal prelievo, con retry e logging robusto.
     """
-    import logging
     max_retries = 3
 
     for attempt in range(max_retries):
@@ -192,7 +191,6 @@ def upload_vendor_orders():
         return jsonify({"job_id": job_id}), 201
 
     except Exception as e:
-        import logging
         logging.exception("Errore durante upload ordini vendor")
         return jsonify({"error": f"Errore upload: {e}"}), 500
 
@@ -257,8 +255,6 @@ def get_riepilogo_nuovi():
             logging.exception(f"[get_riepilogo_nuovi] Errore interno: {ex}")
             return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
 
-import httpx
-import logging
 
 @bp.route('/api/amazon/vendor/orders/dettaglio-destinazione', methods=['GET'])
 def dettaglio_destinazione():
@@ -303,8 +299,6 @@ def dettaglio_destinazione():
 
 
 
-import logging
-
 @bp.route('/api/amazon/vendor/riepilogo-id', methods=['GET'])
 def get_riepilogo_id():
     center = request.args.get("center")
@@ -326,7 +320,6 @@ def get_riepilogo_id():
         return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
 
 
-import logging
 
 @bp.route('/api/amazon/vendor/parziali', methods=['GET'])
 def get_parziali():
@@ -363,10 +356,6 @@ def get_parziali():
                 return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
 
-
-import logging
-import time
-from datetime import datetime
 
 @bp.route('/api/amazon/vendor/parziali', methods=['POST'])
 def save_parziale():
@@ -987,7 +976,6 @@ def get_items_by_po():
 
         return jsonify(items)
     except Exception as ex:
-        import logging
         logging.exception("Errore in get_items_by_po")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
@@ -1234,7 +1222,6 @@ def export_lista_prelievo_nuovi_pdf():
     
     
     # TEEESTTTTTTTTTT
-import logging
 
 @bp.route('/api/amazon/vendor/asn/test', methods=['POST'])
 def test_asn_submit():
@@ -1467,7 +1454,6 @@ def riepilogo_dashboard_parziali():
         except Exception as ex:
             import httpx
             import time
-            import logging
             if isinstance(ex, httpx.RemoteProtocolError):
                 logging.warning(f"[riepilogo_dashboard_parziali] Connessione interrotta verso Supabase (tentativo {attempt+1}/{max_retries})")
                 if attempt < max_retries - 1:
@@ -1708,7 +1694,6 @@ def date_importabili_prelievo():
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
 # --- IMPORTA PRELIEVI ---
-import logging
 
 @bp.route('/api/prelievi/importa', methods=['POST'])
 def importa_prelievi():

@@ -385,7 +385,6 @@ def generate_sdi_xml(dati):
 
     # ==== XML FINALE ====
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<?xml version="1.0" encoding="utf-8"?>
 <p:FatturaElettronica
   xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
   xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2"
