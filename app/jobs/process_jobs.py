@@ -346,7 +346,9 @@ def generate_sdi_xml(dati):
     # ==== RIGHE XML (SKU + ASIN, descrizione sempre valorizzata) ====
     dettaglio_linee = ""
     for idx, a in enumerate(articoli, 1):
-        qty = float(a.get("qty_confirmed") or a.get("qty_ordered") or 0)
+        qty = float(a.get("qty_confirmed") or 0)
+        if qty == 0:
+            continue  # Salta righe non confermate
         cost = float(a.get("cost", 0))
         totale_riga = "{:.2f}".format(cost * qty)
         sku = a.get("model_number", "")
