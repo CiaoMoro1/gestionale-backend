@@ -385,7 +385,13 @@ def generate_sdi_xml(dati):
 
     # ==== XML FINALE ====
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<FatturaElettronica xmlns="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2" versione="FPR12">
+<?xml version="1.0" encoding="utf-8"?>
+<p:FatturaElettronica
+  xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+  xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  versione="FPR12"
+  xsi:schemaLocation="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 fatturaordinaria_v1.2.xsd ">
   <FatturaElettronicaHeader>
     <DatiTrasmissione>
       <IdTrasmittente>
@@ -471,7 +477,7 @@ def generate_sdi_xml(dati):
       </DettaglioPagamento>
     </DatiPagamento>
   </FatturaElettronicaBody>
-</FatturaElettronica>
+</p:FatturaElettronica>
 """.replace("    ", " ").replace("  ", " ").strip()
 
     return xml
