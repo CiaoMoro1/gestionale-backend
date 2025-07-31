@@ -523,9 +523,8 @@ def process_genera_notecredito_amazon_reso_job(job):
 
         def to_float(val):
             try:
-                val = str(val).replace(",", ".")
-                return float(val)
-            except:
+                return float(str(val).replace(",", ".").strip())
+            except Exception:
                 return 0.0
 
         grouped = df.groupby(['ID richiesta spedizione', 'Ordine d’acquisto'])
@@ -538,13 +537,18 @@ def process_genera_notecredito_amazon_reso_job(job):
             for idx, r in righe.iterrows():
                 qty = to_float(r.get("Quantità", 1))
                 price = to_float(r.get("Costo unitario", 0))
-                total_row = to_float(r.get("Importo totale", qty * price))
+                # "Importo totale" può essere vuoto: fallback qty*price
+                raw_total = r.get("Importo totale", None)
+                if raw_total is None or str(raw_total).strip() == "" or str(raw_total).lower() == "nan":
+                    total_row = qty * price
+                else:
+                    total_row = to_float(raw_total)
                 imponibile += total_row
                 dettagli_xml.append({
                     "NumeroLinea": idx+1,
                     "ASIN": str(r.get("ASIN", "")),
                     "EAN": str(r.get("EAN", "")),
-                    "Descrizione": str(r.get("Prodotto", "")),
+                    "Descrizione": str(r.get("UPC", "")),       # <-- questa è la descrizione giusta!
                     "Quantita": qty,
                     "PrezzoUnitario": price,
                     "PrezzoTotale": total_row,
