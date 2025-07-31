@@ -9,6 +9,11 @@ from supabase import create_client
 from dotenv import load_dotenv
 import html
 
+
+print("IMPORT OK", flush=True)
+
+
+
 load_dotenv()
 
 def fix_date(val):
@@ -758,6 +763,7 @@ def main_loop():
     print("WORKER AVVIATO - SONO IL VERO WORKER!")
     while True:
         jobs = supabase.table("jobs").select("*").eq("status", "pending").execute().data
+        print(f"[worker] Trovati {len(jobs)} job pending", flush=True)
         if not jobs:
             time.sleep(5)
             continue
@@ -771,3 +777,6 @@ def main_loop():
                 process_genera_notecredito_amazon_reso_job(job)     # <--- E QUESTA!
         time.sleep(1)
 
+if __name__ == "__main__":
+    print("CHIAMO main_loop()", flush=True)
+    main_loop()
