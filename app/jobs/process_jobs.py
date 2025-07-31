@@ -519,6 +519,8 @@ def process_genera_notecredito_amazon_reso_job(job):
 
         # Leggi CSV (Return_Items di Amazon Vendor)
         df = pd.read_csv(io.BytesIO(csv_bytes), sep=",", encoding="utf-8-sig")
+        print("Colonne lette dal CSV:", df.columns.tolist(), flush=True)
+        print(df.head(2).to_string(), flush=True)
         df.columns = [c.strip() for c in df.columns]
 
         def to_float(val):
