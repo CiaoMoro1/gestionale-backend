@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from supabase import create_client
 from dotenv import load_dotenv
+import html
+
 load_dotenv()
 
 def fix_date(val):
@@ -296,6 +298,8 @@ def process_genera_fattura_amazon_vendor_job(job):
         }).eq("id", job["id"]).execute()
 
 
+import html
+
 def generate_sdi_xml(dati):
     """
     Genera una stringa XML SDI pronta da inviare, secondo i dati di input.
@@ -341,9 +345,9 @@ def generate_sdi_xml(dati):
         "riferimento_amministrazione": "7401713799"
     }
 
-    causale = f"Ordine Amazon centro {centro} - Data consegna {start_delivery}. Basato su PO: {', '.join(po_list)}."
+    causale = "VRET"
 
-    # ==== RIGHE XML (SKU + ASIN, descrizione sempre valorizzata) ====
+    # ==== RIGHE XML (SKU + ASIN, descrizione sempre valorizzata e escapata) ====
     dettaglio_linee = ""
     for idx, a in enumerate(articoli, 1):
         qty = float(a.get("qty_confirmed") or 0)
@@ -353,7 +357,8 @@ def generate_sdi_xml(dati):
         totale_riga = "{:.2f}".format(cost * qty)
         sku = a.get("model_number", "")
         asin = a.get("asin", "")
-        descrizione = a['title'] if a.get('title') and str(a['title']).lower() != "none" else f"Articolo {sku}"
+        raw_descrizione = a['title'] if a.get('title') and str(a['title']).lower() != "none" else f"Articolo {sku}"
+        descrizione = html.escape(raw_descrizione, quote=True)  # <-- escapato!
         dettaglio_linee += f"""
         <DettaglioLinee>
           <NumeroLinea>{idx}</NumeroLinea>
@@ -486,8 +491,271 @@ def generate_sdi_xml(dati):
 
 
 
+def genera_numero_nota_credito(supabase) -> str:
+    resp = supabase.rpc("genera_numero_nota_credito").execute()
+    if hasattr(resp, "data"):
+        return str(resp.data)
+    raise Exception("Errore generazione numero nota credito")
+
+def process_genera_notecredito_amazon_reso_job(job):
+    try:
+        supabase.table("jobs").update({
+            "status": "in_progress",
+            "started_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job["id"]).execute()
+
+        storage_path = job["payload"]["storage_path"]
+        bucket, filename = storage_path.split("/", 1)
+        print(f"[worker] Scarico file {storage_path} da storage...")
+        file_resp = supabase.storage.from_(bucket).download(filename)
+        if hasattr(file_resp, 'error') and file_resp.error:
+            raise Exception(f"Errore download da storage: {file_resp.error}")
+        csv_bytes = file_resp
+
+        # Leggi CSV (Return_Items di Amazon Vendor)
+        df = pd.read_csv(io.BytesIO(csv_bytes))
+        df.columns = [c.strip() for c in df.columns]
+
+        def to_float(val):
+            try:
+                val = str(val).replace(",", ".")
+                return float(val)
+            except:
+                return 0.0
+
+        grouped = df.groupby(['ID richiesta spedizione', 'Ordine d’acquisto'])
+
+        risultati = []
+        for (vret, po), righe in grouped:
+            righe = righe.reset_index(drop=True)
+            imponibile = 0.0
+            dettagli_xml = []
+            for idx, r in righe.iterrows():
+                qty = to_float(r.get("Quantità", 1))
+                price = to_float(r.get("Costo unitario", 0))
+                total_row = to_float(r.get("Importo totale", qty * price))
+                imponibile += total_row
+                dettagli_xml.append({
+                    "NumeroLinea": idx+1,
+                    "ASIN": str(r.get("ASIN", "")),
+                    "EAN": str(r.get("EAN", "")),
+                    "Descrizione": str(r.get("Prodotto", "")) if r.get("Prodotto") else str(r.get("UPC", "")),
+                    "Quantita": qty,
+                    "PrezzoUnitario": price,
+                    "PrezzoTotale": total_row,
+                    "AliquotaIVA": 22.00,
+                    "VRET": vret
+                })
+            iva = round(imponibile * 0.22, 2)
+            totale = round(imponibile + iva, 2)
+            oggi = datetime.now(timezone.utc).date().isoformat()
+            numero_nota = genera_numero_nota_credito(supabase)
+
+
+            dati_xml = {
+                "data_nota": oggi,
+                "numero_nota": numero_nota,
+                "po": po,
+                "vret": vret,
+                "dettagli": dettagli_xml,
+                "imponibile": imponibile,
+                "iva": iva,
+                "totale": totale
+            }
+
+            # --- GENERA XML NOTA DI CREDITO ---
+            xml_str = generate_sdi_notecredito_xml(dati_xml)
+
+            # Salva XML su Supabase Storage
+            xml_filename = f"xml/{numero_nota}_{vret}.xml"
+            xml_bucket = "notecredito"
+            upload_resp = supabase.storage.from_(xml_bucket).upload(xml_filename, xml_str.encode("utf-8"), {"content-type": "application/xml"})
+            if hasattr(upload_resp, 'error') and upload_resp.error:
+                raise Exception(f"Errore upload XML: {upload_resp.error}")
+            xml_url = f"{xml_bucket}/{xml_filename}"
+
+            # Inserisci record in tabella notecredito_amazon_reso
+            nota_insert = {
+                "data_nota": oggi,
+                "numero_nota": numero_nota,
+                "po": po,
+                "vret": vret,
+                "xml_url": xml_url,
+                "imponibile": round(imponibile, 2),
+                "iva": iva,
+                "totale": totale,
+                "stato": "pronta",
+                "job_id": job["id"],
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            supabase.table("notecredito_amazon_reso").insert(nota_insert).execute()
+            risultati.append(nota_insert)
+
+        # Aggiorna job come DONE
+        supabase.table("jobs").update({
+            "status": "done",
+            "result": {
+                "note_generate": len(risultati),
+                "note": risultati
+            },
+            "finished_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job["id"]).execute()
+        print(f"[worker] Note di credito generate: {len(risultati)}")
+
+    except Exception as e:
+        print("[worker] ERRORE nota credito!", e)
+        supabase.table("jobs").update({
+            "status": "failed",
+            "error": str(e),
+            "stacktrace": traceback.format_exc(),
+            "finished_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job["id"]).execute()
+
+
+def generate_sdi_notecredito_xml(dati):
+    # Dati statici intestazione/fornitore/Amazon (modifica con i tuoi dati)
+    intestatario = {
+        "denominazione": "AMAZON EU SARL, SUCCURSALE ITALIANA",
+        "indirizzo": "VIALE MONTE GRAPPA",
+        "numero_civico": "3/5",
+        "cap": "20124",
+        "comune": "MILANO",
+        "provincia": "MI",
+        "nazione": "IT",
+        "piva": "08973230967",
+        "codice_destinatario": "XR6XN0E",
+        "pec": "amazoneu@legalmail.it"
+    }
+    fornitore = {
+        "denominazione": "CYBORG",
+        "piva": "09780071214",
+        "codice_fiscale": "09780071214",
+        "indirizzo": "Via G. D' Annunzio 58",
+        "cap": "80053",
+        "comune": "Castellammare di Stabia",
+        "provincia": "NA",
+        "nazione": "IT",
+        "regime_fiscale": "RF01",
+        "cod_eori": "IT09780071214",
+        "riferimento_amministrazione": "7401713799"
+    }
+
+    dettaglio_linee = ""
+    for r in dati["dettagli"]:
+        dettaglio_linee += f"""
+        <DettaglioLinee>
+          <NumeroLinea>{r['NumeroLinea']}</NumeroLinea>
+          <CodiceArticolo>
+            <CodiceTipo>ASIN</CodiceTipo>
+            <CodiceValore>{html.escape(r['ASIN'], quote=True)}</CodiceValore>
+          </CodiceArticolo>
+          {f'''<CodiceArticolo>
+            <CodiceTipo>EAN</CodiceTipo>
+            <CodiceValore>{html.escape(r['EAN'], quote=True)}</CodiceValore>
+          </CodiceArticolo>''' if r.get("EAN") else ""}
+          <Descrizione>{html.escape(r['Descrizione'], quote=True)}</Descrizione>
+          <Quantita>{r['Quantita']}</Quantita>
+          <PrezzoUnitario>{r['PrezzoUnitario']}</PrezzoUnitario>
+          <PrezzoTotale>{r['PrezzoTotale']}</PrezzoTotale>
+          <AliquotaIVA>{r['AliquotaIVA']:.2f}</AliquotaIVA>
+          <RiferimentoAmministrazione>{r['VRET']}</RiferimentoAmministrazione>
+        </DettaglioLinee>
+        """
+
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<p:FatturaElettronica
+  xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+  xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  versione="FPR12"
+  xsi:schemaLocation="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 fatturaordinaria_v1.2.xsd ">
+  <FatturaElettronicaHeader>
+    <DatiTrasmissione>
+      <IdTrasmittente>
+        <IdPaese>IT</IdPaese>
+        <IdCodice>{fornitore['piva']}</IdCodice>
+      </IdTrasmittente>
+      <ProgressivoInvio>{dati['numero_nota']}</ProgressivoInvio>
+      <FormatoTrasmissione>FPR12</FormatoTrasmissione>
+      <CodiceDestinatario>{intestatario['codice_destinatario']}</CodiceDestinatario>
+      <PECDestinatario>{intestatario['pec']}</PECDestinatario>
+    </DatiTrasmissione>
+    <CedentePrestatore>
+      <DatiAnagrafici>
+        <IdFiscaleIVA>
+          <IdPaese>IT</IdPaese>
+          <IdCodice>{fornitore['piva']}</IdCodice>
+        </IdFiscaleIVA>
+        <CodiceFiscale>{fornitore['codice_fiscale']}</CodiceFiscale>
+        <Anagrafica>
+          <Denominazione>{fornitore['denominazione']}</Denominazione>
+          <CodEORI>{fornitore['cod_eori']}</CodEORI>
+        </Anagrafica>
+        <RegimeFiscale>{fornitore['regime_fiscale']}</RegimeFiscale>
+      </DatiAnagrafici>
+      <Sede>
+        <Indirizzo>{fornitore['indirizzo']}</Indirizzo>
+        <CAP>{fornitore['cap']}</CAP>
+        <Comune>{fornitore['comune']}</Comune>
+        <Provincia>{fornitore['provincia']}</Provincia>
+        <Nazione>{fornitore['nazione']}</Nazione>
+      </Sede>
+      <RiferimentoAmministrazione>{fornitore['riferimento_amministrazione']}</RiferimentoAmministrazione>
+    </CedentePrestatore>
+    <CessionarioCommittente>
+      <DatiAnagrafici>
+        <IdFiscaleIVA>
+          <IdPaese>IT</IdPaese>
+          <IdCodice>{intestatario['piva']}</IdCodice>
+        </IdFiscaleIVA>
+        <CodiceFiscale>{intestatario['piva']}</CodiceFiscale>
+        <Anagrafica>
+          <Denominazione>{intestatario['denominazione']}</Denominazione>
+        </Anagrafica>
+      </DatiAnagrafici>
+      <Sede>
+        <Indirizzo>{intestatario['indirizzo']}</Indirizzo>
+        <NumeroCivico>{intestatario['numero_civico']}</NumeroCivico>
+        <CAP>{intestatario['cap']}</CAP>
+        <Comune>{intestatario['comune']}</Comune>
+        <Provincia>{intestatario['provincia']}</Provincia>
+        <Nazione>{intestatario['nazione']}</Nazione>
+      </Sede>
+    </CessionarioCommittente>
+  </FatturaElettronicaHeader>
+  <FatturaElettronicaBody>
+    <DatiGenerali>
+      <DatiGeneraliDocumento>
+        <TipoDocumento>TD04</TipoDocumento>
+        <Divisa>EUR</Divisa>
+        <Data>{dati['data_nota']}</Data>
+        <Numero>{dati['numero_nota']}</Numero>
+        <ImportoTotaleDocumento>{dati['totale']:.2f}</ImportoTotaleDocumento>
+        <Causale>VRET</Causale>
+      </DatiGeneraliDocumento>
+      <DatiOrdineAcquisto>
+        <IdDocumento>{dati['po']}</IdDocumento>
+      </DatiOrdineAcquisto>
+    </DatiGenerali>
+    <DatiBeniServizi>
+      {dettaglio_linee}
+      <DatiRiepilogo>
+        <AliquotaIVA>22.00</AliquotaIVA>
+        <ImponibileImporto>{dati['imponibile']:.2f}</ImponibileImporto>
+        <Imposta>{dati['iva']:.2f}</Imposta>
+        <EsigibilitaIVA>I</EsigibilitaIVA>
+      </DatiRiepilogo>
+    </DatiBeniServizi>
+  </FatturaElettronicaBody>
+</p:FatturaElettronica>
+"""
+    return xml
+
+
+
+
 def main_loop():
-    print("WORKER AVVIATO - SONO IL VERO WORKER!")  # <-- stampa subito all'avvio
+    print("WORKER AVVIATO - SONO IL VERO WORKER!")
     while True:
         jobs = supabase.table("jobs").select("*").eq("status", "pending").execute().data
         if not jobs:
@@ -499,7 +767,7 @@ def main_loop():
                 process_import_vendor_orders_job(job)
             elif job["type"] == "genera_fattura_amazon_vendor":
                 process_genera_fattura_amazon_vendor_job(job)
+            elif job["type"] == "genera_notecredito_amazon_reso":   # <--- AGGIUNGI QUESTA!
+                process_genera_notecredito_amazon_reso_job(job)     # <--- E QUESTA!
         time.sleep(1)
 
-if __name__ == "__main__":
-    main_loop()

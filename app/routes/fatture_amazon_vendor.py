@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, send_file
 from app.supabase_client import supabase  # importa il tuo client Supabase
 import uuid
 
+
 bp = Blueprint('fatture_amazon_vendor', __name__)
 
 # 1. CREA UN NUOVO JOB DI GENERAZIONE FATTURA
@@ -74,7 +75,7 @@ def download_fattura_amazon_vendor(fattura_id):
         import io
         return send_file(
             io.BytesIO(file_resp),
-            download_name=f"Fattura_{fattura['numero_fattura']}.xml",
+            download_name=f"Fattura_{fattura['numero_fattura']}_{fattura['centro']}_{fattura['data_fattura'].replace('-', '')}.xml",
             as_attachment=True,
             mimetype="application/xml"
         )
