@@ -544,7 +544,7 @@ def process_genera_notecredito_amazon_reso_job(job):
                     "NumeroLinea": idx+1,
                     "ASIN": str(r.get("ASIN", "")),
                     "EAN": str(r.get("EAN", "")),
-                    "Descrizione": str(r.get("Prodotto", "")) if r.get("Prodotto") else str(r.get("UPC", "")),
+                    "Descrizione": str(r.get("Prodotto", "")),
                     "Quantita": qty,
                     "PrezzoUnitario": price,
                     "PrezzoTotale": total_row,
