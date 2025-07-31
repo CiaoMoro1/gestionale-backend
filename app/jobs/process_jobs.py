@@ -494,7 +494,26 @@ def generate_sdi_xml(dati):
 
 
 
+def fix_numeric(val):
+    # Torna None per valori vuoti, oppure float con il punto decimale
+    if val is None or str(val).strip() == '':
+        return None
+    return float(str(val).replace(",", ".").replace(" ", ""))
 
+def to_float(val):
+    try:
+        if pd.isna(val):
+            return 0.0
+        return float(str(val).replace(",", ".").replace(" ", "").strip())
+    except Exception:
+        return 0.0
+
+def csv_to_xlsx(csv_bytes):
+    df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", sep=",")
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name="Return_Items")
+    return output.getvalue()
 
 def genera_numero_nota_credito(supabase) -> str:
     resp = supabase.rpc("genera_numero_nota_credito").execute()
@@ -517,61 +536,72 @@ def process_genera_notecredito_amazon_reso_job(job):
             raise Exception(f"Errore download da storage: {file_resp.error}")
         csv_bytes = file_resp
 
-        # Leggi CSV (Return_Items di Amazon Vendor)
-        df = pd.read_csv(io.BytesIO(csv_bytes), sep=",", encoding="utf-8-sig")
-        print("Colonne lette dal CSV:", df.columns.tolist(), flush=True)
-        print(df.head(2).to_string(), flush=True)
+        # Conversione CSV -> XLSX (in RAM)
+        xlsx_bytes = csv_to_xlsx(csv_bytes)
+
+        # Leggi XLSX
+        df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name="Return_Items")
         df.columns = [c.strip() for c in df.columns]
 
-        def to_float(val):
-            try:
-                if pd.isna(val):
-                    return 0.0
-                return float(str(val).replace(",", ".").replace(" ", "").strip())
-            except Exception:
-                return 0.0
-
-        grouped = df.groupby(['ID richiesta spedizione', 'Ordine d’acquisto'])
+        grouped = df.groupby(['ID reso', 'Numero di tracking'])
 
         risultati = []
-        for (vret, po), righe in grouped:
-            righe = righe.reset_index(drop=True)
-            imponibile = 0.0
-            dettagli_xml = []
-            for idx, r in righe.iterrows():
-                qty = to_float(r.get("Quantità", 1))
-                price = to_float(r.get("Costo unitario", 0))
-                raw_total = r.get("Importo totale", None)
-                if raw_total is None or str(raw_total).strip() == "" or str(raw_total).lower() == "nan":
-                    total_row = qty * price
-                else:
-                    total_row = to_float(raw_total)
-                imponibile += total_row
-                dettagli_xml.append({
-                    "NumeroLinea": idx+1,
-                    "ASIN": str(r.get("ASIN", "")),
-                    "EAN": str(r.get("EAN", "")),
-                    "Descrizione": str(r.get("Prodotto", "")),    # <-- ora corretto!
-                    "Quantita": qty,
-                    "PrezzoUnitario": price,
-                    "PrezzoTotale": total_row,
-                    "AliquotaIVA": 22.00,
-                    "VRET": vret
-                })
-            iva = round(imponibile * 0.22, 2)
-            totale = round(imponibile + iva, 2)
+        for (vret, _), righe in grouped:
+            po = righe.iloc[0]['Numero di tracking'].strip()
+            print(f"Sto generando nota per PO={po}, VRET={vret}")
+
             oggi = datetime.now(timezone.utc).date().isoformat()
             numero_nota = genera_numero_nota_credito(supabase)
+
+            # DETTAGLIO ARTICOLI PER L'XML
+            dettaglio_linee = []
+            imponibile = 0.0
+            for idx, r in righe.iterrows():
+                qty = fix_numeric(r.get("Linea di prodotti", 1))
+                price = fix_numeric(r.get("Quantità", 0))
+                total_row = qty * price if qty and price else 0.0
+                imponibile += total_row
+                dettaglio_linee.append({
+                    "NumeroLinea": idx+1,
+                    "asin": str(r.get("Corriere", "")),
+                    "ean": str(r.get("ASIN", "")),
+                    "descrizione": str(r.get("UPC", "")),
+                    "quantita": qty,
+                    "prezzo_unitario": price,
+                    "prezzo_totale": total_row,
+                    "AliquotaIVA": 22.00,
+                    "VRET": vret  # <--- ID reso!
+                })
+
+            iva = round(imponibile * 0.22, 2)
+            importo_totale = round(imponibile + iva, 2)
+
+
+            articoli_json = []
+            for idx, r in righe.iterrows():
+                qty = fix_numeric(r.get("Linea di prodotti", 1))
+                price = fix_numeric(r.get("Quantità", 0))
+                total_row = qty * price if qty and price else 0.0
+                articoli_json.append({
+                    "numero_linea": idx+1,
+                    "ean": str(r.get("EAN", "")),
+                    "asin": str(r.get("ASIN", "")),   # <-- prendi ASIN vero!
+                    "descrizione": str(r.get("UPC", "")),
+                    "quantita": qty,
+                    "prezzo_unitario": price,
+                    "prezzo_totale": total_row
+                })
+
 
             dati_xml = {
                 "data_nota": oggi,
                 "numero_nota": numero_nota,
                 "po": po,
                 "vret": vret,
-                "dettagli": dettagli_xml,
+                "dettagli": dettaglio_linee,
                 "imponibile": imponibile,
                 "iva": iva,
-                "totale": totale
+                "importo_totale": importo_totale
             }
 
             # --- GENERA XML NOTA DI CREDITO ---
@@ -592,17 +622,15 @@ def process_genera_notecredito_amazon_reso_job(job):
                 "po": po,
                 "vret": vret,
                 "xml_url": xml_url,
-                "imponibile": round(imponibile, 2),
-                "iva": iva,
-                "totale": totale,
                 "stato": "pronta",
                 "job_id": job["id"],
+                "articoli": articoli_json,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
             supabase.table("notecredito_amazon_reso").insert(nota_insert).execute()
             risultati.append(nota_insert)
-            print(f"Inserisco nota: PO={po}, VRET={vret}, Totale={totale}, XML={xml_url}", flush=True)
-            
+            print(f"Inserisco nota: PO={po}, VRET={vret}, XML={xml_url}", flush=True)
+
         # Aggiorna job come DONE
         supabase.table("jobs").update({
             "status": "done",
@@ -624,8 +652,8 @@ def process_genera_notecredito_amazon_reso_job(job):
         }).eq("id", job["id"]).execute()
 
 
+
 def generate_sdi_notecredito_xml(dati):
-    # Dati statici intestazione/fornitore/Amazon (modifica con i tuoi dati)
     intestatario = {
         "denominazione": "AMAZON EU SARL, SUCCURSALE ITALIANA",
         "indirizzo": "VIALE MONTE GRAPPA",
@@ -652,27 +680,43 @@ def generate_sdi_notecredito_xml(dati):
         "riferimento_amministrazione": "7401713799"
     }
 
+    # DETTAGLIO ARTICOLI
     dettaglio_linee = ""
     for r in dati["dettagli"]:
         dettaglio_linee += f"""
         <DettaglioLinee>
-          <NumeroLinea>{r['NumeroLinea']}</NumeroLinea>
-          <CodiceArticolo>
-            <CodiceTipo>ASIN</CodiceTipo>
-            <CodiceValore>{html.escape(r['ASIN'], quote=True)}</CodiceValore>
-          </CodiceArticolo>
-          {f'''<CodiceArticolo>
-            <CodiceTipo>EAN</CodiceTipo>
-            <CodiceValore>{html.escape(r['EAN'], quote=True)}</CodiceValore>
-          </CodiceArticolo>''' if r.get("EAN") else ""}
-          <Descrizione>{html.escape(r['Descrizione'], quote=True)}</Descrizione>
-          <Quantita>{r['Quantita']}</Quantita>
-          <PrezzoUnitario>{r['PrezzoUnitario']}</PrezzoUnitario>
-          <PrezzoTotale>{r['PrezzoTotale']}</PrezzoTotale>
-          <AliquotaIVA>{r['AliquotaIVA']:.2f}</AliquotaIVA>
-          <RiferimentoAmministrazione>{r['VRET']}</RiferimentoAmministrazione>
-        </DettaglioLinee>
+            <NumeroLinea>{r['NumeroLinea']}</NumeroLinea>
+            <CodiceArticolo>
+                <CodiceTipo>EAN</CodiceTipo>
+                <CodiceValore>{html.escape(str(r['ean']), quote=True)}</CodiceValore>
+            </CodiceArticolo>
+            <CodiceArticolo>
+                <CodiceTipo>ASIN</CodiceTipo>
+                <CodiceValore>{html.escape(str(r['asin']), quote=True)}</CodiceValore>
+            </CodiceArticolo>
+            <Descrizione>{html.escape(str(r['descrizione']), quote=True)}</Descrizione>
+            <Quantita>{float(r['quantita']):.6f}</Quantita>
+            <PrezzoUnitario>{float(r['prezzo_unitario']):.6f}</PrezzoUnitario>
+            <PrezzoTotale>{float(r['prezzo_totale']):.2f}</PrezzoTotale>
+            <AliquotaIVA>22.00</AliquotaIVA>
+            <RiferimentoAmministrazione>{r['VRET']}</RiferimentoAmministrazione>
+            </DettaglioLinee>
         """
+
+    # Dati pagamento (sezione obbligatoria per Amazon, puoi parametrizzare IBAN o altro)
+    dati_pagamento = f"""
+    <DatiPagamento>
+      <CondizioniPagamento>TP02</CondizioniPagamento>
+      <DettaglioPagamento>
+        <Beneficiario>{fornitore['denominazione']}</Beneficiario>
+        <ModalitaPagamento>MP05</ModalitaPagamento>
+        <DataRiferimentoTerminiPagamento>{dati['data_nota']}</DataRiferimentoTerminiPagamento>
+        <GiorniTerminiPagamento>0</GiorniTerminiPagamento>
+        <DataScadenzaPagamento>{dati['data_nota']}</DataScadenzaPagamento>
+        <ImportoPagamento>{dati['importo_totale']:.2f}</ImportoPagamento>
+      </DettaglioPagamento>
+    </DatiPagamento>
+    """
 
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <p:FatturaElettronica
@@ -742,7 +786,7 @@ def generate_sdi_notecredito_xml(dati):
         <Divisa>EUR</Divisa>
         <Data>{dati['data_nota']}</Data>
         <Numero>{dati['numero_nota']}</Numero>
-        <ImportoTotaleDocumento>{dati['totale']:.2f}</ImportoTotaleDocumento>
+        <ImportoTotaleDocumento>{dati['importo_totale']:.2f}</ImportoTotaleDocumento>
         <Causale>VRET</Causale>
       </DatiGeneraliDocumento>
       <DatiOrdineAcquisto>
@@ -753,21 +797,21 @@ def generate_sdi_notecredito_xml(dati):
       {dettaglio_linee}
       <DatiRiepilogo>
         <AliquotaIVA>22.00</AliquotaIVA>
+        <SpeseAccessorie>0.00</SpeseAccessorie>
         <ImponibileImporto>{dati['imponibile']:.2f}</ImponibileImporto>
         <Imposta>{dati['iva']:.2f}</Imposta>
         <EsigibilitaIVA>I</EsigibilitaIVA>
+        <RiferimentoNormativo>Iva 22% vendite</RiferimentoNormativo>
       </DatiRiepilogo>
     </DatiBeniServizi>
+    {dati_pagamento}
   </FatturaElettronicaBody>
 </p:FatturaElettronica>
 """
     return xml
 
-
-
-
 def main_loop():
-    print("WORKER AVVIATO - SONO IL VERO WORKER!")
+    print("WORKER AVVIATO - SONO IL VERO WORKER 3!")
     while True:
         jobs = supabase.table("jobs").select("*").eq("status", "pending").execute().data
         print(f"[worker] Trovati {len(jobs)} job pending", flush=True)
