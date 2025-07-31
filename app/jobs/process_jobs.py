@@ -601,7 +601,8 @@ def process_genera_notecredito_amazon_reso_job(job):
             }
             supabase.table("notecredito_amazon_reso").insert(nota_insert).execute()
             risultati.append(nota_insert)
-
+            print(f"Inserisco nota: PO={po}, VRET={vret}, Totale={totale}, XML={xml_url}", flush=True)
+            
         # Aggiorna job come DONE
         supabase.table("jobs").update({
             "status": "done",
