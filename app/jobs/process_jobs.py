@@ -53,7 +53,12 @@ def process_import_vendor_orders_job(job):
             raise Exception(f"Errore download da storage: {file_resp.error}")
         excel_bytes = file_resp
 
-        df = pd.read_excel(io.BytesIO(excel_bytes), header=2, sheet_name="Articoli")
+        df = pd.read_excel(
+            io.BytesIO(excel_bytes),
+            header=2,
+            sheet_name="Articoli",
+            dtype={"Codice identificativo esterno": str}
+        )
         df.columns = [str(c).strip().replace('\n', ' ').replace('\r', '').replace('  ', ' ') for c in df.columns]
 
         required_columns = [
