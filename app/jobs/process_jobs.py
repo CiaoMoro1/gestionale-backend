@@ -350,7 +350,7 @@ def generate_sdi_xml(dati):
         "riferimento_amministrazione": "7401713799"
     }
 
-    causale = "VRET"
+    causale = f"Ordine Amazon centro {centro} - Data consegna {start_delivery}. Basato su PO: {', '.join(po_list)}."
 
     # ==== RIGHE XML (SKU + ASIN, descrizione sempre valorizzata e escapata) ====
     dettaglio_linee = ""
