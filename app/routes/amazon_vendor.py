@@ -147,17 +147,19 @@ def allowed_file(filename):
 def get_all_items_by_po(po_list):
     """
     Carica in batch gli articoli degli ordini (PO) con retry per ogni finestra/offset.
+    Deduplica per (po_number, model_number, fulfillment_center, start_delivery) per evitare doppioni.
     """
     all_items = []
     BATCH_SIZE_PO = 50
     LIMIT = 500
+
     for i in range(0, len(po_list), BATCH_SIZE_PO):
         batch_po = po_list[i:i + BATCH_SIZE_PO]
         offset = 0
         while True:
             res = supa_with_retry(lambda: (
                 sb_table("ordini_vendor_items")
-                .select("po_number, qty_ordered, fulfillment_center, start_delivery")
+                .select("po_number, model_number, qty_ordered, fulfillment_center, start_delivery")
                 .in_("po_number", batch_po)
                 .range(offset, offset + LIMIT - 1)
                 .execute()
@@ -169,8 +171,26 @@ def get_all_items_by_po(po_list):
             if len(batch) < LIMIT:
                 break
             offset += LIMIT
+
         time.sleep(0.05)
-    return all_items
+
+    # --- DEDUP ---
+    seen = set()
+    dedup = []
+    for x in all_items:
+        key = (
+            str(x.get("po_number") or "").upper(),
+            str(x.get("model_number") or "").upper(),
+            str(x.get("fulfillment_center") or "").upper(),
+            str(x.get("start_delivery") or "")[:10],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(x)
+
+    return dedup
+
 
 
 
