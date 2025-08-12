@@ -59,7 +59,8 @@ def create_app():
     app.register_blueprint(amazon_oauth_bp)
     app.register_blueprint(cavallotti.bp)
     app.register_blueprint(jobs_bp)
-    logging.info("App Flask avviata. Blueprint registrati: bulk_sync, webhook, orders, shopify, bulk_routes, brt")
+    names = ", ".join(sorted(app.blueprints.keys()))
+    logging.info(f"App Flask avviata. Blueprint registrati: {names}")
     return app
 
 app = create_app()
