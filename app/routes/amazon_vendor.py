@@ -2625,9 +2625,11 @@ def badge_counts():
 
 def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parziale: int):
     """
-    Sposta in 'Trasferito' le quantità del parziale confermato,
-    prelevandole solo dagli stati 'attivi' (Stampato -> Calandrato -> Cucito -> Confezionato),
-    stessa data, stesso SKU/EAN. Idempotente via flag 'gestito'.
+    Sposta in 'Trasferito' le quantità del parziale confermato.
+    Regola quantità da spostare = quantità confermata nel parziale - riscontro (già presente) sui prelievi.
+    Preleva prioritariamente dalla stessa data; se non basta, prende da altre date (più vecchie prima).
+    Stati da cui preleva: Stampato, Calandrato, Cucito, Confezionato.
+    Idempotente via flag 'gestito'.
     """
     # 1) riepilogo + parziale
     rres = supa_with_retry(lambda: (
@@ -2638,7 +2640,9 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         .single()
         .execute()
     ))
-    riepilogo_id = rres.data["id"]
+    riepilogo_id = (rres.data or {}).get("id")
+    if not riepilogo_id:
+        return
 
     pres = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
@@ -2647,29 +2651,30 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         .eq("numero_parziale", numero_parziale)
         .single()
         .execute()
-    )).data
-
-    if not pres or pres.get("gestito"):
+    ))
+    pres_data = pres.data or {}
+    if not pres_data or pres_data.get("gestito"):
         return
 
-    dati = pres.get("dati") or []
+    dati = pres_data.get("dati") or []
     if isinstance(dati, str):
         try:
             dati = json.loads(dati)
         except Exception:
             dati = []
 
-    # 2) delta da spostare: mappa (sku, ean) -> qty
-    to_move_map = {}
+    # 2) mappa parziale (sku, ean) -> quantità parziale
+    parziale_map = {}
     for r in dati:
         sku = r.get("model_number") or r.get("sku")
-        ean = r.get("vendor_product_id") or r.get("ean")
+        ean = r.get("vendor_product_id") or r.get("ean") or ""
         q = int(r.get("quantita") or r.get("qty") or 0)
         if sku and q > 0:
-            key = (sku, ean or "")
-            to_move_map[key] = to_move_map.get(key, 0) + q
+            key = (sku, ean)
+            parziale_map[key] = parziale_map.get(key, 0) + q
 
-    if not to_move_map:
+    if not parziale_map:
+        # nulla da fare: segna gestito
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
             .update({"gestito": True})
@@ -2679,37 +2684,83 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         ))
         return
 
-    # 3) prendo righe di produzione su stessa data, stati attivi
-    stati_priorita = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
-    rows = supa_with_retry(lambda: (
+    # 3) RISCONTRO: sottraiamo i pezzi già confermati nel prelievo per la stessa data/SKU/EAN
+    #    (così se nel prelievo c'è riscontro=1 e nel parziale confermi 3, spostiamo solo 2)
+    riscontro_map = {}
+    # prendiamo solo i prelievi della stessa data; se vuoi considerare anche altro per sottrazione, estendi qui
+    prelievi_same_date = supa_with_retry(lambda: (
+        sb_table("prelievi_ordini_amazon")
+        .select("sku, ean, start_delivery, riscontro")
+        .eq("start_delivery", start_delivery)
+        .execute()
+    )).data or []
+    for p in prelievi_same_date:
+        sku_p = p.get("sku")
+        ean_p = p.get("ean") or ""
+        if not sku_p:
+            continue
+        key = (sku_p, ean_p)
+        try:
+            riscontro_map[key] = riscontro_map.get(key, 0) + int(p.get("riscontro") or 0)
+        except Exception:
+            pass
+
+    # quantità da spostare = parziale - riscontro (minimo 0)
+    to_move_map = {}
+    for key, q_parz in parziale_map.items():
+        q_risc = riscontro_map.get(key, 0)
+        to_move_map[key] = max(0, q_parz - q_risc)
+
+    # se dopo la compensazione non resta nulla da spostare, chiudi e marca gestito
+    if all(q <= 0 for q in to_move_map.values()):
+        supa_with_retry(lambda: (
+            sb_table("ordini_vendor_parziali")
+            .update({"gestito": True})
+            .eq("riepilogo_id", riepilogo_id)
+            .eq("numero_parziale", numero_parziale)
+            .execute()
+        ))
+        return
+
+    # 4) Recupera TUTTE le righe attive di produzione per gli SKU interessati,
+    #    senza limitarsi alla data: useremo una priorità (stessa data prima, poi altre date più vecchie).
+    stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
+    # prendi tutte le righe attive per gli SKU/EAN target (senza vincolo data)
+    target_sku = list({k[0] for k in to_move_map.keys()})
+    rows_all = supa_with_retry(lambda: (
         sb_table("produzione_vendor")
         .select("*")
-        .eq("start_delivery", start_delivery)
+        .in_("sku", target_sku)
         .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi"])
         .execute()
     )).data or []
 
-    # indicizza per (sku, ean) e ordina per priorità stato
+    # indicizza per (sku, ean)
     by_key = {}
-    for r in rows:
-        key = (r.get("sku"), r.get("ean") or "")
+    for r in rows_all:
+        key = (r.get("sku"), (r.get("ean") or ""))
         by_key.setdefault(key, []).append(r)
-    for k in by_key:
-        by_key[k].sort(key=lambda r: stati_priorita.index(r["stato_produzione"])
-                       if r["stato_produzione"] in stati_priorita else 999)
 
-    # 4) sposta
+    # ordina per priorità:
+    #   1) stessa data (0) prima di date diverse (1)
+    #   2) ordine stato (Stampato -> Calandrato -> Cucito -> Confezionato)
+    #   3) tra date diverse: più vecchie prima (FIFO)
+    stato_index = {s: i for i, s in enumerate(stati_attivi)}
+    def _row_priority(row):
+        same_date = 0 if str(row.get("start_delivery") or "")[:10] == str(start_delivery)[:10] else 1
+        st = row.get("stato_produzione")
+        st_i = stato_index.get(st, 999)
+        dt = str(row.get("start_delivery") or "")
+        return (same_date, st_i, dt)
+
+    for k in by_key:
+        by_key[k].sort(key=_row_priority)
+
+    # 5) esegui gli spostamenti
     for key, qty_to_move in to_move_map.items():
         if qty_to_move <= 0:
             continue
-
-        sku_key, ean_key = key
-        candidati = by_key.get((sku_key, ean_key), [])
-
-        # fallback: se il parziale non ha EAN, usa tutte le righe con lo stesso SKU
-        if not candidati and not (ean_key or "").strip():
-            candidati = [r for (s, _e), righe in by_key.items() if s == sku_key for r in righe]
-
+        candidati = by_key.get(key, [])
         for r in candidati:
             if qty_to_move <= 0:
                 break
@@ -2719,23 +2770,23 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
             take = min(avail, qty_to_move)
 
-            # decrementa l'origine
-            supa_with_retry(lambda: (
+            # riduci l'origine
+            supa_with_retry(lambda rid=r["id"], new_val=avail - take: (
                 sb_table("produzione_vendor")
-                .update({"da_produrre": avail - take})
-                .eq("id", r["id"])
+                .update({"da_produrre": new_val})
+                .eq("id", rid)
                 .execute()
             ))
 
-            # inserisci la riga "Trasferito"
+            # crea riga 'Trasferito'
             nuovo = {
-                "sku": r["sku"],
+                "sku": r.get("sku"),
                 "ean": r.get("ean"),
                 "qty": r.get("qty"),
                 "riscontro": r.get("riscontro"),
                 "plus": r.get("plus") or 0,
                 "radice": r.get("radice"),
-                "start_delivery": r.get("start_delivery"),
+                "start_delivery": r.get("start_delivery"),  # manteniamo la data della riga da cui preleviamo
                 "stato": r.get("stato"),
                 "stato_produzione": "Trasferito",
                 "da_produrre": take,
@@ -2743,23 +2794,26 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 "note": (r.get("note") or ""),
                 "modificata_manualmente": False,
             }
-            inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
+            inserted = supa_with_retry(lambda row=nuovo: sb_table("produzione_vendor").insert(row).execute()).data or []
             if inserted:
                 irow = inserted[0]
-                log_movimento_produzione(
-                    irow, utente="operatore",
-                    motivo=f"Auto-spostamento da {r['stato_produzione']} a Trasferito (parziale #{numero_parziale})",
-                    stato_vecchio=r["stato_produzione"],
-                    stato_nuovo="Trasferito",
-                    qty_vecchia=None,
-                    qty_nuova=take
-                )
+                try:
+                    log_movimento_produzione(
+                        irow, utente="operatore",
+                        motivo=f"Auto-spostamento da {r['stato_produzione']} a Trasferito (parziale #{numero_parziale})",
+                        stato_vecchio=r["stato_produzione"],
+                        stato_nuovo="Trasferito",
+                        qty_vecchia=None,
+                        qty_nuova=take
+                    )
+                except Exception:
+                    pass
 
             qty_to_move -= take
 
-        # eventuale residuo non si prende da 'Da Stampare' (voluto)
+        # eventuale residuo (non trovato in attivi) rimane non spostato: è voluto
 
-    # 5) flag gestito
+    # 6) flag gestito
     supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
         .update({"gestito": True})
