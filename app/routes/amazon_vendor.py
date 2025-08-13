@@ -2637,24 +2637,25 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         .select("id")
         .eq("fulfillment_center", center)
         .eq("start_delivery", start_delivery)
-        .single()
+        .limit(1)
         .execute()
     ))
-    riepilogo_id = (rres.data or {}).get("id")
+    rows_r = rres.data or []
+    riepilogo_id = rows_r[0]["id"] if rows_r else None
     if not riepilogo_id:
         return
 
+    # parziale corrente (senza .single())
     pres = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
         .select("dati, gestito")
         .eq("riepilogo_id", riepilogo_id)
         .eq("numero_parziale", numero_parziale)
-        .single()
+        .limit(1)
         .execute()
     ))
-    pres_data = pres.data or {}
-    if not pres_data or pres_data.get("gestito"):
-        return
+    _pres_rows = pres.data or []
+    pres_data = _pres_rows[0] if _pres_rows else {}
 
     dati_curr = pres_data.get("dati") or []
     if isinstance(dati_curr, str):
@@ -2664,16 +2665,17 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
             dati_curr = []
 
     # 2) Somme del parziale corrente: (SKU,EAN) e per-SKU
-    parziale_exact_curr = {}   # (sku, ean) -> qty
-    parziale_sku_curr   = {}   # sku -> qty totale
-    for r in dati_curr:
+    # parziale corrente per SKU
+    parziale_sku_curr = {}
+    parziale_exact_curr = {}
+    for r in (dati_curr or []):
         sku = r.get("model_number") or r.get("sku")
         ean = (r.get("vendor_product_id") or r.get("ean") or "")
         q = int(r.get("quantita") or r.get("qty") or 0)
         if not sku or q <= 0:
             continue
-        parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
+        parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
     if not parziale_sku_curr:
         supa_with_retry(lambda: (
@@ -2685,22 +2687,20 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         ))
         return
 
-    # 3) Somma parziali PRECEDENTI (confermati) per SKU (serve per non sottrarre due volte il riscontro)
+    # somma parziali precedenti confermati
     parziali_prec = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("numero_parziale, dati, confermato, gestito")
+        .select("numero_parziale,dati,confermato")
         .eq("riepilogo_id", riepilogo_id)
         .order("numero_parziale")
         .execute()
     )).data or []
 
-    sum_parziali_precedenti_sku = {}  # sku -> qty
+    sum_parziali_precedenti_sku = {}
     for p in parziali_prec:
         num = p.get("numero_parziale")
-        if num is None or num >= numero_parziale:
-            continue  # solo i precedenti
-        if not p.get("confermato"):
-            continue  # consideriamo solo confermati
+        if num is None or num >= numero_parziale or not p.get("confermato"):
+            continue
         dati_p = p.get("dati") or []
         if isinstance(dati_p, str):
             try:
@@ -2714,11 +2714,11 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 continue
             sum_parziali_precedenti_sku[sku] = sum_parziali_precedenti_sku.get(sku, 0) + q
 
-    # 4) RISCONTRO per SKU alla stessa data (ignora EAN)
+    # riscontro per SKU (stessa data)
     riscontro_sku = {}
     prelievi_same_date = supa_with_retry(lambda: (
         sb_table("prelievi_ordini_amazon")
-        .select("sku, riscontro")
+        .select("sku,riscontro")
         .eq("start_delivery", start_delivery)
         .execute()
     )).data or []
@@ -2731,8 +2731,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         except Exception:
             pass
 
-    # 5) Quantità da spostare per SKU
-    #    to_move_sku = parziale_corrente - max(0, riscontro_totale - somma_parziali_precedenti)
+    # qty da spostare per SKU = parziale_corrente - max(0, riscontro_totale - somma_parziali_precedenti)
     to_move_sku = {}
     for sku, q_curr in parziale_sku_curr.items():
         prev_sum = sum_parziali_precedenti_sku.get(sku, 0)
@@ -2750,6 +2749,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         ))
         return
 
+
     # 6) Righe produzione attive per gli SKU interessati (senza filtro data)
     stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
     stato_index = {s: i for i, s in enumerate(stati_attivi)}
@@ -2763,7 +2763,6 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         .execute()
     )).data or []
 
-    # indicizzazioni utili
     rows_by_sku = {}
     rows_by_exact = {}
     for r in rows_all:
@@ -2772,7 +2771,6 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         rows_by_sku.setdefault(sku_r, []).append(r)
         rows_by_exact.setdefault((sku_r, ean_r), []).append(r)
 
-    # sort con priorità: stessa data -> stato -> data crescente (FIFO tra date diverse)
     def _priority(row):
         same_date = 0 if str(row.get("start_delivery") or "")[:10] == str(start_delivery)[:10] else 1
         st_i = stato_index.get(row.get("stato_produzione"), 999)
@@ -2784,29 +2782,24 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     for k in rows_by_exact:
         rows_by_exact[k].sort(key=_priority)
 
-    # 7) Sposta: per ogni SKU, prima (SKU,EAN) presenti nel parziale corrente, poi fallback solo SKU
     for sku, need in to_move_sku.items():
         if need <= 0:
             continue
 
-        # EAN presenti nel parziale corrente per questo SKU (ordine: quantità desc)
         eans_for_sku = sorted(
-            [ean for (s, ean), q in parziale_exact_curr.items() if s == sku and q > 0],
+            [ean for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
             key=lambda e: parziale_exact_curr.get((sku, e), 0),
             reverse=True
         )
 
-        # candidati (SKU,EAN) nell'ordine sopra
         ordered_candidates = []
         for e in eans_for_sku:
             ordered_candidates.extend(rows_by_exact.get((sku, e), []))
 
-        # fallback: altre righe per SKU non ancora considerate
         already_ids = {r["id"] for r in ordered_candidates}
         fallback_rows = [r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids]
         ordered_candidates.extend(fallback_rows)
 
-        # applica spostamenti
         for r in ordered_candidates:
             if need <= 0:
                 break
@@ -2832,7 +2825,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 "riscontro": r.get("riscontro"),
                 "plus": r.get("plus") or 0,
                 "radice": r.get("radice"),
-                "start_delivery": r.get("start_delivery"),  # manteniamo la data della riga origine
+                "start_delivery": r.get("start_delivery"),  # mantieni la data origine
                 "stato": r.get("stato"),
                 "stato_produzione": "Trasferito",
                 "da_produrre": take,
@@ -2856,6 +2849,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                     pass
 
             need -= take
+
         # eventuale residuo rimane non spostato (mancano pezzi attivi)
 
     # 8) marca questo parziale come gestito
