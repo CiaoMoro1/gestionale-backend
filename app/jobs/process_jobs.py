@@ -627,6 +627,74 @@ def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
 # NOTE DI CREDITO
 # -----------------------
 
+
+# --- Helpers ---
+
+def safe_str(v):
+    return "" if v is None else str(v).strip()
+
+def fix_numeric(v):
+    try:
+        s = safe_str(v).replace(",", ".")
+        if s == "" or s.lower() == "nan":
+            return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+def csv_to_xlsx(csv_bytes: bytes) -> bytes:
+    # Converte un CSV in un XLSX in RAM (per evitare i problemi di parsing “shiftato” che avevi)
+    import pandas as pd, io
+    df = pd.read_csv(io.BytesIO(csv_bytes), sep=",", encoding="utf-8-sig")
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Return_Items")
+    return bio.getvalue()
+
+def load_invoice_map_from_summary(summary_bytes: bytes) -> dict:
+    """
+    Legge il file Return Summary (xls/xlsx), prova a individuare:
+      - colonna VRET (tipicamente 'Codice fornitore' o simili)
+      - colonna ID reso (oppure 'ID richiesta spedizione' se l'ID reso non c’è nel summary)
+      - colonna numero fattura (varie diciture)
+    Restituisce un dizionario {(vret, id_reso): numero_fattura}.
+    """
+    import pandas as pd, io
+    invoice_map = {}
+
+    # Leggo tutte le sheet e provo a trovare quella 'giusta'
+    xls = pd.read_excel(io.BytesIO(summary_bytes), sheet_name=None)
+    # Heuristics sulle colonne
+    vret_candidates = ["Codice fornitore", "VRET", "Vendor code", "Codice Fornitore"]
+    id_reso_candidates = ["ID reso", "ID richiesta spedizione", "Return Request ID", "ID Reso"]
+    fattura_candidates = ["Numero fattura", "Invoice Number", "Invoice", "Numero documento fiscale", "Numero documento", "Fattura"]
+
+    def pick_col(cols, candidates):
+        # ritorna il primo candidato che esiste (case insensitive)
+        low = {c.lower(): c for c in cols}
+        for cand in candidates:
+            if cand.lower() in low:
+                return low[cand.lower()]
+        return None
+
+    for name, df in xls.items():
+        df_cols = [str(c).strip() for c in df.columns]
+        vret_col = pick_col(df_cols, vret_candidates)
+        fatt_col = pick_col(df_cols, fattura_candidates)
+        id_col = pick_col(df_cols, id_reso_candidates)
+        if not vret_col or not fatt_col or not id_col:
+            continue
+
+        for _, row in df.iterrows():
+            vret = safe_str(row.get(vret_col))
+            id_reso = safe_str(row.get(id_col))
+            fatt = safe_str(row.get(fatt_col))
+            if vret and id_reso and fatt:
+                invoice_map[(vret, id_reso)] = fatt
+
+    return invoice_map
+
+
 def generate_sdi_notecredito_xml(dati: Dict[str, Any]) -> str:
     intestatario = {
         "denominazione": "AMAZON EU SARL, SUCCURSALE ITALIANA",
@@ -651,31 +719,42 @@ def generate_sdi_notecredito_xml(dati: Dict[str, Any]) -> str:
         "nazione": "IT",
         "regime_fiscale": "RF01",
         "cod_eori": "IT09780071214",
-        "riferimento_amministrazione": "7401713799"
+        # NB: NON inserirò RiferimentoAmministrazione qui nell’header
     }
 
-    # Dettaglio righe
-    dettaglio_linee = ""
+    # Righe
+    dettaglio_linee_xml = []
     for r in dati["dettagli"]:
-        dettaglio_linee += f"""
+        dettaglio_linee_xml.append(f"""
         <DettaglioLinee>
-            <NumeroLinea>{r['NumeroLinea']}</NumeroLinea>
-            <CodiceArticolo>
-                <CodiceTipo>EAN</CodiceTipo>
-                <CodiceValore>{html.escape(str(r.get('ean','')), quote=True)}</CodiceValore>
-            </CodiceArticolo>
-            <CodiceArticolo>
-                <CodiceTipo>ASIN</CodiceTipo>
-                <CodiceValore>{html.escape(str(r.get('asin','')), quote=True)}</CodiceValore>
-            </CodiceArticolo>
-            <Descrizione>{html.escape(str(r.get('descrizione','')), quote=True)}</Descrizione>
-            <Quantita>{float(r['quantita']):.6f}</Quantita>
-            <PrezzoUnitario>{float(r['prezzo_unitario']):.6f}</PrezzoUnitario>
-            <PrezzoTotale>{float(r['prezzo_totale']):.2f}</PrezzoTotale>
-            <AliquotaIVA>22.00</AliquotaIVA>
-            <RiferimentoAmministrazione>{html.escape(str(r.get('VRET','')), quote=True)}</RiferimentoAmministrazione>
-        </DettaglioLinee>
-        """.strip()
+          <NumeroLinea>{r['NumeroLinea']}</NumeroLinea>
+          <CodiceArticolo>
+            <CodiceTipo>EAN</CodiceTipo>
+            <CodiceValore>{html.escape(safe_str(r.get('ean','')), quote=True)}</CodiceValore>
+          </CodiceArticolo>
+          <CodiceArticolo>
+            <CodiceTipo>ASIN</CodiceTipo>
+            <CodiceValore>{html.escape(safe_str(r.get('asin','')), quote=True)}</CodiceValore>
+          </CodiceArticolo>
+          <Descrizione>{html.escape(safe_str(r.get('descrizione','')), quote=True)}</Descrizione>
+          <Quantita>{float(r['quantita']):.6f}</Quantita>
+          <PrezzoUnitario>{float(r['prezzo_unitario']):.6f}</PrezzoUnitario>
+          <PrezzoTotale>{float(r['prezzo_totale']):.2f}</PrezzoTotale>
+          <AliquotaIVA>22.00</AliquotaIVA>
+          <RiferimentoAmministrazione>{html.escape(safe_str(r.get('VRET','')), quote=True)}</RiferimentoAmministrazione>
+        </DettaglioLinee>""".strip())
+
+    dettaglio_linee = "\n".join(dettaglio_linee_xml)
+
+    # Blocco DatiFattureCollegate (se numero presente)
+    fattura_collegata = safe_str(dati.get("fattura_collegata", ""))
+    if fattura_collegata:
+        collegata_xml = f"""
+        <DatiFattureCollegate>
+          <IdDocumento>{html.escape(fattura_collegata, quote=True)}</IdDocumento>
+        </DatiFattureCollegate>""".strip()
+    else:
+        collegata_xml = ""  # opzionale
 
     dati_pagamento = f"""
     <DatiPagamento>
@@ -729,7 +808,6 @@ def generate_sdi_notecredito_xml(dati: Dict[str, Any]) -> str:
         <Provincia>{fornitore['provincia']}</Provincia>
         <Nazione>{fornitore['nazione']}</Nazione>
       </Sede>
-      <RiferimentoAmministrazione>{fornitore['riferimento_amministrazione']}</RiferimentoAmministrazione>
     </CedentePrestatore>
     <CessionarioCommittente>
       <DatiAnagrafici>
@@ -762,9 +840,7 @@ def generate_sdi_notecredito_xml(dati: Dict[str, Any]) -> str:
         <ImportoTotaleDocumento>{dati['importo_totale']:.2f}</ImportoTotaleDocumento>
         <Causale>VRET</Causale>
       </DatiGeneraliDocumento>
-      <DatiOrdineAcquisto>
-        <IdDocumento>{html.escape(dati['po'], quote=True)}</IdDocumento>
-      </DatiOrdineAcquisto>
+      {collegata_xml}
     </DatiGenerali>
     <DatiBeniServizi>
       {dettaglio_linee}
@@ -782,7 +858,11 @@ def generate_sdi_notecredito_xml(dati: Dict[str, Any]) -> str:
 </p:FatturaElettronica>
 """.strip()
 
+    # strip pulito
     return "\n".join(line.strip() for line in xml.splitlines() if line.strip())
+
+
+from typing import Dict, Any
 
 def process_genera_notecredito_amazon_reso_job(job: Dict[str, Any]) -> None:
     try:
@@ -792,43 +872,66 @@ def process_genera_notecredito_amazon_reso_job(job: Dict[str, Any]) -> None:
         }).eq("id", job["id"]).execute()
 
         storage_path = job["payload"]["storage_path"]
+        summary_path = job["payload"].get("summary_path")  # può essere None
+
+        # --- Return Items ---
         bucket, filename = storage_path.split("/", 1)
         print(f"[worker] Scarico file {storage_path} da storage...", flush=True)
-        file_resp = supabase.storage.from_(bucket).download(filename)
-        if hasattr(file_resp, 'error') and file_resp.error:
-            raise Exception(f"Errore download da storage: {file_resp.error}")
-        csv_bytes = file_resp
+        items_bytes = supabase.storage.from_(bucket).download(filename)
+        if hasattr(items_bytes, 'error') and items_bytes.error:
+            raise Exception(f"Errore download Return_Items: {items_bytes.error}")
 
-        # CSV -> XLSX in RAM
-        xlsx_bytes = csv_to_xlsx(csv_bytes)
+        # CSV -> XLSX in RAM per evitare shift colonne
+        xlsx_bytes = csv_to_xlsx(items_bytes)
 
-        # Leggi XLSX
+        # Leggi XLSX in DataFrame
         df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name="Return_Items")
         df.columns = [c.strip() for c in df.columns]
 
-        grouped = df.groupby(['ID reso', 'Numero di tracking'])
+        # --- Return Summary (opzionale) ---
+        invoice_map = {}
+        if summary_path:
+            sbucket, sname = summary_path.split("/", 1)
+            print(f"[worker] Scarico summary {summary_path} da storage...", flush=True)
+            summary_bytes = supabase.storage.from_(sbucket).download(sname)
+            if hasattr(summary_bytes, 'error') and summary_bytes.error:
+                print(f"[worker] Warning: errore download Return_Summary: {summary_bytes.error}", flush=True)
+            else:
+                invoice_map = load_invoice_map_from_summary(summary_bytes)
+                print(f"[worker] Mappate {len(invoice_map)} fatture collegate dal Summary.", flush=True)
+
+        # --- Grouping corretto: VRET + ID RESO + PO (tracking) ---
+        # vret = Codice fornitore; id_reso = ID reso; po = Numero di tracking
+        group_cols = ['Codice fornitore', 'ID reso', 'Numero di tracking']
+        for col in group_cols:
+            if col not in df.columns:
+                raise Exception(f"Colonna mancante nel Return_Items: {col}")
+
+        grouped = df.groupby(group_cols, dropna=False)
 
         risultati = []
-        for (vret, _), righe in grouped:
-            po = righe.iloc[0]['Numero di tracking'].strip()
-            print(f"Sto generando nota per PO={po}, VRET={vret}", flush=True)
+        for (vret, id_reso, po), righe in grouped:
+            vret = safe_str(vret)
+            id_reso = safe_str(id_reso)
+            po = safe_str(po)
+            print(f"[worker] Genero nota per VRET={vret}, ID_RESO={id_reso}, PO={po}", flush=True)
 
             oggi = datetime.now(timezone.utc).date().isoformat()
             numero_nota = genera_numero_nota_credito(supabase)
 
-            # DETTAGLI (NB: mapping “shiftato” confermato da te)
+            # DETTAGLI righe
             dettaglio_linee = []
             imponibile = 0.0
-            for idx, r in righe.iterrows():
-                qty = fix_numeric(r.get("Linea di prodotti", 1))      # <-- voluto
-                price = fix_numeric(r.get("Quantità", 0))            # <-- voluto
+            for _, r in righe.iterrows():
+                qty = fix_numeric(r.get("Linea di prodotti", 1))   # mapping “shiftato” come richiesto
+                price = fix_numeric(r.get("Quantità", 0))
                 total_row = (qty or 0.0) * (price or 0.0)
                 imponibile += total_row
                 dettaglio_linee.append({
                     "NumeroLinea": len(dettaglio_linee) + 1,
-                    "asin": safe_str(r.get("ASIN", "")) or "",
-                    "ean": safe_str(r.get("EAN", "")) or "",
-                    "descrizione": safe_str(r.get("UPC", "")) or "",
+                    "asin": safe_str(r.get("ASIN", "")),
+                    "ean": safe_str(r.get("EAN", "")),
+                    "descrizione": safe_str(r.get("UPC", "")),
                     "quantita": qty or 0.0,
                     "prezzo_unitario": price or 0.0,
                     "prezzo_totale": total_row,
@@ -839,38 +942,25 @@ def process_genera_notecredito_amazon_reso_job(job: Dict[str, Any]) -> None:
             iva = round(imponibile * 0.22, 2)
             importo_totale = round(imponibile + iva, 2)
 
-            # JSON Articoli per tabella
-            articoli_json = []
-            for i, r in enumerate(righe.iterrows(), start=1):
-                _, rr = r
-                qty = fix_numeric(rr.get("Linea di prodotti", 1))
-                price = fix_numeric(rr.get("Quantità", 0))
-                total_row = (qty or 0.0) * (price or 0.0)
-                articoli_json.append({
-                    "numero_linea": i,
-                    "ean": safe_str(rr.get("EAN", "")) or "",
-                    "asin": safe_str(rr.get("ASIN", "")) or "",
-                    "descrizione": safe_str(rr.get("UPC", "")) or "",
-                    "quantita": qty or 0.0,
-                    "prezzo_unitario": price or 0.0,
-                    "prezzo_totale": total_row
-                })
+            # Fattura collegata dal Summary (se disponibile)
+            fatt_collegata = invoice_map.get((vret, id_reso), "")
 
             dati_xml = {
                 "data_nota": oggi,
                 "numero_nota": numero_nota,
-                "po": po,
+                "po": po,  # lo teniamo nel DB per consultazione, ma NON lo mettiamo più in XML come DatiOrdineAcquisto
                 "vret": vret,
                 "dettagli": dettaglio_linee,
                 "imponibile": imponibile,
                 "iva": iva,
-                "importo_totale": importo_totale
+                "importo_totale": importo_totale,
+                "fattura_collegata": fatt_collegata
             }
 
             # XML Nota di credito
             xml_str = generate_sdi_notecredito_xml(dati_xml)
 
-            # Upload
+            # Upload XML
             xml_filename = f"xml/{numero_nota}_{vret}.xml"
             xml_bucket = "notecredito"
             upload_resp = supabase.storage.from_(xml_bucket).upload(
@@ -882,9 +972,19 @@ def process_genera_notecredito_amazon_reso_job(job: Dict[str, Any]) -> None:
                 raise Exception(f"Errore upload XML: {upload_resp.error}")
             xml_url = f"{xml_bucket}/{xml_filename}"
 
-            # Inserisci record
+            # Inserisci record DB
+            articoli_json = [{
+                "numero_linea": r["NumeroLinea"],
+                "ean": r["ean"],
+                "asin": r["asin"],
+                "descrizione": r["descrizione"],
+                "quantita": r["quantita"],
+                "prezzo_unitario": r["prezzo_unitario"],
+                "prezzo_totale": r["prezzo_totale"]
+            } for r in dettaglio_linee]
+
             nota_insert = {
-                "data_nota": oggi,                         # DATE
+                "data_nota": oggi,
                 "numero_nota": numero_nota,
                 "po": po,
                 "vret": vret,
@@ -892,11 +992,15 @@ def process_genera_notecredito_amazon_reso_job(job: Dict[str, Any]) -> None:
                 "stato": "pronta",
                 "job_id": job["id"],
                 "articoli": articoli_json,
+                "fattura_collegata": fatt_collegata,   # salva anche nel DB per visibilità
+                "imponibile": round(imponibile, 2),
+                "iva": iva,
+                "totale": importo_totale,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
             supabase.table("notecredito_amazon_reso").insert(nota_insert).execute()
             risultati.append(nota_insert)
-            print(f"Inserita nota: PO={po}, VRET={vret}, XML={xml_url}", flush=True)
+            print(f"[worker] Inserita nota: VRET={vret} ID_RESO={id_reso} PO={po} FATT={fatt_collegata} XML={xml_url}", flush=True)
 
         supabase.table("jobs").update({
             "status": "done",

@@ -9,22 +9,34 @@ bp = Blueprint('notecredito_amazon_reso', __name__)
 BUCKET = "notecredito"  # Bucket separato per le note di credito
 
 # 1. ENDPOINT UPLOAD RETURN_ITEMS.CSV
+# 1. ENDPOINT UPLOAD RETURN_ITEMS + RETURN_SUMMARY
 @bp.route('/api/notecredito_amazon_reso/upload', methods=['POST'])
 def upload_notecredito_amazon_reso():
-    if 'file' not in request.files:
-        return jsonify({'error': 'Nessun file inviato'}), 400
+    if 'return_items' not in request.files:
+        return jsonify({'error': 'File return_items mancante'}), 400
 
-    file = request.files['file']
-    filename = f"return_items/{uuid.uuid4()}_{file.filename}"
-    file_bytes = file.read()
-    res = supabase.storage.from_(BUCKET).upload(filename, file_bytes, {"content-type": "text/csv"})
-    if hasattr(res, 'error') and res.error:
-        return jsonify({'error': 'Errore upload su storage'}), 500
+    items_file = request.files['return_items']
+    items_path = f"return_items/{uuid.uuid4()}_{items_file.filename}"
+    items_bytes = items_file.read()
+    res1 = supabase.storage.from_(BUCKET).upload(items_path, items_bytes, {"content-type": "text/csv"})
+    if hasattr(res1, 'error') and res1.error:
+        return jsonify({'error': 'Errore upload return_items su storage'}), 500
 
-    # Crea job asincrono
+    summary_path = None
+    if 'return_summary' in request.files and request.files['return_summary'].filename:
+        summary_file = request.files['return_summary']
+        # può essere xls o xlsx
+        ct = "application/vnd.ms-excel" if summary_file.filename.lower().endswith(".xls") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        summary_path = f"return_summary/{uuid.uuid4()}_{summary_file.filename}"
+        summary_bytes = summary_file.read()
+        res2 = supabase.storage.from_(BUCKET).upload(summary_path, summary_bytes, {"content-type": ct})
+        if hasattr(res2, 'error') and res2.error:
+            return jsonify({'error': 'Errore upload return_summary su storage'}), 500
+
     job_id = str(uuid.uuid4())
     job_payload = {
-        "storage_path": f"{BUCKET}/{filename}"
+        "storage_path": f"{BUCKET}/{items_path}",
+        "summary_path": f"{BUCKET}/{summary_path}" if summary_path else None
     }
     supabase.table("jobs").insert({
         "id": job_id,
@@ -34,6 +46,7 @@ def upload_notecredito_amazon_reso():
     }).execute()
 
     return jsonify({"job_id": job_id, "status": "pending"})
+
 
 
 # 2. LISTA NOTE DI CREDITO
