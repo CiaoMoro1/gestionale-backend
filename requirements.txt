@@ -61,3 +61,4 @@ tenacity
 fpdf2
 python-barcode
 pillow
+xlsxwriter
