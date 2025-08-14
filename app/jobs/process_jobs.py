@@ -929,14 +929,14 @@ def process_genera_notecredito_amazon_reso_job(job: Dict[str, Any]) -> None:
                 imponibile += total_row
                 dettaglio_linee.append({
                     "NumeroLinea": len(dettaglio_linee) + 1,
-                    "asin": safe_str(r.get("ASIN", "")),
-                    "ean": safe_str(r.get("EAN", "")),
-                    "descrizione": safe_str(r.get("UPC", "")),
-                    "quantita": qty or 0.0,
-                    "prezzo_unitario": price or 0.0,
+                    "asin": str(r.get("Corriere", "")),
+                    "ean": str(r.get("ASIN", "")),
+                    "descrizione": str(r.get("UPC", "")),
+                    "quantita": qty,
+                    "prezzo_unitario": price,
                     "prezzo_totale": total_row,
                     "AliquotaIVA": 22.00,
-                    "VRET": vret
+                    "VRET": vret  # <--- ID reso!
                 })
 
             iva = round(imponibile * 0.22, 2)
