@@ -49,25 +49,40 @@ def upload_notecredito_amazon_reso():
 
 
 
-# 2. LISTA NOTE DI CREDITO
+# app/routes/notecredito_amazon_reso.py
+
 @bp.route('/api/notecredito_amazon_reso/list', methods=['GET'])
 def lista_notecredito_amazon_reso():
     try:
         query = supabase.table("notecredito_amazon_reso").select("*")
+
         po = request.args.get("po")
         vret = request.args.get("vret")
         stato = request.args.get("stato")
+        job_id = request.args.get("job_id")
+        date_from = request.args.get("date_from")  # YYYY-MM-DD
+        date_to = request.args.get("date_to")      # YYYY-MM-DD
+
         if po:
             query = query.eq("po", po)
         if vret:
             query = query.eq("vret", vret)
         if stato:
             query = query.eq("stato", stato)
-        res = query.order("data_nota", desc=True).limit(100).execute()
+        if job_id:
+            query = query.eq("job_id", job_id)
+        if date_from:
+            query = query.gte("data_nota", date_from)
+        if date_to:
+            query = query.lte("data_nota", date_to)
+
+        # mostra le più recenti prima
+        res = query.order("created_at", desc=True).limit(200).execute()
         return jsonify(res.data)
     except Exception as e:
         print(f"ERRORE su /api/notecredito_amazon_reso/list: {e}")
         return jsonify({"error": "Errore nel recupero note credito", "details": str(e)}), 500
+
 
 
 # 3. DOWNLOAD SINGOLA NOTA DI CREDITO
