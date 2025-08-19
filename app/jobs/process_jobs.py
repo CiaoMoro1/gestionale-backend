@@ -330,13 +330,16 @@ def process_import_vendor_orders_job(job: Dict[str, Any]) -> None:
 def generate_sdi_xml(dati: Dict[str, Any]) -> str:
     """
     Genera XML SDI (FPR12) per fattura.
-    dati: centro, start_delivery (YYYY-MM-DD), po_list (list[str]), articoli (rows),
-          data_fattura (YYYY-MM-DD), numero_fattura, imponibile, iva, totale
+    Atteso:
+      - dati["centro"], dati["start_delivery"], dati["po_list"]
+      - dati["lines"]: lista di dict con chiavi:
+          line_no, po_number, model_number, asin, title, qty, cost, line_total
+      - dati["data_fattura"], dati["numero_fattura"], dati["imponibile"], dati["iva"], dati["totale"]
     """
     centro = dati["centro"]
     start_delivery = dati["start_delivery"]
-    po_list = dati["po_list"]
-    articoli = dati["articoli"]
+    po_list = dati["po_list"] or []
+    lines = dati["lines"] or []
     data_fattura = dati["data_fattura"]
     numero_fattura = dati["numero_fattura"]
     imponibile = "{:.2f}".format(dati["imponibile"])
@@ -372,50 +375,50 @@ def generate_sdi_xml(dati: Dict[str, Any]) -> str:
 
     causale = f"Ordine Amazon centro {centro} - Data consegna {start_delivery}. Basato su PO: {', '.join(po_list)}."
 
-    # Righe
-    dettaglio_linee = ""
-    line_num = 0
-    for a in articoli:
-        qty_conf = safe_int(a.get("qty_confirmed"), None)
-        qty_ord = safe_int(a.get("qty_ordered"), 0)
-        qty = qty_conf if (qty_conf is not None and qty_conf > 0) else qty_ord
-        if qty <= 0:
-            continue
-        cost = to_float(a.get("cost"), 0.0)
-        totale_riga = "{:.2f}".format(cost * qty)
-        sku = safe_str(a.get("model_number")) or ""
-        asin = safe_str(a.get("asin")) or ""
-        raw_descrizione = a.get('title')
-        descrizione = html.escape(safe_str(raw_descrizione) or f"Articolo {sku}", quote=True)
-        line_num += 1
-        dettaglio_linee += f"""
+    # --- DETTAGLIO LINEE (solo righe confermate) ---
+    dettaglio_linee_parts = []
+    for a in lines:
+        descrizione = html.escape((a.get("title") or f"Articolo {a.get('model_number','')}").strip(), quote=True)
+        sku = (a.get("model_number") or "").strip()
+        asin = (a.get("asin") or "").strip()
+        dettaglio_linee_parts.append(f"""
         <DettaglioLinee>
-          <NumeroLinea>{line_num}</NumeroLinea>
+          <NumeroLinea>{int(a["line_no"])}</NumeroLinea>
           <CodiceArticolo>
             <CodiceTipo>SKU</CodiceTipo>
-            <CodiceValore>{sku}</CodiceValore>
+            <CodiceValore>{html.escape(sku, quote=True)}</CodiceValore>
           </CodiceArticolo>
           {f'''<CodiceArticolo>
             <CodiceTipo>ASIN</CodiceTipo>
-            <CodiceValore>{asin}</CodiceValore>
+            <CodiceValore>{html.escape(asin, quote=True)}</CodiceValore>
           </CodiceArticolo>''' if asin else ""}
           <Descrizione>{descrizione}</Descrizione>
-          <Quantita>{float(qty):.2f}</Quantita>
-          <PrezzoUnitario>{cost:.6f}</PrezzoUnitario>
-          <PrezzoTotale>{totale_riga}</PrezzoTotale>
+          <Quantita>{float(a["qty"]):.2f}</Quantita>
+          <PrezzoUnitario>{float(a["cost"]):.6f}</PrezzoUnitario>
+          <PrezzoTotale>{float(a["line_total"]):.2f}</PrezzoTotale>
           <AliquotaIVA>22.00</AliquotaIVA>
         </DettaglioLinee>
-        """
+        """.strip())
+    dettaglio_linee_xml = "\n".join(dettaglio_linee_parts)
 
-    # Dati Ordine Acquisto
-    dati_ordini_xml = "\n".join([
-        f"""
+    # --- Mapping PO → riferimenti numero linea (corretto) ---
+    po_to_lines = defaultdict(list)
+    for a in lines:
+        po_to_lines[str(a.get("po_number", "")).strip()].append(int(a["line_no"]))
+
+    # 1 blocco per PO con tutti i <RiferimentoNumeroLinea> pertinenti
+    dati_ordini_xml_parts = []
+    for po, line_nos in po_to_lines.items():
+        if not po:
+            continue
+        refs = "\n".join(f"<RiferimentoNumeroLinea>{n}</RiferimentoNumeroLinea>" for n in line_nos)
+        dati_ordini_xml_parts.append(f"""
         <DatiOrdineAcquisto>
-          <RiferimentoNumeroLinea>{i+1}</RiferimentoNumeroLinea>
+          {refs}
           <IdDocumento>{html.escape(po, quote=True)}</IdDocumento>
         </DatiOrdineAcquisto>
-        """.strip() for i, po in enumerate(po_list)
-    ])
+        """.strip())
+    dati_ordini_xml = "\n".join(dati_ordini_xml_parts)
 
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <p:FatturaElettronica
@@ -491,7 +494,7 @@ def generate_sdi_xml(dati: Dict[str, Any]) -> str:
       {dati_ordini_xml}
     </DatiGenerali>
     <DatiBeniServizi>
-      {dettaglio_linee}
+      {dettaglio_linee_xml}
       <DatiRiepilogo>
         <AliquotaIVA>22.00</AliquotaIVA>
         <ImponibileImporto>{imponibile}</ImponibileImporto>
@@ -512,8 +515,9 @@ def generate_sdi_xml(dati: Dict[str, Any]) -> str:
 </p:FatturaElettronica>
 """.strip()
 
-    # normalizzo un po' spazi senza rovinare i contenuti
+    # normalizza spazi
     return "\n".join(line.strip() for line in xml.splitlines() if line.strip())
+
 
 def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
     try:
@@ -523,10 +527,10 @@ def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
         }).eq("id", job["id"]).execute()
 
         centro = job["payload"]["centro"]
-        start_delivery = job["payload"]["start_delivery"]  # deve essere "YYYY-MM-DD" (string)
+        start_delivery = job["payload"]["start_delivery"]  # "YYYY-MM-DD" (string)
         po_list = job["payload"]["po_list"]
 
-        # 1) Articoli di questi PO/centro/data
+        # 1) Articoli dei PO/centro/data
         res = supabase.table("ordini_vendor_items") \
             .select("*") \
             .in_("po_number", po_list) \
@@ -537,29 +541,47 @@ def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
         if not articoli:
             raise Exception("Nessun articolo trovato per questa fattura!")
 
-        # 2) Totali
-        def qty_for_sum(a):
-            q = safe_int(a.get("qty_confirmed"), None)
-            return q if (q is not None and q > 0) else safe_int(a.get("qty_ordered"), 0)
+        # 2) SOLO righe con qty_confirmed > 0
+        rows = [a for a in articoli if (safe_int(a.get("qty_confirmed"), 0) > 0)]
+        if not rows:
+            raise Exception("Nessuna riga con qty_confirmed > 0 per questa fattura!")
 
-        imponibile = sum(to_float(a.get("cost"), 0.0) * qty_for_sum(a) for a in articoli)
+        # Ordine stabile: per PO poi SKU
+        rows.sort(key=lambda a: ((a.get("po_number") or ""), (a.get("model_number") or "")))
+
+        # 3) Costruzione linee e totali (solo confermato)
+        lines = []
+        imponibile = 0.0
+        for i, a in enumerate(rows, start=1):
+            qty = safe_int(a.get("qty_confirmed"), 0)
+            cost = to_float(a.get("cost"), 0.0)
+            line_total = round(qty * cost, 2)
+            imponibile += line_total
+            lines.append({
+                "line_no": i,
+                "po_number": a.get("po_number"),
+                "model_number": a.get("model_number"),
+                "asin": a.get("asin"),
+                "title": a.get("title"),
+                "qty": qty,
+                "cost": cost,
+                "line_total": line_total,
+            })
+
         imponibile = round(imponibile, 2)
         iva = round(imponibile * 0.22, 2)
         totale = round(imponibile + iva, 2)
 
-        articoli_ordinati = sum(safe_int(a.get("qty_ordered"), 0) for a in articoli)
-        articoli_confermati = sum(safe_int(a.get("qty_confirmed"), 0) for a in articoli)
-
-        # 3) Numero e data fattura
+        # 4) Numero e data fattura
         data_fattura = datetime.now(timezone.utc).date().isoformat()
         numero_fattura = genera_numero_fattura(supabase, datetime.now().year)
 
-        # 4) XML
+        # 5) XML (lines + mapping PO→linee corretto)
         fattura_xml = generate_sdi_xml({
             "centro": centro,
             "start_delivery": start_delivery,
             "po_list": po_list,
-            "articoli": articoli,
+            "lines": lines,
             "data_fattura": data_fattura,
             "numero_fattura": numero_fattura,
             "imponibile": imponibile,
@@ -567,7 +589,7 @@ def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
             "totale": totale
         })
 
-        # 5) Upload XML (upsert=True così non esplode se rigeneri)
+        # 6) Upload XML (upsert=True per rigenerazione)
         filename = f"fatture/{numero_fattura}_{centro}_{start_delivery}.xml"
         bucket = "fatture"
         upload_resp = supabase.storage.from_(bucket).upload(
@@ -579,7 +601,7 @@ def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
             raise Exception(f"Errore upload XML: {upload_resp.error}")
         xml_url = f"{bucket}/{filename}"
 
-        # 6) Inserisci fattura
+        # 7) Inserisci fattura (nota: articoli_ordinati ora non ha senso: metto 0)
         ins = supabase.table("fatture_amazon_vendor").insert({
             "data_fattura": data_fattura,               # DATE
             "numero_fattura": numero_fattura,
@@ -588,15 +610,15 @@ def process_genera_fattura_amazon_vendor_job(job: Dict[str, Any]) -> None:
             "po_list": po_list,                         # text[]
             "totale_fattura": totale,
             "imponibile": imponibile,
-            "articoli_ordinati": articoli_ordinati,
-            "articoli_confermati": articoli_confermati,
+            "articoli_ordinati": 0,
+            "articoli_confermati": sum(l["qty"] for l in lines),
             "xml_url": xml_url,
             "stato": "pronta",
             "job_id": job["id"],
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
 
-        # segna riepilogo come fatturato
+        # 8) Marca riepilogo fatturato
         supabase.table("ordini_vendor_riepilogo") \
             .update({"fatturato": True}) \
             .eq("fulfillment_center", centro) \
