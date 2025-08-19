@@ -622,7 +622,7 @@ def get_parziali_wip():
 
         pres = supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
-            .select("dati, numero_parziale")
+            .select("dati, numero_parziale, last_modified_at, conferma_collo")
             .eq("riepilogo_id", riepilogo_id)
             .eq("confermato", False)
             .order("numero_parziale", desc=True)
@@ -630,8 +630,14 @@ def get_parziali_wip():
             .execute()
         ))
         if pres.data:
-            return jsonify(pres.data[0]["dati"])
-        return jsonify([])
+            row = pres.data[0]
+            return jsonify({
+                "parziali": row.get("dati", []),
+                "confermaCollo": row.get("conferma_collo", {}),
+                "numero_parziale": row.get("numero_parziale"),
+                "last_modified_at": row.get("last_modified_at"),
+            })
+        return jsonify({"parziali": [], "confermaCollo": {}, "numero_parziale": 1})
     except Exception as ex:
         logging.exception("[get_parziali_wip] Errore")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
@@ -640,9 +646,12 @@ def get_parziali_wip():
 def save_parziali_wip():
     center = request.args.get("center")
     start_delivery = request.args.get("data")
-    data = request.json
+    data = request.json or {}
     parziali = data.get("parziali")
     conferma_collo = data.get("confermaCollo", {})
+    merge = bool(data.get("merge"))
+    client_ts = data.get("client_last_modified_at")
+
     if not center or not start_delivery or parziali is None:
         return jsonify({"error": "center/data/parziali richiesti"}), 400
 
@@ -659,18 +668,36 @@ def save_parziali_wip():
             return jsonify({"error": "riepilogo non trovato"}), 400
         riepilogo_id = rows[0]["id"]
 
-        res = supa_with_retry(lambda: (
+        # leggi ultimo WIP (non confermato)
+        latest = supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
-            .select("numero_parziale")
+            .select("numero_parziale, dati, conferma_collo, last_modified_at")
             .eq("riepilogo_id", riepilogo_id)
             .eq("confermato", False)
             .order("numero_parziale", desc=True)
             .limit(1)
             .execute()
         ))
-        if res.data:
-            numero_parziale = res.data[0]["numero_parziale"]
+        if latest.data:
+            row = latest.data[0]
+            numero_parziale = row["numero_parziale"]
+            server_ts = row.get("last_modified_at")
+            server_parziali = row.get("dati") or []
+            server_conferma = row.get("conferma_collo") or {}
+            # optimistic concurrency
+            if client_ts and server_ts and str(client_ts) != str(server_ts):
+                return jsonify({"error": "Conflitto: dati aggiornati da altro client."}), 409
+            if merge:
+                # MERGE lato server: sostituisci solo l'articolo presente nel body
+                # NB: qui non conosci 'articolo' lato server; lato client invii già l'array merged
+                merged = parziali
+                parziali_final = merged
+                conferma_final = conferma_collo or server_conferma
+            else:
+                parziali_final = parziali
+                conferma_final = conferma_collo
         else:
+            # non esiste WIP: crea nuovo numero_parziale
             conf = supa_with_retry(lambda: (
                 sb_table("ordini_vendor_parziali")
                 .select("numero_parziale")
@@ -682,12 +709,14 @@ def save_parziali_wip():
             ))
             max_num = conf.data[0]["numero_parziale"] if (conf.data and len(conf.data) > 0) else 0
             numero_parziale = max_num + 1
+            parziali_final = parziali
+            conferma_final = conferma_collo
 
         parziale_data = {
             "riepilogo_id": riepilogo_id,
             "numero_parziale": numero_parziale,
-            "dati": parziali,
-            "conferma_collo": conferma_collo,
+            "dati": parziali_final,
+            "conferma_collo": conferma_final,
             "confermato": False,
             "created_at": (datetime.now(timezone.utc)).isoformat(),
             "last_modified_at": (datetime.now(timezone.utc)).isoformat()
@@ -697,7 +726,6 @@ def save_parziali_wip():
             sb_table("ordini_vendor_parziali")
             .upsert(parziale_data, on_conflict="riepilogo_id,numero_parziale")
         ))
-
         return jsonify({"ok": True, "numero_parziale": numero_parziale})
     except Exception as ex:
         logging.exception("[save_parziali_wip] Errore salvataggio parziali wip")
