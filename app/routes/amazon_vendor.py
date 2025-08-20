@@ -2705,16 +2705,6 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
         parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
-    if not parziale_sku_curr:
-        supa_with_retry(lambda: (
-            sb_table("ordini_vendor_parziali")
-            .update({"gestito": True})
-            .eq("riepilogo_id", riepilogo_id)
-            .eq("numero_parziale", numero_parziale)
-            .execute()
-        ))
-        return
-
     # somma parziali precedenti confermati
     parziali_prec = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
@@ -2766,16 +2756,6 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         risc = riscontro_sku.get(sku, 0)
         residuo_riscontro = max(0, risc - prev_sum)
         to_move_sku[sku] = max(0, q_curr - residuo_riscontro)
-
-    if all(q <= 0 for q in to_move_sku.values()):
-        supa_with_retry(lambda: (
-            sb_table("ordini_vendor_parziali")
-            .update({"gestito": True})
-            .eq("riepilogo_id", riepilogo_id)
-            .eq("numero_parziale", numero_parziale)
-            .execute()
-        ))
-        return
 
 
     # 6) Righe produzione attive per gli SKU interessati (senza filtro data)
@@ -2880,11 +2860,3 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
         # eventuale residuo rimane non spostato (mancano pezzi attivi)
 
-    # 8) marca questo parziale come gestito
-    supa_with_retry(lambda: (
-        sb_table("ordini_vendor_parziali")
-        .update({"gestito": True})
-        .eq("riepilogo_id", riepilogo_id)
-        .eq("numero_parziale", numero_parziale)
-        .execute()
-    ))
