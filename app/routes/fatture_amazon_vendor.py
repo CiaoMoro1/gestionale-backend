@@ -97,3 +97,38 @@ def dettaglio_fattura_amazon_vendor(fattura_id):
 
 
 
+# 5. CREA JOB DI NOTA DI CREDITO DA FATTURA
+@bp.route('/api/fatture_amazon_vendor/nota-credito', methods=['POST'])
+def crea_nota_credito_da_fattura():
+    data = request.get_json()
+    fattura_id = data.get("fattura_id")
+    motive = data.get("motive")  # opzionale (descrizione/causale)
+    user_id = data.get("user_id")  # opzionale
+
+    if not fattura_id:
+        return jsonify({"error": "fattura_id mancante"}), 400
+
+    # carico la fattura per estrarre centro, data, po_list e (facoltativo) lines da rigenerare
+    fatt = supabase.table("fatture_amazon_vendor").select("*").eq("id", fattura_id).single().execute().data
+    if not fatt:
+        return jsonify({"error": "Fattura non trovata"}), 404
+
+    job_id = str(uuid.uuid4())
+    job_payload = {
+        "fattura_id": fattura_id,
+        "centro": fatt.get("centro"),
+        "start_delivery": fatt.get("start_delivery"),
+        "po_list": fatt.get("po_list") or [],
+        "numero_fattura_collegata": fatt.get("numero_fattura"),
+        "motive": motive or "Storno/variazione Amazon"
+    }
+
+    supabase.table("jobs").insert({
+        "id": job_id,
+        "type": "genera_nota_credito_da_fattura",
+        "payload": job_payload,
+        "status": "pending",
+        "user_id": user_id
+    }).execute()
+
+    return jsonify({"job_id": job_id, "status": "pending"})

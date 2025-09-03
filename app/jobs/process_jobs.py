@@ -997,22 +997,321 @@ def process_genera_notecredito_amazon_reso_job(job):
             "finished_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", job["id"]).execute()
 
+
+
+
+# ========= NUOVO: XML TD04 DA FATTURA (multi-PO, importi positivi) =========
+def generate_sdi_nc_da_fattura_xml(dati: Dict[str, Any]) -> str:
+    """
+    dati atteso:
+      - centro, data_nota, numero_nota, causale, numero_fattura_collegata
+      - po_list: [ ... ]
+      - lines: [{ line_no, po_number, model_number, asin, ean?, title, qty, cost, line_total }]
+      - imponibile, iva, totale
+    """
+    import html
+    from collections import defaultdict
+
+    centro = dati["centro"]
+    data_nota = dati["data_nota"]
+    numero_nota = dati["numero_nota"]
+    numero_fattura_collegata = dati["numero_fattura_collegata"]
+    po_list = dati.get("po_list") or []
+    lines = dati.get("lines") or []
+
+    imponibile = f"{dati['imponibile']:.2f}"
+    iva = f"{dati['iva']:.2f}"
+    totale = f"{dati['totale']:.2f}"
+
+    intestatario = {
+        "denominazione": "AMAZON EU SARL, SUCCURSALE ITALIANA",
+        "indirizzo": "VIALE MONTE GRAPPA",
+        "numero_civico": "3/5",
+        "cap": "20124",
+        "comune": "MILANO",
+        "provincia": "MI",
+        "nazione": "IT",
+        "piva": "08973230967",
+        "codice_destinatario": "XR6XN0E",
+        "pec": "amazoneu@legalmail.it"
+    }
+    fornitore = {
+        "denominazione": "CYBORG",
+        "piva": "09780071214",
+        "codice_fiscale": "09780071214",
+        "indirizzo": "Via G. D' Annunzio 58",
+        "cap": "80053",
+        "comune": "Castellammare di Stabia",
+        "provincia": "NA",
+        "nazione": "IT",
+        "regime_fiscale": "RF01",
+        "cod_eori": "IT09780071214"
+    }
+    causale = dati.get("causale") or f"Nota di credito Amazon centro {centro} a storno fattura {numero_fattura_collegata}"
+
+    # Dettaglio linee (importi POSITIVI – è TD04 a qualificare la NC)
+    dettaglio = []
+    for a in lines:
+        sku = (a.get("model_number") or "").strip()
+        asin = (a.get("asin") or "").strip()
+        ean = (a.get("ean") or "").strip() if a.get("ean") else None
+        descr = html.escape((a.get("title") or f"Articolo {sku}").strip(), quote=True)
+        codici = f"""
+          <CodiceArticolo><CodiceTipo>SKU</CodiceTipo><CodiceValore>{html.escape(sku, True)}</CodiceValore></CodiceArticolo>
+          {f'<CodiceArticolo><CodiceTipo>ASIN</CodiceTipo><CodiceValore>{html.escape(asin, True)}</CodiceValore></CodiceArticolo>' if asin else ''}
+          {f'<CodiceArticolo><CodiceTipo>EAN</CodiceTipo><CodiceValore>{html.escape(ean, True)}</CodiceValore></CodiceArticolo>' if ean else ''}
+        """.strip()
+        dettaglio.append(f"""
+        <DettaglioLinee>
+          <NumeroLinea>{int(a["line_no"])}</NumeroLinea>
+          {codici}
+          <Descrizione>{descr}</Descrizione>
+          <Quantita>{float(a["qty"]):.2f}</Quantita>
+          <PrezzoUnitario>{float(a["cost"]):.6f}</PrezzoUnitario>
+          <PrezzoTotale>{float(a["line_total"]):.2f}</PrezzoTotale>
+          <AliquotaIVA>22.00</AliquotaIVA>
+        </DettaglioLinee>
+        """.strip())
+    dettaglio_linee_xml = "\n".join(dettaglio)
+
+    # PO -> riferimenti linea
+    po_to_lines = defaultdict(list)
+    for a in lines:
+        po_to_lines[str(a.get("po_number") or "").strip()].append(int(a["line_no"]))
+    dati_ordini_xml = "\n".join(
+        f"<DatiOrdineAcquisto>\n" +
+        "\n".join(f"<RiferimentoNumeroLinea>{n}</RiferimentoNumeroLinea>" for n in nums) +
+        f"\n<IdDocumento>{html.escape(po, True)}</IdDocumento>\n</DatiOrdineAcquisto>"
+        for po, nums in po_to_lines.items() if po
+    )
+
+    # fattura collegata (obbligatorio per rejected invoice)
+    fatt_col = f"""
+    <DatiFattureCollegate>
+      <IdDocumento>{html.escape(str(numero_fattura_collegata), True)}</IdDocumento>
+    </DatiFattureCollegate>
+    """.strip()
+
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<p:FatturaElettronica xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:p="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" versione="FPR12" xsi:schemaLocation="http://ivaservizi.agenziaentrate.gov.it/docs/xsd/fatture/v1.2 fatturaordinaria_v1.2.xsd ">
+  <FatturaElettronicaHeader>
+    <DatiTrasmissione>
+      <IdTrasmittente><IdPaese>IT</IdPaese><IdCodice>{fornitore['piva']}</IdCodice></IdTrasmittente>
+      <ProgressivoInvio>{numero_nota}</ProgressivoInvio>
+      <FormatoTrasmissione>FPR12</FormatoTrasmissione>
+      <CodiceDestinatario>{intestatario['codice_destinatario']}</CodiceDestinatario>
+      <PECDestinatario>{intestatario['pec']}</PECDestinatario>
+    </DatiTrasmissione>
+    <CedentePrestatore>
+      <DatiAnagrafici>
+        <IdFiscaleIVA><IdPaese>IT</IdPaese><IdCodice>{fornitore['piva']}</IdCodice></IdFiscaleIVA>
+        <CodiceFiscale>{fornitore['codice_fiscale']}</CodiceFiscale>
+        <Anagrafica><Denominazione>{fornitore['denominazione']}</Denominazione><CodEORI>{fornitore['cod_eori']}</CodEORI></Anagrafica>
+        <RegimeFiscale>RF01</RegimeFiscale>
+      </DatiAnagrafici>
+      <Sede><Indirizzo>{fornitore['indirizzo']}</Indirizzo><CAP>{fornitore['cap']}</CAP><Comune>{fornitore['comune']}</Comune><Provincia>{fornitore['provincia']}</Provincia><Nazione>{fornitore['nazione']}</Nazione></Sede>
+    </CedentePrestatore>
+    <CessionarioCommittente>
+      <DatiAnagrafici>
+        <IdFiscaleIVA><IdPaese>IT</IdPaese><IdCodice>{intestatario['piva']}</IdCodice></IdFiscaleIVA>
+        <CodiceFiscale>{intestatario['piva']}</CodiceFiscale>
+        <Anagrafica><Denominazione>{intestatario['denominazione']}</Denominazione></Anagrafica>
+      </DatiAnagrafici>
+      <Sede><Indirizzo>{intestatario['indirizzo']}</Indirizzo><NumeroCivico>{intestatario['numero_civico']}</NumeroCivico><CAP>{intestatario['cap']}</CAP><Comune>{intestatario['comune']}</Comune><Provincia>{intestatario['provincia']}</Provincia><Nazione>{intestatario['nazione']}</Nazione></Sede>
+    </CessionarioCommittente>
+  </FatturaElettronicaHeader>
+
+  <FatturaElettronicaBody>
+    <DatiGenerali>
+      <DatiGeneraliDocumento>
+        <TipoDocumento>TD04</TipoDocumento>
+        <Divisa>EUR</Divisa>
+        <Data>{data_nota}</Data>
+        <Numero>{numero_nota}</Numero>
+        <ImportoTotaleDocumento>{totale}</ImportoTotaleDocumento>
+        <Causale>{html.escape(causale, True)}</Causale>
+      </DatiGeneraliDocumento>
+      {dati_ordini_xml}
+      {fatt_col}
+    </DatiGenerali>
+
+    <DatiBeniServizi>
+      {dettaglio_linee_xml}
+      <DatiRiepilogo>
+        <AliquotaIVA>22.00</AliquotaIVA>
+        <ImponibileImporto>{imponibile}</ImponibileImporto>
+        <Imposta>{iva}</Imposta>
+        <EsigibilitaIVA>I</EsigibilitaIVA>
+        <RiferimentoNormativo>Iva 22% vendite</RiferimentoNormativo>
+      </DatiRiepilogo>
+    </DatiBeniServizi>
+
+    <DatiPagamento>
+      <CondizioniPagamento>TP02</CondizioniPagamento>
+      <DettaglioPagamento>
+        <ModalitaPagamento>MP05</ModalitaPagamento>
+        <DataScadenzaPagamento>{data_nota}</DataScadenzaPagamento>
+        <ImportoPagamento>{totale}</ImportoPagamento>
+      </DettaglioPagamento>
+    </DatiPagamento>
+  </FatturaElettronicaBody>
+</p:FatturaElettronica>"""
+    return "\n".join(line.strip() for line in xml.splitlines() if line.strip())
+
+
+# ========= NUOVO: PROCESSOR JOB 'genera_nota_credito_da_fattura' =========
+def process_genera_nota_credito_da_fattura_job(job: Dict[str, Any]) -> None:
+    try:
+        supabase.table("jobs").update({
+            "status": "in_progress",
+            "started_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job["id"]).execute()
+
+        payload = job["payload"]
+        fattura_id = payload["fattura_id"]
+        centro = payload["centro"]
+        start_delivery = payload["start_delivery"]
+        po_list = payload["po_list"] or []
+        numero_fattura_collegata = payload["numero_fattura_collegata"]
+        causale = payload.get("motive") or f"Storno fattura {numero_fattura_collegata}"
+
+        # carico righe della fattura dalle stesse sorgenti della fattura: ordini_vendor_items (solo confermati)
+        res = supabase.table("ordini_vendor_items") \
+            .select("*") \
+            .in_("po_number", po_list) \
+            .eq("fulfillment_center", centro) \
+            .eq("start_delivery", start_delivery) \
+            .execute()
+        items = res.data or []
+        rows = [a for a in items if (isinstance(a.get("qty_confirmed"), (int, float)) and float(a["qty_confirmed"]) > 0)]
+        if not rows:
+            raise Exception("Nessuna riga confermata trovata per generare la nota di credito.")
+
+        # costruisco lines (storno totale: stessa qty_confirmed e cost della fattura)
+        lines = []
+        imponibile = 0.0
+        for i, a in enumerate(sorted(rows, key=lambda x: (x.get("po_number") or "", x.get("model_number") or "")), start=1):
+            qty = float(a.get("qty_confirmed") or 0)
+            cost = float(a.get("cost") or 0.0)
+            line_total = round(qty * cost, 2)
+            imponibile += line_total
+            lines.append({
+                "line_no": i,
+                "po_number": a.get("po_number"),
+                "model_number": a.get("model_number"),
+                "asin": a.get("asin"),
+                "ean": a.get("vendor_product_id"),
+                "title": a.get("title"),
+                "qty": qty,
+                "cost": cost,
+                "line_total": line_total
+            })
+
+        imponibile = round(imponibile, 2)
+        iva = round(imponibile * 0.22, 2)
+        totale = round(imponibile + iva, 2)
+
+        data_nota = datetime.now(timezone.utc).date().isoformat()
+        numero_nota = genera_numero_nota_credito(supabase)
+
+        xml_nc = generate_sdi_nc_da_fattura_xml({
+            "centro": centro,
+            "data_nota": data_nota,
+            "numero_nota": numero_nota,
+            "causale": causale,
+            "numero_fattura_collegata": numero_fattura_collegata,
+            "po_list": po_list,
+            "lines": lines,
+            "imponibile": imponibile,
+            "iva": iva,
+            "totale": totale
+        })
+
+        # upload XML su storage
+        bucket = "notecredito"
+        filename = f"nc/{numero_nota}_{centro}_{start_delivery}.xml"
+        up = supabase.storage.from_(bucket).upload(filename, xml_nc.encode("utf-8"),
+                                                   {"content-type": "application/xml", "upsert": "true"})
+        if hasattr(up, "error") and up.error:
+            raise Exception(f"Errore upload XML NC: {up.error}")
+        xml_url = f"{bucket}/{filename}"
+
+        # salva su tabella notecredito (creane una dedicata se non l'hai già: es. 'notecredito_amazon_fattura')
+        supabase.table("notecredito_amazon_fattura").insert({
+            "data_nota": data_nota,
+            "numero_nota": numero_nota,
+            "centro": centro,
+            "start_delivery": start_delivery,
+            "po_list": po_list,
+            "totale": totale,
+            "imponibile": imponibile,
+            "xml_url": xml_url,
+            "stato": "pronta",
+            "fattura_id": fattura_id,
+            "fattura_numero": numero_fattura_collegata,
+            "job_id": job["id"],
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+
+        supabase.table("jobs").update({
+            "status": "done",
+            "result": {"numero_nota": numero_nota, "xml_url": xml_url},
+            "finished_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job["id"]).execute()
+
+        print(f"[worker] Nota di credito generata da fattura {numero_fattura_collegata}: {numero_nota}", flush=True)
+
+    except Exception as e:
+        print("[worker] ERRORE NC da fattura!", e, flush=True)
+        supabase.table("jobs").update({
+            "status": "failed",
+            "error": str(e),
+            "stacktrace": traceback.format_exc(),
+            "finished_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job["id"]).execute()
+
+
+
+
+
+
+
+
 # -----------------------
 # MAIN LOOP
 # -----------------------
 
 def main_loop():
     print("WORKER AVVIATO - SONO IL VERO WORKER!", flush=True)
+    sleep_s = 5          # parte reattivo
+    MAX_SLEEP = 120       # massimo 120s a vuoto
     while True:
         try:
-            jobs = supabase.table("jobs").select("*").eq("status", "pending").execute().data
-            print(f"[worker] Trovati {len(jobs)} job pending", flush=True)
-            if not jobs:
-                time.sleep(5)
+            # 1) Check leggero: HEAD con count per evitare di scaricare righe
+            head = supabase.table("jobs") \
+                .select("id", count="exact", head=True) \
+                .eq("status", "pending") \
+                .execute()
+            pending = getattr(head, "count", 0) or 0
+
+            if pending == 0:
+                # niente da fare -> backoff
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 2, MAX_SLEEP)
                 continue
 
+            # c'è lavoro -> torna reattivo
+            sleep_s = 5
+
+            # 2) Preleva un batch di pending (limita per non saturare)
+            jobs = supabase.table("jobs") \
+                .select("*") \
+                .eq("status", "pending") \
+                .limit(25) \
+                .execute().data or []
+
             for job in jobs:
-                print(f"[worker] Processo job {job['id']} ({job['type']})...", flush=True)
+                print(f"[worker] Processo job {job['id']} ({job.get('type')})...", flush=True)
                 jtype = job.get("type")
                 if jtype == "import_vendor_orders":
                     process_import_vendor_orders_job(job)
@@ -1020,9 +1319,14 @@ def main_loop():
                     process_genera_fattura_amazon_vendor_job(job)
                 elif jtype == "genera_notecredito_amazon_reso":
                     process_genera_notecredito_amazon_reso_job(job)
+                elif jtype == "genera_nota_credito_da_fattura":
+                    process_genera_nota_credito_da_fattura_job(job)
                 else:
                     print(f"[worker] Tipo job non gestito: {jtype}", flush=True)
+
+            # piccolo respiro tra batch
             time.sleep(1)
+
         except Exception as loop_err:
             print("[worker] ERRORE nel loop principale:", loop_err, flush=True)
             time.sleep(5)

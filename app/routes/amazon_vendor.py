@@ -56,32 +56,53 @@ bp = Blueprint('amazon_vendor', __name__)
 # -----------------------------------------------------------------------------
 # Helper: retry uniforme per chiamate Supabase
 # -----------------------------------------------------------------------------
-def supa_with_retry(builder_fn, retries=3, delay=0.7, backoff=1.5):
+# amazon_vendor.py
+
+from app import supabase_client
+
+# includo anche alcune eccezioni comuni di rete
+_RETRYABLE_EXC = (
+   httpx.RemoteProtocolError,
+   httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+   httpx.ConnectError, httpx.ReadError, httpx.ProtocolError,
+   httpx.TransportError, httpx.RequestError,
+)
+
+def supa_with_retry(builder_fn, retries=6, delay=0.5, backoff=2.0):
     """
-    Esegue una operazione Supabase con retry ed exponential backoff + jitter.
-    builder_fn: lambda che RITORNA un builder (su cui chiameremo .execute()) oppure
-                un oggetto che ha già .execute() invocato e quindi contiene .data.
-    Ritorna l'oggetto risposta di Supabase (con attributo .data).
+    Esegue una operazione Supabase con retry + exponential backoff + jitter.
+    - Se avvengono disconnessioni consecutive, il client httpx viene ricreato
+      automaticamente dal modulo supabase_client.
+    - Su esito positivo, azzera il contatore di disconnessioni.
     """
     last_ex = None
     cur_delay = delay
+
     for attempt in range(1, retries + 1):
         try:
             builder = builder_fn()
-            if hasattr(builder, "execute"):
-                return builder.execute()
-            return builder
-        except httpx.RemoteProtocolError as ex:
+            # compat: o ritorna un builder con .execute() oppure un risultato già eseguito
+            res = builder.execute() if hasattr(builder, "execute") else builder
+            supabase_client.note_success()  # ✅ ok: azzera contatore consecutivi
+            return res
+
+        except _RETRYABLE_EXC as ex:
             last_ex = ex
-            logging.warning(f"[supa_with_retry] RemoteProtocolError tentativo {attempt}/{retries}: {ex}")
+            logging.warning(f"[supa_with_retry] tentativo {attempt}/{retries} — rete/protocollo: {ex}")
+            # segnala il disconnect e lascia che il modulo decida se resettare la sessione
+            supabase_client.note_disconnect_and_maybe_reset()
+
         except Exception as ex:
+            # altri errori (es. validazione): ritentiamo comunque (alcuni sono transient)
             last_ex = ex
-            logging.warning(f"[supa_with_retry] Errore supabase tentativo {attempt}/{retries}: {ex}")
+            logging.warning(f"[supa_with_retry] tentativo {attempt}/{retries} — errore generico: {ex}")
+
         if attempt < retries:
-            # jitter leggero per evitare thundering herd
-            sleep_for = cur_delay * (1.0 + random.uniform(0.0, 0.2))
-            time.sleep(sleep_for)
+            # exponential backoff con jitter leggero
+            time.sleep(cur_delay * (1.0 + random.uniform(0.0, 0.2)))
             cur_delay *= backoff
+
+    # esauriti i tentativi
     raise last_ex
 
 # Helper esecuzione con paginazione "elastica" per builder finti dei test
@@ -1863,12 +1884,14 @@ def log_movimenti_produzione_bulk(rows, utente, motivo):
 @bp.route('/api/prelievi/date-importabili', methods=['GET'])
 def date_importabili_prelievo():
     try:
-        res = sb_table("ordini_vendor_riepilogo")\
-            .select("start_delivery")\
-            .eq("stato_ordine", "nuovo")\
-            .order("start_delivery")\
+        res = supa_with_retry(lambda: (
+            sb_table("ordini_vendor_riepilogo")
+            .select("start_delivery")
+            .eq("stato_ordine", "nuovo")
+            .order("start_delivery")
             .execute()
-        date_set = sorted(list(set(r["start_delivery"] for r in res.data)))
+        ))
+        date_set = sorted({r["start_delivery"] for r in (res.data or [])})
         return jsonify(date_set)
     except Exception as ex:
         logging.exception("Errore in date_importabili_prelievo")
@@ -1886,12 +1909,16 @@ def importa_prelievi():
 
         supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").delete().eq("start_delivery", data).execute())
 
-        items = sb_table("ordini_vendor_items").select("*").eq("start_delivery", data).execute().data
-        riepiloghi = sb_table("ordini_vendor_riepilogo")\
-            .select("fulfillment_center,start_delivery,stato_ordine")\
-            .eq("start_delivery", data)\
-            .eq("stato_ordine", "nuovo")\
-            .execute().data
+        items = supa_with_retry(lambda: (
+            sb_table("ordini_vendor_items").select("*").eq("start_delivery", data).execute()
+        )).data
+        riepiloghi = supa_with_retry(lambda: (
+            sb_table("ordini_vendor_riepilogo")
+            .select("fulfillment_center,start_delivery,stato_ordine")
+            .eq("start_delivery", data)
+            .eq("stato_ordine", "nuovo")
+            .execute()
+        )).data
 
         centri_validi = set((r["fulfillment_center"], str(r["start_delivery"])) for r in riepiloghi)
         articoli = [i for i in items if (i["fulfillment_center"], str(i["start_delivery"])) in centri_validi]
@@ -1967,7 +1994,7 @@ def lista_prelievi():
         if search:
             query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
         query = query.order("radice").order("sku")
-        prelievi = query.execute().data
+        prelievi = supa_with_retry(lambda: query.execute()).data
         return jsonify(prelievi)
     except Exception as ex:
         logging.exception("[lista_prelievi] Errore in GET prelievi")
@@ -2003,12 +2030,13 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         BATCH = 200
         for i in range(0, len(mov_rows), BATCH):
             try:
-                sb_table("movimenti_produzione_vendor").insert(mov_rows[i:i + BATCH]).execute()
+                supa_with_retry(lambda rows=mov_rows[i:i + BATCH]: (
+                    sb_table("movimenti_produzione_vendor").insert(rows).execute()
+                ))
             except Exception as ex:
                 logging.error(f"[sync_produzione] Errore insert movimenti_produzione_vendor: {ex}")
-
     tutte = [
-        r for r in sb_table("produzione_vendor").select("*").execute().data
+        r for r in supa_with_retry(lambda: sb_table("produzione_vendor").select("*").execute()).data
         if r["stato_produzione"] != "Rimossi"
     ]
 
@@ -2126,20 +2154,26 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         BATCH = 100
         for i in range(0, len(ids_cleanup), BATCH):
             try:
-                sb_table("produzione_vendor").delete().in_("id", ids_cleanup[i:i + BATCH]).execute()
+                supa_with_retry(lambda batch=ids_cleanup[i:i + BATCH]: (
+                    sb_table("produzione_vendor").delete().in_("id", batch).execute()
+                ))
             except Exception as ex:
                 logging.error(f"[sync_produzione] Errore delete cleanup produzione_vendor: {ex}")
 
     for id_del in to_delete:
         try:
-            sb_table("produzione_vendor").delete().eq("id", id_del).execute()
+            supa_with_retry(lambda _id=id_del: (
+                sb_table("produzione_vendor").delete().eq("id", _id).execute()
+            ))
         except Exception as ex:
             logging.error(f"[sync_produzione] Errore delete produzione_vendor id={id_del}: {ex}")
 
     for row in to_update:
         id_val = row.pop("id")
         try:
-            sb_table("produzione_vendor").update(row).eq("id", id_val).execute()
+            supa_with_retry(lambda r=row, _id=id_val: (
+                sb_table("produzione_vendor").update(r).eq("id", _id).execute()
+            ))
         except Exception as ex:
             logging.error(f"[sync_produzione] Errore update produzione_vendor id={id_val}: {ex}")
 
@@ -2148,7 +2182,9 @@ def sync_produzione(prelievi_modificati, utente="operatore", motivo="Modifica pr
         for i in range(0, len(to_insert), BATCH):
             batch = to_insert[i:i + BATCH]
             try:
-                inserted = sb_table("produzione_vendor").insert(batch).execute().data
+                inserted = supa_with_retry(lambda b=batch: (
+                    sb_table("produzione_vendor").insert(b).execute()
+                )).data
                 for irow in inserted or []:
                     log_other.append(dict(
                         produzione_row=irow,
@@ -2190,7 +2226,9 @@ def patch_prelievo(id):
             fields["note"] = note.strip()
 
         if "riscontro" in data:
-            prelievo = sb_table("prelievi_ordini_amazon").select("qty").eq("id", id).single().execute().data
+            prelievo = supa_with_retry(lambda: (
+                sb_table("prelievi_ordini_amazon").select("qty").eq("id", id).single().execute()
+            )).data
             if not prelievo:
                 return jsonify({"error": "Prelievo non trovato"}), 404
             qty = prelievo["qty"]
@@ -2212,7 +2250,9 @@ def patch_prelievo(id):
 
         supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(fields).eq("id", id))
 
-        prelievo = sb_table("prelievi_ordini_amazon").select("*").eq("id", id).single().execute().data
+        prelievo = supa_with_retry(lambda: (
+            sb_table("prelievi_ordini_amazon").select("*").eq("id", id).single().execute()
+        )).data
         if not prelievo:
             return jsonify({"error": "Prelievo non trovato dopo update"}), 404
 
@@ -2253,7 +2293,9 @@ def patch_prelievi_bulk():
         stato_per_id = {}
         if "riscontro" in update_fields:
             riscontro_val = update_fields["riscontro"]
-            prelievi = sb_table("prelievi_ordini_amazon").select("id,qty").in_("id", ids).execute().data
+            prelievi = supa_with_retry(lambda: (
+                sb_table("prelievi_ordini_amazon").select("id,qty").in_("id", ids).execute()
+            )).data
             for p in prelievi:
                 qty = p["qty"]
                 if riscontro_val is None:
@@ -2277,7 +2319,9 @@ def patch_prelievi_bulk():
         else:
             supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(update_fields).in_("id", ids))
 
-        prelievi_full = sb_table("prelievi_ordini_amazon").select("*").in_("id", ids).execute().data
+        prelievi_full = supa_with_retry(lambda: (
+            sb_table("prelievi_ordini_amazon").select("*").in_("id", ids).execute()
+        )).data
         sync_produzione(prelievi_full, utente="operatore", motivo="Patch bulk prelievi")
         return jsonify({"ok": True, "updated_count": len(ids)})
     except Exception as ex:
@@ -2302,9 +2346,12 @@ def lista_produzione():
         if search:
             query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
         query = query.order("start_delivery").order("sku")
-        rows = query.execute().data
+        rows = supa_with_retry(lambda: query.execute()).data
 
-        all_rows = sb_table("produzione_vendor").select("stato_produzione,radice").execute().data
+
+        all_rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("stato_produzione,radice").execute()
+        )).data
 
         badge_stati = {}
         badge_radici = {}
@@ -2334,7 +2381,9 @@ def patch_produzione(id):
         fields = {}
         utente = "operatore"
 
-        old = sb_table("produzione_vendor").select("*").eq("id", id).single().execute().data
+        old = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").eq("id", id).single().execute()
+        )).data
         if not old:
             return jsonify({"error": "Produzione non trovata"}), 404
 
@@ -2401,7 +2450,9 @@ def patch_produzione_bulk():
             return jsonify({"error": "Nessun id/campo"}), 400
 
         utente = "operatore"
-        rows = sb_table("produzione_vendor").select("*").in_("id", ids).execute().data
+        rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").in_("id", ids).execute()
+        )).data
         logs = []
         for r in rows:
             if "stato_produzione" in update_fields and update_fields["stato_produzione"] != r["stato_produzione"]:
@@ -2445,7 +2496,9 @@ def patch_produzione_bulk():
 @bp.route('/api/produzione/<int:id>', methods=['GET'])
 def get_produzione_by_id(id):
     try:
-        res = sb_table("produzione_vendor").select("*").eq("id", id).single().execute()
+        res = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").eq("id", id).single().execute()
+        ))
         return jsonify(res.data)
     except Exception as ex:
         logging.exception(f"[get_produzione_by_id] Errore GET produzione ID {id}")
@@ -2457,11 +2510,13 @@ def get_produzione_by_id(id):
 @bp.route('/api/produzione/<int:id>/log', methods=['GET'])
 def get_log_movimenti(id):
     try:
-        logs = sb_table("movimenti_produzione_vendor")\
-            .select("*")\
-            .eq("produzione_id", id)\
-            .order("created_at", desc=True)\
-            .execute().data
+        logs = supa_with_retry(lambda: (
+            sb_table("movimenti_produzione_vendor")
+            .select("*")
+            .eq("produzione_id", id)
+            .order("created_at", desc=True)
+            .execute()
+        )).data
         return jsonify(logs)
     except Exception as ex:
         logging.exception(f"[get_log_movimenti] Errore GET log movimenti produzione {id}")
@@ -2480,12 +2535,16 @@ def delete_produzione_bulk():
         BATCH_SIZE = 100
         for i in range(0, len(ids), BATCH_SIZE):
             batch_ids = ids[i:i + BATCH_SIZE]
-            sb_table("movimenti_produzione_vendor").delete().in_("produzione_id", batch_ids).execute()
+            supa_with_retry(lambda ids=batch_ids: (
+                sb_table("movimenti_produzione_vendor").delete().in_("produzione_id", ids).execute()
+            ))
             time.sleep(0.05)
 
         for i in range(0, len(ids), BATCH_SIZE):
             batch_ids = ids[i:i + BATCH_SIZE]
-            sb_table("produzione_vendor").delete().in_("id", batch_ids).execute()
+            supa_with_retry(lambda ids=batch_ids: (
+                sb_table("produzione_vendor").delete().in_("id", ids).execute()
+            ))
             time.sleep(0.05)
 
         return jsonify({"ok": True, "deleted_count": len(ids)})
@@ -2499,7 +2558,9 @@ def delete_produzione_bulk():
 @bp.route('/api/prelievi/svuota', methods=['DELETE'])
 def svuota_prelievi():
     try:
-        sb_table("prelievi_ordini_amazon").delete().neq("id", 0).execute()
+        supa_with_retry(lambda: (
+            sb_table("prelievi_ordini_amazon").delete().neq("id", 0).execute()
+        ))
         return jsonify({"ok": True})
     except Exception as ex:
         logging.exception("[svuota_prelievi] Errore DELETE svuota prelievi")
@@ -2517,8 +2578,12 @@ def pulisci_da_stampare_endpoint():
                 (x.get("ean") or "").strip().lower().replace(" ", "")
             )
 
-        produzione = sb_table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute().data
-        prelievi = sb_table("prelievi_ordini_amazon").select("sku,ean,start_delivery").execute().data
+        produzione = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute()
+        )).data
+        prelievi = supa_with_retry(lambda: (
+            sb_table("prelievi_ordini_amazon").select("sku,ean,start_delivery").execute()
+        )).data
 
         max_data_per_sku_ean = defaultdict(str)
         for p in prelievi:
@@ -2537,13 +2602,17 @@ def pulisci_da_stampare_endpoint():
                 ids_da_eliminare.append(r["id"])
 
         if ids_da_eliminare:
-            rows_log = sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute().data
+            rows_log = supa_with_retry(lambda: (
+                sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute()
+            )).data
             for riga in rows_log:
                 log_movimento_produzione(
                     riga, utente="operatore",
                     motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)"
                 )
-            sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+            ))
 
         return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
     except Exception as ex:
@@ -2571,14 +2640,16 @@ def pulisci_da_stampare_parziale():
             produzione_query = produzione_query.in_("prelievo_id", ids)
         elif radice:
             produzione_query = produzione_query.eq("radice", radice)
-        produzione = produzione_query.eq("stato_produzione", "Da Stampare").execute().data
+        produzione = supa_with_retry(lambda: (
+            produzione_query.eq("stato_produzione", "Da Stampare").execute()
+        )).data
 
         prelievi_query = sb_table("prelievi_ordini_amazon").select("id,sku,ean,start_delivery")
         if ids:
             prelievi_query = prelievi_query.in_("id", ids)
         elif radice:
             prelievi_query = prelievi_query.eq("radice", radice)
-        prelievi = prelievi_query.execute().data
+        prelievi = supa_with_retry(lambda: prelievi_query.execute()).data
 
         max_data_per_sku_ean = defaultdict(str)
         for p in prelievi:
@@ -2597,13 +2668,17 @@ def pulisci_da_stampare_parziale():
                 ids_da_eliminare.append(r["id"])
 
         if ids_da_eliminare:
-            rows_log = sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute().data
+            rows_log = supa_with_retry(lambda: (
+                sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute()
+            )).data
             for riga in rows_log:
                 log_movimento_produzione(
                     riga, utente="operatore",
                     motivo="Auto-eliminazione da pulizia parziale prelievo"
                 )
-            sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+            ))
 
         return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
     except Exception as ex:
