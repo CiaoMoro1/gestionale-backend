@@ -1095,13 +1095,13 @@ def conferma_chiudi_ordine():
             totali_sku[r["model_number"]] += int(r["quantita"])
 
         for model_number, qty in totali_sku.items():
-            supa_with_retry(lambda mn=model_number, q=qty:
+            supa_with_retry(lambda mn=model_number, q=qty: (
                 sb_table("ordini_vendor_items")
                 .update({"qty_confirmed": q})
                 .in_("po_number", po_list)
                 .eq("model_number", mn)
                 .execute()
-            )
+            ))
 
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_riepilogo")
@@ -2732,52 +2732,92 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
     # 4) Spostamenti tramite RPC (atomici, con lock)
     for sku, need in list(to_move_sku.items()):
-        if need <= 0: continue
+        if need <= 0:
+            continue
 
-        eans_for_sku = sorted(
-            [ean for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
-            key=lambda e: parziale_exact_curr.get((sku, e), 0),
-            reverse=True
-        )
+        need_initial = int(need)
+        moved_for_sku = 0
 
-        ordered_candidates = []
-        for e in eans_for_sku:
-            ordered_candidates.extend(rows_by_exact.get((sku, e), []))
-        already_ids = {r["id"] for r in ordered_candidates}
-        ordered_candidates.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids])
+        # Riprova più volte ricaricando i candidati (stato si muove durante le RPC)
+        # 3 pass sono più che sufficienti per coprire i casi reali
+        for _pass in range(3):
+            if need <= 0:
+                break
 
-        for r in ordered_candidates:
-            if need <= 0: break
-            avail = int(r.get("da_produrre") or 0)
-            if avail <= 0: continue
+            # (ri)costruisci i candidati aggiornati
+            rows_all = supa_with_retry(lambda: (
+                sb_table("produzione_vendor")
+                .select("*")
+                .eq("sku", sku)
+                .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi"])
+                .execute()
+            )).data or []
 
-            take = min(avail, need)
+            rows_by_sku, rows_by_exact = {}, {}
+            for r in rows_all:
+                sku_r = r.get("sku"); ean_r = (r.get("ean") or "")
+                rows_by_sku.setdefault(sku_r, []).append(r)
+                rows_by_exact.setdefault((sku_r, ean_r), []).append(r)
 
-            try:
-                payload = {
-                    "p_from_id": int(r["id"]),   # <-- forza bigint
-                    "p_to_state": "Trasferito",  # <-- text esatto
-                    "p_qty": int(take),          # <-- forza integer
-                    "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
-                }
-                supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
+            def _priority(row):
+                same_date = 0 if str(row.get("start_delivery") or "")[:10] == str(start_delivery)[:10] else 1
+                st_i = stato_index.get(row.get("stato_produzione"), 999)
+                dt = str(row.get("start_delivery") or "")
+                return (same_date, st_i, dt)
 
-                report["moved"] += take
-                need -= take
+            for k in rows_by_sku: rows_by_sku[k].sort(key=_priority)
+            for k in rows_by_exact: rows_by_exact[k].sort(key=_priority)
 
-            except Exception as ex:
-                logging.warning(
-                    "[move_to_trasferito] fallimento sku=%s take=%s payload=%s err=%s",
-                    sku, take, payload, ex
-                )
-                report["failures"].append({"sku": sku, "take": int(take), "error": str(ex)})
-                # non decremento need: magari le prossime righe coprono
-                
+            # ordina prima per exact (EAN) in base al parziale, poi per SKU
+            eans_for_sku = sorted(
+                [ean for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
+                key=lambda e: parziale_exact_curr.get((sku, e), 0),
+                reverse=True
+            )
+            ordered_candidates = []
+            for e in eans_for_sku:
+                ordered_candidates.extend(rows_by_exact.get((sku, e), []))
+            already_ids = {r["id"] for r in ordered_candidates}
+            ordered_candidates.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids])
+
+            # tenta i candidati aggiornati
+            for r in ordered_candidates:
+                if need <= 0:
+                    break
+                avail = int(r.get("da_produrre") or 0)
+                if avail <= 0:
+                    continue
+
+                take = min(avail, need)
+                try:
+                    payload = {
+                        "p_from_id": int(r["id"]),
+                        "p_to_state": "Trasferito",
+                        "p_qty": int(take),
+                        "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
+                    }
+                    supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
+                    report["moved"] += take
+                    moved_for_sku += take
+                    need -= take
+                except Exception as ex:
+                    logging.warning(
+                        "[move_to_trasferito] fallimento sku=%s take=%s payload=%s err=%s",
+                        sku, take, payload, ex
+                    )
+                    report["failures"].append({"sku": sku, "take": int(take), "error": str(ex)})
+                    # non decremento need: si prova il prossimo candidato
+
+        # se ancora resta bisogno, spiega bene cosa è rimasto e perché
         if need > 0:
             report["failures"].append({
                 "sku": sku,
                 "missing": int(need),
-                "error": "residuo non spostabile ora (resta in stati attivi o coperto da riscontro)"
+                "need_initial": int(need_initial),
+                "moved_for_sku": int(moved_for_sku),
+                "sum_parz_prec_sku": int(sum_parz_prec_sku.get(sku, 0)),
+                "riscontro_totale": int(riscontro_sku.get(sku, 0)),
+                "note": "residuo non spostabile ora (resta in stati attivi o coperto da riscontro, o candidati esauriti)"
             })
 
     return report
