@@ -2698,7 +2698,8 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     to_move_sku = {}
     for sku, q_curr in parziale_sku_curr.items():
         residuo_riscontro = max(0, riscontro_sku.get(sku, 0) - sum_parz_prec_sku.get(sku, 0))
-        to_move_sku[sku] = max(0, q_curr - residuo_riscontro)
+        to_move_sku[sku] = max(0, q_curr)
+
 
     # 3) Righe produzione "attive"
     stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
