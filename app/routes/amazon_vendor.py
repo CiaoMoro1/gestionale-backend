@@ -2649,9 +2649,9 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     # ---- Parziali precedenti (ordinati per created_at) ----
     parziali_prec_all = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("dati, confermato, created_at")
+        .select("numero_parziale,dati,confermato,created_at")
         .eq("riepilogo_id", riepilogo_id)
-        .order("created_at", asc=True)
+        .order("created_at", desc=False)  # asc=True  -> desc=False
         .execute()
     )).data or []
 
