@@ -22,6 +22,11 @@ from barcode.writer import ImageWriter
 
 from app.supabase_client import supabase
 
+# === USER LABEL HELPERS (aggiungi dopo gli import) ===
+from flask import request
+
+from datetime import timedelta
+
 def _coalesce_logs(logs, window_seconds=3):
     """
     Deduplica i trigger tecnici a ridosso di un'azione umana.
@@ -186,33 +191,6 @@ def exec_range_or_limit(query_builder, offset=None, limit=None):
     except Exception:
         return query_builder  # ultima spiaggia, lascia gestire a supa_with_retry
 
-
-
-def enqueue_job(job_type: str, payload: dict) -> None:
-    """Enqueue con dedup: un solo job per (center,data,numero_parziale)."""
-    try:
-        if os.getenv("ENQUEUE_MOVE_FAIL_JOBS", "0") not in ("1", "true", "TRUE"):
-            # flag spento: non creare job
-            return
-        center = str(payload.get("center") or "")
-        start_delivery = str(payload.get("start_delivery") or "")
-        numero_parziale = str(payload.get("numero_parziale") or "")
-        dedup_key = f"{job_type}|{center}|{start_delivery}|{numero_parziale}"
-
-        job = {
-            "type": job_type,
-            "status": "pending",
-            "payload": payload,
-            "dedup_key": dedup_key,               # <— serve un unique index su public.jobs(dedup_key)
-            "attempts": 0,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        # upsert by dedup_key: se esiste, NON duplicare
-        supa_with_retry(lambda: sb_table("jobs").upsert(job, on_conflict="dedup_key").execute())
-    except Exception as ex:
-        logging.warning("[enqueue_job] enqueue fallita: %s", ex)
-
-
 # -----------------------------------------------------------------------------
 # Utilità varie
 # -----------------------------------------------------------------------------
@@ -301,10 +279,12 @@ def get_all_items_by_po(po_list):
 
 
 def estrai_radice(sku: str) -> str:
-    """Primo token prima del primo '-' in upper (coerente con DB)."""
     if not sku:
         return ""
-    return sku.split("-")[0].strip().upper()
+    parts = [p.strip() for p in sku.split("-") if p.strip()]
+    if not parts:
+        return ""
+    return parts[1] if parts[0].upper() == "MZ" and len(parts) > 1 else parts[0]
 
 # -----------------------------------------------------------------------------
 # Autocomplete prodotti (SKU/EAN) con ; come token esatto
@@ -444,6 +424,7 @@ def sync_produzione_from_prelievo(prelievo_id):
             "qty": qty,
             "riscontro": riscontro,
             "plus": plus,
+            "radice": estrai_radice(prelievo.get("sku")),  # <-- invece di prelievo.get("radice")
             "start_delivery": prelievo.get("start_delivery"),
             "stato": stato,
             "stato_produzione": "Da Stampare",
@@ -500,7 +481,7 @@ def upload_vendor_orders():
             "status": "pending",
             "user_id": user_id,
             "created_at": (datetime.now(timezone.utc)).isoformat()
-        }]).execute())
+        }]))
         job_id = job_res.data[0]['id'] if job_res.data else None
 
         return jsonify({"job_id": job_id}), 201
@@ -701,8 +682,7 @@ def save_parziale():
             "last_modified_at": (datetime.now(timezone.utc)).isoformat()
         }
         supa_with_retry(lambda: sb_table("ordini_vendor_parziali")
-                        .upsert(parziale, on_conflict="riepilogo_id,numero_parziale")
-                        .execute())
+                        .upsert(parziale, on_conflict="riepilogo_id,numero_parziale"))
 
         return jsonify({"ok": True, "numero_parziale": max_num})
     except Exception as ex:
@@ -751,7 +731,7 @@ def post_parziali_riepilogo(riepilogo_id):
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
             .upsert(parziale_data, on_conflict="riepilogo_id,numero_parziale")
-        ).execute())
+        ))
         return jsonify({"ok": True})
     except Exception as ex:
         logging.exception("Errore patch parziali riepilogo")
@@ -926,7 +906,7 @@ def save_parziali_wip():
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
             .upsert(parziale_data, on_conflict="riepilogo_id,numero_parziale")
-        ).execute())
+        ))
         return jsonify({"ok": True, "numero_parziale": numero_parziale})
     except Exception as ex:
         logging.exception("[save_parziali_wip] Errore salvataggio parziali wip")
@@ -938,12 +918,11 @@ def save_parziali_wip():
 @bp.route('/api/amazon/vendor/parziali-wip/conferma-parziale', methods=['POST'])
 def conferma_parziale():
     try:
-        center = (request.json.get("center") or "").strip()
-        start_delivery = (request.json.get("data") or "").strip()
+        center = request.json.get("center")
+        start_delivery = request.json.get("data")
         if not center or not start_delivery:
             return jsonify({"error": "center/data richiesti"}), 400
 
-        # 1) Trova riepilogo
         rres = supa_with_retry(lambda: (
             sb_table("ordini_vendor_riepilogo")
             .select("id")
@@ -951,12 +930,16 @@ def conferma_parziale():
             .eq("start_delivery", start_delivery)
             .execute()
         ))
-        rows = rres.data or []
+        rows = rres.data
         if not rows:
             return jsonify({"error": "riepilogo non trovato"}), 400
-        riepilogo_id = rows[0]["id"] if isinstance(rows, list) else rows.get("id")
 
-        # 2) Ultimo parziale non confermato
+        # gestisci sia lista che dict
+        if isinstance(rows, list):
+            riepilogo_id = rows[0]["id"]
+        else:
+            riepilogo_id = rows.get("id")
+
         pres = supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
             .select("*")
@@ -968,18 +951,16 @@ def conferma_parziale():
         ))
         if not pres.data:
             return jsonify({"error": "nessun parziale da confermare"}), 400
+
         num_parz = pres.data[0]["numero_parziale"]
 
-        # 3) Conferma quel parziale (idempotente)  ✅ .execute() OBBLIGATORIO
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
             .update({"confermato": True})
             .eq("riepilogo_id", riepilogo_id)
             .eq("numero_parziale", num_parz)
-            .execute()
         ))
 
-        # 4) Stato ordine -> parziale (idempotente)
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_riepilogo")
             .update({"stato_ordine": "parziale"})
@@ -987,7 +968,7 @@ def conferma_parziale():
             .execute()
         ))
 
-        # 5) Double-check (tollerante array/single)
+        # ricontrolla lo stato — gestisci sia dict che [dict]
         check_r = supa_with_retry(lambda: (
             sb_table("ordini_vendor_riepilogo")
             .select("stato_ordine")
@@ -1001,33 +982,14 @@ def conferma_parziale():
         if not _d or _d.get("stato_ordine") != "parziale":
             logging.error("[conferma_parziale] Stato ordine NON aggiornato a 'parziale'!")
             return jsonify({"error": "Stato ordine non aggiornato, riprova."}), 500
-
-        # 6) Spostamento a Trasferito (best-effort) + report
-        report = {"moved": 0, "failures": []}
+        
         try:
-            report = _move_parziale_to_trasferito(center, start_delivery, num_parz)
-        except Exception:
+            _move_parziale_to_trasferito(center, start_delivery, num_parz)
+        except Exception as ex:
+            # Non blocchiamo la conferma se lo spostamento fallisce; lo logghiamo soltanto
             logging.exception("[conferma_parziale] Errore nello spostamento a 'Trasferito' (non bloccante)")
-            report = {"moved": 0, "failures": [{"error": "eccezione", "sku": None, "take": None}]}
 
-        # 7) Warning all'utente se qualcosa non va
-        if report.get("failures"):
-            enqueue_job("move_to_trasferito_failed", {
-                "center": center,
-                "start_delivery": start_delivery,
-                "numero_parziale": num_parz,
-                "report": report
-            })
-            return jsonify({
-                "ok": True,
-                "numero_parziale": num_parz,
-                "warning": "Qualcosa non ha funzionato nel trasferimento. Contatta l’assistenza.",
-                "transfer_report": report
-            }), 200
-
-        # ✅ SUCCESSO (mancava)
-        return jsonify({"ok": True, "numero_parziale": num_parz, "transfer_report": report}), 200
-
+        return jsonify({"ok": True})
     except Exception as ex:
         logging.exception("Errore conferma parziale")
         return jsonify({"error": f"Errore conferma: {str(ex)}"}), 500
@@ -1076,7 +1038,6 @@ def conferma_chiudi_ordine():
             .update({"confermato": True})
             .eq("riepilogo_id", riepilogo_id)
             .eq("numero_parziale", num_parz)
-            .execute()
         ))
 
         storici = supa_with_retry(lambda: (
@@ -1095,13 +1056,12 @@ def conferma_chiudi_ordine():
             totali_sku[r["model_number"]] += int(r["quantita"])
 
         for model_number, qty in totali_sku.items():
-            supa_with_retry(lambda mn=model_number, q=qty:
+            supa_with_retry(lambda mn=model_number, q=qty: (
                 sb_table("ordini_vendor_items")
                 .update({"qty_confirmed": q})
                 .in_("po_number", po_list)
                 .eq("model_number", mn)
-                .execute()
-            )
+            ))
 
         supa_with_retry(lambda: (
             sb_table("ordini_vendor_riepilogo")
@@ -1142,7 +1102,7 @@ def reset_parziali_wip():
             .delete()
             .eq("riepilogo_id", riepilogo_id)
             .eq("confermato", False)
-        ).execute())
+        ))
         return jsonify({"ok": True})
     except Exception as ex:
         logging.exception("Errore reset parziali WIP")
@@ -1276,12 +1236,9 @@ def chiudi_ordine():
         # --- Update qty_confirmed
         for art in articoli:
             nuova_qty = qty_per_model.get(art["model_number"], 0)
-            supa_with_retry(lambda aid=art["id"], q=nuova_qty:
-                sb_table("ordini_vendor_items")
-                .update({"qty_confirmed": q})
-                .eq("id", aid)
-                .execute()
-            )
+            supa_with_retry(lambda aid=art["id"], q=nuova_qty: (
+                sb_table("ordini_vendor_items").update({"qty_confirmed": q}).eq("id", aid)
+            ))
 
         # --- Stato riepilogo -> completato (anche in fallback: l’ID non è verificato dal test)
         supa_with_retry(lambda: (
@@ -2034,12 +1991,11 @@ def log_movimento_produzione(
     dettaglio=None
 ):
     try:
-        canale_norm = (produzione_row.get("canale") or "Amazon Vendor").strip() or "Amazon Vendor"
         payload = {
             "produzione_id": produzione_row["id"],
             "sku": produzione_row.get("sku"),
             "ean": produzione_row.get("ean"),
-            "canale": canale_norm,
+            "canale": produzione_row.get("canale"),
             "stato_vecchio": stato_vecchio,
             "stato_nuovo": stato_nuovo,
             "qty_vecchia": qty_vecchia,
@@ -2050,15 +2006,16 @@ def log_movimento_produzione(
             "motivo": motivo,
             "dettaglio": dettaglio,
             "created_at": datetime.now(timezone.utc).isoformat(),  # resta UTC
+            "canale": produzione_row.get("canale"),   
         }
-        supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(payload).execute())
+        supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(payload))
     except Exception as ex:
         logging.error(f"[log_movimento_produzione] Errore insert log: {ex}")
 
 
 def log_movimenti_produzione_bulk(rows, utente, motivo):
     logs = []
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now().isoformat()
     for r in rows:
         logs.append({
             "produzione_id": r["id"],
@@ -2078,7 +2035,7 @@ def log_movimenti_produzione_bulk(rows, utente, motivo):
         })
     if logs:
         try:
-            supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(logs).execute())
+            supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(logs))
         except Exception as ex:
             logging.error(f"[log_movimenti_produzione_bulk] Errore insert bulk log: {ex}")
 
@@ -2162,7 +2119,7 @@ def importa_prelievi():
         for i in range(0, len(lista_to_insert), batch_size):
             batch = lista_to_insert[i:i + batch_size]
             try:
-                supa_with_retry(lambda b=batch: sb_table("prelievi_ordini_amazon").insert(b).execute())
+                supa_with_retry(lambda b=batch: sb_table("prelievi_ordini_amazon").insert(b))
                 inserted_total += len(batch)
             except Exception as ex:
                 logging.warning(f"[importa_prelievi] Errore batch [{i}-{i+len(batch)-1}]: {ex}")
@@ -2214,7 +2171,7 @@ def sync_produzione(prelievi_modificati, utente=None, motivo="Modifica prelievo"
         if not entries:
             return
         mov_rows = []
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now().isoformat()
         for entry in entries:
             r = entry.get("produzione_row") or {}
             mov_rows.append({
@@ -2348,6 +2305,7 @@ def sync_produzione(prelievi_modificati, utente=None, motivo="Modifica prelievo"
                     "qty": qty,
                     "riscontro": riscontro,
                     "plus": plus,
+                    "radice": estrai_radice(p["sku"]),  # <-- invece di p["radice"]
                     "start_delivery": p.get("start_delivery"),
                     "stato": stato,
                     "stato_produzione": "Da Stampare",
@@ -2458,7 +2416,7 @@ def patch_prelievo(id):
         if not fields:
             return jsonify({"error": "Nessun campo da aggiornare"}), 400
 
-        supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(fields).eq("id", id).execute())
+        supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(fields).eq("id", id))
 
         prelievo = supa_with_retry(lambda: (
             sb_table("prelievi_ordini_amazon").select("*").eq("id", id).single().execute()
@@ -2524,10 +2482,10 @@ def patch_prelievi_bulk():
                 if ids_group:
                     supa_with_retry(lambda s=stato, g=ids_group: (
                         sb_table("prelievi_ordini_amazon")
-                        .update({**update_fields, "stato": s}).in_("id", g).execute()
+                        .update({**update_fields, "stato": s}).in_("id", g)
                     ))
         else:
-            supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(update_fields).in_("id", ids).execute())
+            supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(update_fields).in_("id", ids))
 
         prelievi_full = supa_with_retry(lambda: (
             sb_table("prelievi_ordini_amazon").select("*").in_("id", ids).execute()
@@ -2537,9 +2495,310 @@ def patch_prelievi_bulk():
     except Exception as ex:
         logging.exception("[patch_prelievi_bulk] Errore patch bulk prelievi")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
-    
-    
-    # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Lista produzione + badge
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione', methods=['GET'])
+def lista_produzione():
+    try:
+        stato = request.args.get("stato_produzione")
+        radice = request.args.get("radice")
+        search = request.args.get("search", "").strip()
+        canale = request.args.get("canale")  # NEW
+
+        query = sb_table("produzione_vendor").select("*")
+        if stato:
+            query = query.eq("stato_produzione", stato)
+        if radice:
+            query = query.eq("radice", radice)
+        if canale:
+            query = query.eq("canale", canale)  # NEW
+        if search:
+            query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
+        query = query.order("start_delivery").order("sku")
+        rows = supa_with_retry(lambda: query.execute()).data
+
+        all_rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("stato_produzione,radice,canale").execute()
+        )).data
+
+        badge_stati, badge_radici, badge_canali = {}, {}, {}
+        for r in (all_rows or []):
+            s = r.get("stato_produzione", "Da Stampare")
+            badge_stati[s] = badge_stati.get(s, 0) + 1
+            rd = r.get("radice") or "?"
+            badge_radici[rd] = badge_radici.get(rd, 0) + 1
+            c = r.get("canale") or "?"
+            badge_canali[c] = badge_canali.get(c, 0) + 1
+
+        return jsonify({
+            "data": rows or [],
+            "badge_stati": badge_stati,
+            "badge_radici": badge_radici,
+            "badge_canali": badge_canali,
+            "all_radici": sorted(set(r.get("radice") for r in (all_rows or []) if r.get("radice")))
+        })
+    except Exception as ex:
+        logging.exception("[lista_produzione] Errore nella GET produzione")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
+
+# -----------------------------------------------------------------------------
+# Patch singola riga produzione (con log)
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/<int:id>', methods=['PATCH'])
+def patch_produzione(id):
+    try:
+        data = request.json
+        fields = {}
+        utente = _current_user_label()
+
+        old = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").eq("id", id).single().execute()
+        )).data
+        if not old:
+            return jsonify({"error": "Produzione non trovata"}), 404
+
+        log_entries = []
+
+        if "stato_produzione" in data and data["stato_produzione"] != old["stato_produzione"]:
+            fields["stato_produzione"] = data["stato_produzione"]
+            log_entries.append(dict(
+                produzione_row=old,
+                utente=utente,
+                motivo="Cambio stato",
+                stato_vecchio=old["stato_produzione"],
+                stato_nuovo=data["stato_produzione"]
+            ))
+        if "da_produrre" in data and data["da_produrre"] != old["da_produrre"]:
+            fields["da_produrre"] = data["da_produrre"]
+            fields["modificata_manualmente"] = True
+            log_entries.append(dict(
+                produzione_row=old,
+                utente=utente,
+                motivo="Modifica quantità",
+                qty_vecchia=old["da_produrre"],
+                qty_nuova=data["da_produrre"]
+            ))
+        if "plus" in data and (old.get("plus") or 0) != (data.get("plus") or 0):
+            fields["plus"] = data["plus"]
+            log_entries.append(dict(
+                produzione_row=old,
+                utente=utente,
+                motivo="Modifica plus",
+                plus_vecchio=old.get("plus") or 0,
+                plus_nuovo=data["plus"]
+            ))
+        for f in ["cavallotti", "note"]:
+            if f in data:
+                fields[f] = data[f]
+
+        if "da_produrre" in data and old["stato_produzione"] != "Da Stampare":
+            if data.get("password") != "oreste":
+                return jsonify({"error": "Password richiesta per modificare la quantità in questo stato."}), 403
+
+        if not fields:
+            return jsonify({"error": "Nessun campo da aggiornare"}), 400
+
+        res = supa_with_retry(lambda: sb_table("produzione_vendor").update(fields).eq("id", id))
+
+        for entry in log_entries:
+            log_movimento_produzione(**entry)
+
+        return jsonify({"ok": True, "updated": res.data})
+    except Exception as ex:
+        logging.exception("[patch_produzione] Errore patch produzione")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
+# -----------------------------------------------------------------------------
+# Patch bulk produzione (con log)
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/bulk', methods=['PATCH'])
+def patch_produzione_bulk():
+    try:
+        ids = request.json.get("ids", [])
+        update_fields = request.json.get("fields", {})
+        if not ids or not update_fields:
+            return jsonify({"error": "Nessun id/campo"}), 400
+
+        utente = _current_user_label()
+        rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").in_("id", ids).execute()
+        )).data
+        logs = []
+        for r in rows:
+            if "stato_produzione" in update_fields and update_fields["stato_produzione"] != r["stato_produzione"]:
+                logs.append(dict(
+                    produzione_row=r,
+                    utente=utente,
+                    motivo="Cambio stato (bulk)",
+                    stato_vecchio=r["stato_produzione"],
+                    stato_nuovo=update_fields["stato_produzione"]
+                ))
+            if "da_produrre" in update_fields and update_fields["da_produrre"] != r["da_produrre"]:
+                logs.append(dict(
+                    produzione_row=r,
+                    utente=utente,
+                    motivo="Modifica quantità (bulk)",
+                    qty_vecchia=r["da_produrre"],
+                    qty_nuova=update_fields["da_produrre"]
+                ))
+            if "plus" in update_fields and (r.get("plus") or 0) != (update_fields.get("plus") or 0):
+                logs.append(dict(
+                    produzione_row=r,
+                    utente=utente,
+                    motivo="Modifica plus (bulk)",
+                    plus_vecchio=r.get("plus") or 0,
+                    plus_nuovo=update_fields["plus"]
+                ))
+
+        supa_with_retry(lambda: sb_table("produzione_vendor").update(update_fields).in_("id", ids))
+
+        for entry in logs:
+            log_movimento_produzione(**entry)
+
+        return jsonify({"ok": True, "updated_count": len(ids)})
+    except Exception as ex:
+        logging.exception("[patch_produzione_bulk] Errore PATCH bulk produzione")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
+# -----------------------------------------------------------------------------
+# GET produzione by ID
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/<int:id>', methods=['GET'])
+def get_produzione_by_id(id):
+    try:
+        res = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").eq("id", id).single().execute()
+        ))
+        return jsonify(res.data)
+    except Exception as ex:
+        logging.exception(f"[get_produzione_by_id] Errore GET produzione ID {id}")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
+# -----------------------------------------------------------------------------
+# Log storico di una riga produzione
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/<int:id>/log', methods=['GET'])
+def get_log_movimenti(id):
+    try:
+        logs = supa_with_retry(lambda: (
+            sb_table("movimenti_produzione_vendor")
+            .select("*")
+            .eq("produzione_id", id)
+            .order("created_at", desc=True)
+            .execute()
+        )).data or []
+
+        # arricchisci canale / etichette user-friendly
+        def _canale_label(l):
+            # 1) se già presente in riga
+            c = l.get("canale")
+            if c: return c
+            # 2) prova da meta/dettaglio JSON
+            for k in ("meta", "dettaglio"):
+                raw = l.get(k)
+                if isinstance(raw, dict) and raw.get("canale"):
+                    return raw["canale"]
+                if isinstance(raw, str):
+                    try:
+                        j = json.loads(raw)
+                        if j.get("canale"):
+                            return j["canale"]
+                    except Exception:
+                        pass
+            # 3) fallback: prendo una riga produzione compatibile
+            q = sb_table("produzione_vendor").select("canale").eq("sku", l.get("sku")).eq("ean", l.get("ean"))
+            sd = l.get("start_delivery")
+            if sd is None:
+                q = q.is_("start_delivery", "null")
+            else:
+                q = q.eq("start_delivery", sd)
+            r = supa_with_retry(lambda: q.limit(1).execute()).data or []
+            return (r[0]["canale"] if r else None)
+
+        def _humanize(l):
+            motivo_raw = (l.get("motivo") or "").strip()
+            motivo_low = motivo_raw.lower()
+            if motivo_low.startswith("trigger insert"):
+                motivo = "Creazione riga (sistema)"
+            elif motivo_low.startswith("trigger update"):
+                motivo = "Aggiornamento automatico (sistema)"
+            else:
+                motivo = motivo_raw or "Aggiornamento"
+
+            utente = (l.get("utente") or "").strip()
+            if not utente or utente.lower() in ("postgres","postgrest","supabase"):
+                utente = "Sistema"
+
+            l["motivo"] = motivo
+            l["utente"] = utente
+            l["canale_label"] = _canale_label(l)
+            return l
+
+        logs = [_humanize(l) for l in logs]
+
+        # dedupe: se esiste "Inserimento manuale" nello stesso secondo e stesso stato/qty,
+        # nascondi "Creazione riga (sistema)"
+        seen_keys = set()
+        out = []
+        for l in logs:
+            ts = l.get("created_at")
+            sec = int(datetime.fromisoformat(str(ts).replace("Z","+00:00")).timestamp()) if ts else 0
+            key = (sec, l.get("stato_nuovo"), l.get("qty_nuova"))
+
+            if l.get("motivo") == "Inserimento manuale":
+                seen_keys.add(key)
+                out.append(l)
+                continue
+
+            if l.get("motivo") == "Creazione riga (sistema)" and key in seen_keys:
+                # salta il trigger duplicato
+                continue
+
+            out.append(l)
+
+        return jsonify(out)
+    except Exception as ex:
+        logging.exception(f"[get_log_movimenti] Errore GET log movimenti produzione {id}")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Bulk delete produzione (+ cancellazione log collegati)
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/bulk', methods=['DELETE'])
+def delete_produzione_bulk():
+    try:
+        ids = request.json.get("ids", [])
+        if not ids:
+            return jsonify({"error": "Nessun id"}), 400
+
+        BATCH_SIZE = 100
+        for i in range(0, len(ids), BATCH_SIZE):
+            batch_ids = ids[i:i + BATCH_SIZE]
+            supa_with_retry(lambda ids=batch_ids: (
+                sb_table("movimenti_produzione_vendor").delete().in_("produzione_id", ids).execute()
+            ))
+            time.sleep(0.05)
+
+        for i in range(0, len(ids), BATCH_SIZE):
+            batch_ids = ids[i:i + BATCH_SIZE]
+            supa_with_retry(lambda ids=batch_ids: (
+                sb_table("produzione_vendor").delete().in_("id", ids).execute()
+            ))
+            time.sleep(0.05)
+
+        return jsonify({"ok": True, "deleted_count": len(ids)})
+    except Exception as ex:
+        logging.exception("[delete_produzione_bulk] Errore DELETE bulk produzione")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
+# -----------------------------------------------------------------------------
 # Svuota prelievi
 # -----------------------------------------------------------------------------
 @bp.route('/api/prelievi/svuota', methods=['DELETE'])
@@ -2552,8 +2811,121 @@ def svuota_prelievi():
     except Exception as ex:
         logging.exception("[svuota_prelievi] Errore DELETE svuota prelievi")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
-    
-    # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Pulizia produzione "Da Stampare"
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/pulisci-da-stampare', methods=['POST'])
+def pulisci_da_stampare_endpoint():
+    try:
+        def norm(x):
+            return (
+                (x.get("sku") or "").strip().lower().replace(" ", ""),
+                (x.get("ean") or "").strip().lower().replace(" ", "")
+            )
+
+        produzione = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute()
+        )).data
+        prelievi = supa_with_retry(lambda: (
+            sb_table("prelievi_ordini_amazon").select("sku,ean,start_delivery").execute()
+        )).data
+
+        max_data_per_sku_ean = defaultdict(str)
+        for p in prelievi:
+            chiave = norm(p)
+            data = str(p.get("start_delivery") or "")[:10]
+            if data and (data > max_data_per_sku_ean[chiave]):
+                max_data_per_sku_ean[chiave] = data
+
+        ids_da_eliminare = []
+        for r in produzione:
+            chiave = norm(r)
+            data_riga = str(r.get("start_delivery") or "")[:10]
+            if max_data_per_sku_ean.get(chiave) and data_riga != max_data_per_sku_ean[chiave]:
+                ids_da_eliminare.append(r["id"])
+            elif chiave not in max_data_per_sku_ean:
+                ids_da_eliminare.append(r["id"])
+
+        if ids_da_eliminare:
+            rows_log = supa_with_retry(lambda: (
+                sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute()
+            )).data
+            for riga in rows_log:
+                log_movimento_produzione(riga, utente=_current_user_label(), motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)")
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+            ))
+
+        return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
+    except Exception as ex:
+        logging.exception("[pulisci_da_stampare_endpoint] Errore pulizia produzione da stampare")
+        return jsonify({"error": f"Errore pulizia: {str(ex)}"}), 500
+
+# -----------------------------------------------------------------------------
+# Pulizia parziale "Da Stampare"
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/pulisci-da-stampare-parziale', methods=['POST'])
+def pulisci_da_stampare_parziale():
+    try:
+        data = request.json
+        radice = data.get("radice")
+        ids = data.get("ids", [])
+
+        def norm(x):
+            return (
+                (x.get("sku") or "").strip().lower().replace(" ", ""),
+                (x.get("ean") or "").strip().lower().replace(" ", "")
+            )
+
+        produzione_query = sb_table("produzione_vendor").select("id,sku,ean,start_delivery,prelievo_id")
+        if ids:
+            produzione_query = produzione_query.in_("prelievo_id", ids)
+        elif radice:
+            produzione_query = produzione_query.eq("radice", radice)
+        produzione = supa_with_retry(lambda: (
+            produzione_query.eq("stato_produzione", "Da Stampare").execute()
+        )).data
+
+        prelievi_query = sb_table("prelievi_ordini_amazon").select("id,sku,ean,start_delivery")
+        if ids:
+            prelievi_query = prelievi_query.in_("id", ids)
+        elif radice:
+            prelievi_query = prelievi_query.eq("radice", radice)
+        prelievi = supa_with_retry(lambda: prelievi_query.execute()).data
+
+        max_data_per_sku_ean = defaultdict(str)
+        for p in prelievi:
+            chiave = norm(p)
+            data = str(p.get("start_delivery") or "")[:10]
+            if data and (data > max_data_per_sku_ean[chiave]):
+                max_data_per_sku_ean[chiave] = data
+
+        ids_da_eliminare = []
+        for r in produzione:
+            chiave = norm(r)
+            data_riga = str(r.get("start_delivery") or "")[:10]
+            if max_data_per_sku_ean.get(chiave) and data_riga != max_data_per_sku_ean[chiave]:
+                ids_da_eliminare.append(r["id"])
+            elif chiave not in max_data_per_sku_ean:
+                ids_da_eliminare.append(r["id"])
+
+        if ids_da_eliminare:
+            rows_log = supa_with_retry(lambda: (
+                sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute()
+            )).data
+            for riga in rows_log:
+                log_movimento_produzione(riga, utente=_current_user_label(), motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)")
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
+            ))
+
+        return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
+    except Exception as ex:
+        logging.exception("[pulisci_da_stampare_parziale] Errore pulizia parziale da stampare")
+        return jsonify({"error": f"Errore pulizia parziale: {str(ex)}"}), 500
+
+# -----------------------------------------------------------------------------
 # Badge counts
 # -----------------------------------------------------------------------------
 @bp.route('/api/amazon/vendor/orders/badge-counts', methods=['GET'])
@@ -2596,11 +2968,12 @@ def badge_counts():
 
 def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parziale: int):
     """
-    Sposta in 'Trasferito' le quantità del parziale confermato, usando SOLO la RPC move_qty_rpc.
-    Ritorna un report: { "moved": int, "failures": [ {sku, take, error}, ... ] }
+    Sposta in 'Trasferito' le quantità del parziale confermato.
+    Quantità da spostare per SKU = (parziale_corrente_per_SKU) - max(0, riscontro_SKU_alla_stessa_data - somma_parziali_precedenti_SKU).
+    Prelievo dai soli stati attivi (Stampato, Calandrato, Cucito, Confezionato),
+    con priorità: stessa data -> altre date (più vecchie prima); prima match (SKU,EAN), poi fallback solo SKU.
+    Idempotente via flag 'gestito'.
     """
-    report = {"moved": 0, "failures": []}
-
     # 1) Riepilogo e parziale corrente
     rres = supa_with_retry(lambda: (
         sb_table("ordini_vendor_riepilogo")
@@ -2613,11 +2986,12 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     rows_r = rres.data or []
     riepilogo_id = rows_r[0]["id"] if rows_r else None
     if not riepilogo_id:
-        return report  # niente da fare
+        return
 
+    # parziale corrente (senza .single())
     pres = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("dati, gestito, numero_parziale, created_at")  # <-- aggiunto created_at
+        .select("dati, gestito")
         .eq("riepilogo_id", riepilogo_id)
         .eq("numero_parziale", numero_parziale)
         .limit(1)
@@ -2625,15 +2999,16 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     ))
     _pres_rows = pres.data or []
     pres_data = _pres_rows[0] if _pres_rows else {}
+
     dati_curr = pres_data.get("dati") or []
     if isinstance(dati_curr, str):
         try:
             dati_curr = json.loads(dati_curr)
         except Exception:
             dati_curr = []
-    curr_created = pres_data.get("created_at")  # <-- timestamp di riferimento
 
-    # 2) Quantità da spostare per SKU/EAN
+    # 2) Somme del parziale corrente: (SKU,EAN) e per-SKU
+    # parziale corrente per SKU
     parziale_sku_curr = {}
     parziale_exact_curr = {}
     for r in (dati_curr or []):
@@ -2645,38 +3020,34 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
         parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
+    # somma parziali precedenti confermati
     parziali_prec = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("numero_parziale,dati,confermato,created_at")  # <-- aggiunto created_at
+        .select("numero_parziale,dati,confermato")
         .eq("riepilogo_id", riepilogo_id)
-        .order("created_at")                                   # <-- ordina per tempo
+        .order("numero_parziale")
         .execute()
     )).data or []
 
-    sum_parz_prec_sku: dict[str, int] = {}
+    sum_parziali_precedenti_sku = {}
     for p in parziali_prec:
-        if not p.get("confermato"):
+        num = p.get("numero_parziale")
+        if num is None or num >= numero_parziale or not p.get("confermato"):
             continue
-
-        # Considera "precedente" solo se creato prima del parziale corrente
-        if curr_created and p.get("created_at") and str(p["created_at"]) >= str(curr_created):
-            continue
-
         dati_p = p.get("dati") or []
         if isinstance(dati_p, str):
             try:
                 dati_p = json.loads(dati_p)
             except Exception:
                 dati_p = []
-
         for r in dati_p:
-            model = r.get("model_number") or r.get("sku")
+            sku = r.get("model_number") or r.get("sku")
             q = int(r.get("quantita") or r.get("qty") or 0)
-            if not model or q <= 0:
+            if not sku or q <= 0:
                 continue
-            sum_parz_prec_sku[model] = sum_parz_prec_sku.get(model, 0) + q
+            sum_parziali_precedenti_sku[sku] = sum_parziali_precedenti_sku.get(sku, 0) + q
 
-    # riscontro stessa data
+    # riscontro per SKU (stessa data)
     riscontro_sku = {}
     prelievi_same_date = supa_with_retry(lambda: (
         sb_table("prelievi_ordini_amazon")
@@ -2696,15 +3067,16 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     # qty da spostare per SKU = parziale_corrente - max(0, riscontro_totale - somma_parziali_precedenti)
     to_move_sku = {}
     for sku, q_curr in parziale_sku_curr.items():
-        residuo_riscontro = max(0, riscontro_sku.get(sku, 0) - sum_parz_prec_sku.get(sku, 0))
+        prev_sum = sum_parziali_precedenti_sku.get(sku, 0)
+        risc = riscontro_sku.get(sku, 0)
+        residuo_riscontro = max(0, risc - prev_sum)
         to_move_sku[sku] = max(0, q_curr - residuo_riscontro)
 
-    # 3) Righe produzione "attive"
+
+    # 6) Righe produzione attive per gli SKU interessati (senza filtro data)
     stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
     stato_index = {s: i for i, s in enumerate(stati_attivi)}
-    target_skus = [s for s, need in to_move_sku.items() if need > 0]
-    if not target_skus:
-        return report
+    target_skus = list(to_move_sku.keys())
 
     rows_all = supa_with_retry(lambda: (
         sb_table("produzione_vendor")
@@ -2714,9 +3086,11 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         .execute()
     )).data or []
 
-    rows_by_sku, rows_by_exact = {}, {}
+    rows_by_sku = {}
+    rows_by_exact = {}
     for r in rows_all:
-        sku_r = r.get("sku"); ean_r = (r.get("ean") or "")
+        sku_r = r.get("sku")
+        ean_r = (r.get("ean") or "")
         rows_by_sku.setdefault(sku_r, []).append(r)
         rows_by_exact.setdefault((sku_r, ean_r), []).append(r)
 
@@ -2726,12 +3100,14 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         dt = str(row.get("start_delivery") or "")
         return (same_date, st_i, dt)
 
-    for k in rows_by_sku: rows_by_sku[k].sort(key=_priority)
-    for k in rows_by_exact: rows_by_exact[k].sort(key=_priority)
+    for k in rows_by_sku:
+        rows_by_sku[k].sort(key=_priority)
+    for k in rows_by_exact:
+        rows_by_exact[k].sort(key=_priority)
 
-    # 4) Spostamenti tramite RPC (atomici, con lock)
-    for sku, need in list(to_move_sku.items()):
-        if need <= 0: continue
+    for sku, need in to_move_sku.items():
+        if need <= 0:
+            continue
 
         eans_for_sku = sorted(
             [ean for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
@@ -2742,42 +3118,337 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         ordered_candidates = []
         for e in eans_for_sku:
             ordered_candidates.extend(rows_by_exact.get((sku, e), []))
+
         already_ids = {r["id"] for r in ordered_candidates}
-        ordered_candidates.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids])
+        fallback_rows = [r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids]
+        ordered_candidates.extend(fallback_rows)
 
         for r in ordered_candidates:
-            if need <= 0: break
+            if need <= 0:
+                break
             avail = int(r.get("da_produrre") or 0)
-            if avail <= 0: continue
+            if avail <= 0:
+                continue
 
             take = min(avail, need)
 
-            try:
-                payload = {
-                    "p_from_id": int(r["id"]),   # <-- forza bigint
-                    "p_to_state": "Trasferito",  # <-- text esatto
-                    "p_qty": int(take),          # <-- forza integer
-                    "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
-                }
-                supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
+            # riduci origine
+            supa_with_retry(lambda rid=r["id"], new_val=avail - take: (
+                sb_table("produzione_vendor")
+                .update({"da_produrre": new_val})
+                .eq("id", rid)
+                .execute()
+            ))
 
-                report["moved"] += take
-                need -= take
+            # ⬅️ AGGIUNGI QUESTO BLOCCO
+            if avail - take <= 0:
+                supa_with_retry(lambda rid=r["id"]: (
+                    sb_table("produzione_vendor").delete().eq("id", rid).execute()
+                ))
 
-            except Exception as ex:
-                logging.warning(
-                    "[move_to_trasferito] fallimento sku=%s take=%s payload=%s err=%s",
-                    sku, take, payload, ex
+
+            _merge_into_target(r, "Trasferito", take)
+
+            need -= take
+
+        # eventuale residuo rimane non spostato (mancano pezzi attivi)
+
+# -----------------------------------------------------------------------------
+# Inserimento manuale in produzione (canali: Amazon Seller, Sito)
+# -----------------------------------------------------------------------------
+@bp.route('/api/produzione/manuale', methods=['POST'])
+def crea_produzione_manuale():
+    try:
+        data = request.json or {}
+        canale = (data.get("canale") or "").strip()
+        if canale not in ("Amazon Seller", "Sito"):
+            return jsonify({"error": "Canale non valido. Usa 'Amazon Seller' o 'Sito'."}), 400
+
+        sku = (data.get("sku") or "").strip()
+        ean = (data.get("ean") or "").strip()
+        qty = data.get("qty")
+        start_delivery = (data.get("start_delivery") or "").strip() or None  # opzionale per Sito
+        note = (data.get("note") or "").strip()
+        plus = int(data.get("plus") or 0)
+        cavallotti = bool(data.get("cavallotti") or False)
+        radice = estrai_radice(sku)
+
+        if not sku:
+            return jsonify({"error": "sku obbligatorio"}), 400
+        try:
+            qty = int(qty)
+        except Exception:
+            return jsonify({"error": "qty deve essere un intero >= 1"}), 400
+        if qty < 1:
+            return jsonify({"error": "qty deve essere >= 1"}), 400
+        if len(note) > 255:
+            return jsonify({"error": "Nota troppo lunga (max 255)"}), 400
+
+        # tenta aggregazione su riga "Da Stampare" esistente
+        # tenta aggregazione su riga "Da Stampare" esistente (stessa chiave logica)
+        def _build_existing_query():
+            q = (sb_table("produzione_vendor")
+                .select("id, da_produrre, qty, plus")
+                .eq("sku", sku)
+                .eq("ean", ean)
+                .eq("stato_produzione", "Da Stampare")
+                .eq("canale", canale))
+
+            # ⚠️ NON usare eq(None) sulle date: per NULL si usa .is_("col", "null")
+            if start_delivery:
+                q = q.eq("start_delivery", start_delivery)
+            else:
+                q = q.is_("start_delivery", "null")
+
+            return q.limit(1).execute()
+
+        existing = supa_with_retry(_build_existing_query).data or []
+
+        if existing:
+            r = existing[0]
+            new_qty = int(r.get("da_produrre") or 0) + qty + plus
+            # merge
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor")
+                .update({
+                    "da_produrre": new_qty,
+                    "qty": new_qty,
+                    "plus": 0,
+                    "note": note or None,
+                    "cavallotti": cavallotti
+                }).eq("id", r["id"]).execute()
+            ))
+            return jsonify({"ok": True, "id": r["id"], "aggregated": True})
+
+        nuovo = {
+            "prelievo_id": None,
+            "sku": sku,
+            "ean": ean,
+            "qty": qty,
+            "riscontro": 0,
+            "plus": plus,
+            "radice": radice,
+            "start_delivery": start_delivery,
+            "stato": "manuale",
+            "stato_produzione": "Da Stampare",
+            "da_produrre": qty + plus,
+            "cavallotti": cavallotti,
+            "note": note or None,
+            "canale": canale
+        }
+        inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
+        new_id = inserted[0]["id"] if inserted else None
+
+        # ---- NEW: log esplicito “Inserimento manuale” ----
+        try:
+            user_label = _current_user_label()
+            if inserted:
+                irow = inserted[0]
+                log_movimento_produzione(
+                    irow,
+                    utente=user_label,
+                    motivo="Inserimento manuale",
+                    stato_vecchio=None,
+                    stato_nuovo="Da Stampare",
+                    qty_vecchia=None,
+                    qty_nuova=irow.get("da_produrre"),
+                    plus_vecchio=None,
+                    plus_nuovo=irow.get("plus") or 0,
+                    dettaglio={"canale": irow.get("canale")}
                 )
-                report["failures"].append({"sku": sku, "take": int(take), "error": str(ex)})
-                # non decremento need: magari le prossime righe coprono
-                
-        if need > 0:
-            report["failures"].append({
-                "sku": sku,
-                "missing": int(need),
-                "error": "non disponibile in stati attivi (restano DS) o residuo riscontro"
-            })
+        except Exception:
+            pass
+        # ---------------------------------------------------
 
-    return report
- 
+        return jsonify({"ok": True, "id": new_id, "aggregated": False})
+    except Exception as ex:
+        logging.exception("[crea_produzione_manuale] Errore inserimento manuale")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500
+    
+    # -----------------------------------------------------------------------------
+# Sposta parte dei pezzi di una riga produzione in un altro stato
+# -----------------------------------------------------------------------------
+def _merge_into_target(row_src: dict, to_state: str, qty: int, *, log_merge: bool = True):
+    """
+    Merge 'qty' sulla destinazione (stessa chiave logica) e RITORNA l'ID della riga target.
+    Se log_merge=False, non scrive il log 'Merge in <to_state>' (utile quando stiamo già loggando lo SPOTAMENTO).
+    """
+    key = {
+        "sku": row_src.get("sku"),
+        "ean": row_src.get("ean"),
+        "start_delivery": row_src.get("start_delivery"),
+        "stato_produzione": to_state,
+        "canale": row_src.get("canale"),
+    }
+
+    def _select_target():
+        q = (
+            sb_table("produzione_vendor")
+            .select("id, da_produrre, plus, stato_produzione, canale")
+            .eq("sku", key["sku"])
+            .eq("ean", key["ean"])
+            .eq("stato_produzione", to_state)
+            .eq("canale", key["canale"])
+        )
+        if key["start_delivery"] is None:
+            q = q.is_("start_delivery", "null")
+        else:
+            q = q.eq("start_delivery", key["start_delivery"])
+        return q.limit(1).execute()
+
+    found = supa_with_retry(_select_target).data or []
+
+    user_label = request.headers.get("X-USER-NAME") or request.headers.get("X-USER-ID") or "Operatore"
+
+    if found:
+        tgt = found[0]
+        tgt_id = tgt["id"]
+        new_val = int(tgt.get("da_produrre") or 0) + qty
+
+        supa_with_retry(lambda: sb_table("produzione_vendor").update({"da_produrre": new_val}).eq("id", tgt_id))
+
+        if log_merge:
+            try:
+                # log 'merge' associato alla RIGA TARGET (produzione_id = tgt_id)
+                tgt_row = {
+                    "id": tgt_id,
+                    "sku": key["sku"],
+                    "ean": key["ean"],
+                    "start_delivery": key["start_delivery"],
+                    "stato_produzione": to_state,
+                    "plus": tgt.get("plus") or 0,
+                    "canale": tgt.get("canale") or key["canale"],
+                }
+                log_movimento_produzione(
+                    tgt_row,
+                    utente=user_label,
+                    motivo=f"Merge in {to_state}",
+                    stato_vecchio=to_state,
+                    stato_nuovo=to_state,
+                    qty_vecchia=None,
+                    qty_nuova=qty,  # quantità confluita nel target
+                    plus_vecchio=tgt.get("plus") or 0,
+                    plus_nuovo=tgt.get("plus") or 0,
+                    dettaglio={"merge": True},
+                )
+            except Exception:
+                pass
+
+        return tgt_id
+
+    # target non esiste -> lo creo
+    nuovo = {
+        "prelievo_id": row_src.get("prelievo_id"),
+        "sku": key["sku"],
+        "ean": key["ean"],
+        "qty": row_src.get("qty"),
+        "riscontro": row_src.get("riscontro"),
+        "plus": 0,
+        "radice": row_src.get("radice"),
+        "start_delivery": key["start_delivery"],
+        "stato": row_src.get("stato"),
+        "stato_produzione": to_state,
+        "da_produrre": qty,
+        "cavallotti": row_src.get("cavallotti"),
+        "note": row_src.get("note"),
+        "canale": key["canale"],
+    }
+    inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
+    tgt_id = inserted[0]["id"] if inserted else None
+
+    if log_merge and tgt_id:
+        try:
+            tgt_row = dict(nuovo)
+            tgt_row["id"] = tgt_id
+            log_movimento_produzione(
+                tgt_row,
+                utente=user_label,
+                motivo=f"Merge in {to_state}",
+                stato_vecchio=to_state,
+                stato_nuovo=to_state,
+                qty_vecchia=None,
+                qty_nuova=qty,
+                plus_vecchio=0,
+                plus_nuovo=0,
+                dettaglio={"merge": True},
+            )
+        except Exception:
+            pass
+
+    return tgt_id
+
+
+
+
+@bp.route('/api/produzione/move-qty', methods=['POST'])
+def move_qty_endpoint():
+    try:
+        body = request.json or {}
+        from_id = int(body.get("from_id") or 0)
+        to_state = body.get("to_state")
+        qty = int(body.get("qty") or 0)
+        if from_id <= 0 or qty <= 0 or not to_state:
+            return jsonify({"error": "Parametri non validi"}), 400
+
+        src = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").eq("id", from_id).single().execute()
+        )).data
+        if not src:
+            return jsonify({"error": "Riga produzione non trovata"}), 404
+
+        canale = (src.get("canale") or "").strip()
+        avail = int(src.get("da_produrre") or 0)
+        user_label = request.headers.get("X-USER-NAME") or request.headers.get("X-USER-ID") or "Operatore"
+
+        def _log_spostamento(qty_before: int, qty_after: int, tgt_id: int | None):
+            try:
+                src_row = dict(src); src_row["id"] = from_id
+                log_movimento_produzione(
+                    src_row,
+                    utente=user_label,
+                    motivo=f"Spostamento a {to_state}",
+                    stato_vecchio=src.get("stato_produzione"),
+                    stato_nuovo=to_state,
+                    qty_vecchia=qty_before,
+                    qty_nuova=qty_after,
+                    plus_vecchio=src.get("plus") or 0,
+                    plus_nuovo=src.get("plus") or 0,
+                    dettaglio={"target_id": tgt_id}
+                )
+            except Exception:
+                pass
+
+        if qty <= avail:
+            new_src_val = avail - qty
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").update({"da_produrre": new_src_val}).eq("id", from_id).execute()
+            ))
+
+            tgt_id = _merge_into_target(src, to_state, qty, log_merge=False)  # <— niente log 'Merge in ...' qui
+            _log_spostamento(avail, new_src_val, tgt_id)
+
+            if new_src_val <= 0:
+                supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", from_id).execute())
+
+            return jsonify({"ok": True})
+
+        # qty > avail
+        if canale in ("Sito", "Amazon Seller"):
+            if avail > 0:
+                supa_with_retry(lambda: sb_table("produzione_vendor").update({"da_produrre": 0}).eq("id", from_id))
+                tgt_id_1 = _merge_into_target(src, to_state, avail, log_merge=False)
+                _log_spostamento(avail, 0, tgt_id_1)
+                supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", from_id))
+
+            extra = qty - avail
+            if extra > 0:
+                tgt_id_2 = _merge_into_target(src, to_state, extra, log_merge=False)
+                _log_spostamento(0, 0, tgt_id_2)
+
+            return jsonify({"ok": True, "over_move": True})
+
+        return jsonify({"error": "Quantità oltre il disponibile"}), 400
+
+    except Exception as ex:
+        logging.exception("[move_qty_endpoint] errore")
+        return jsonify({"error": f"Errore: {str(ex)}"}), 500

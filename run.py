@@ -24,6 +24,7 @@ from app.routes.jobs import bp as jobs_bp
 from app.routes.fatture_amazon_vendor import bp as fatture_amazon_vendor_bp
 from app.routes.notecredito_amazon_reso import bp as notecredito_amazon_reso_bp
 from app.routes.notecredito import bp as notecredito_tools_bp
+from app.routes.produzione import bp as produzione_bp  # NEW
 
 
 
@@ -55,6 +56,7 @@ def create_app():
     app.register_blueprint(brt)  # <--- AGGIUNGI QUI
     app.register_blueprint(validate_address_bp)
     app.register_blueprint(amazon_vendor_bp)
+    app.register_blueprint(produzione_bp) 
     app.register_blueprint(fatture_amazon_vendor_bp)
     app.register_blueprint(notecredito_amazon_reso_bp)
     app.register_blueprint(notecredito_tools_bp)
