@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request, Response
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from typing import Optional
 from io import BytesIO
 import os
 import io
@@ -211,6 +212,105 @@ def enqueue_job(job_type: str, payload: dict) -> None:
         supa_with_retry(lambda: sb_table("jobs").upsert(job, on_conflict="dedup_key").execute())
     except Exception as ex:
         logging.warning("[enqueue_job] enqueue fallita: %s", ex)
+
+
+def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_label: str) -> Optional[int]:
+    """
+    Sposta 'qty' dalla riga attiva SRC (qualsiasi stato attivo: Stampato/Calandrato/Cucito/Confezionato)
+    verso una riga TARGET con la stessa chiave (sku, ean, canale, stato_produzione) ma con
+    start_delivery = new_start_delivery. Crea/merge la TARGET se serve.
+    Ritorna l'ID della riga TARGET (nella nuova data). Logga un evento 'Retarget data (auto)'.
+    """
+    if qty <= 0:
+        return None
+
+    # 1) leggi sorgente
+    src = supa_with_retry(lambda: (
+        sb_table("produzione_vendor").select("*").eq("id", src_id).single().execute()
+    )).data
+    if not src:
+        return None
+
+    take = min(int(src.get("da_produrre") or 0), int(qty))
+    if take <= 0:
+        return None
+
+    sku  = src.get("sku")
+    ean  = src.get("ean")
+    st   = src.get("stato_produzione")
+    can  = src.get("canale")
+
+    # 2) cerca/crea target con stessa chiave logica ma data nuova
+    def _select_target():
+        q = (sb_table("produzione_vendor")
+             .select("id, da_produrre, plus")
+             .eq("sku", sku)
+             .eq("stato_produzione", st)
+             .eq("canale", can)
+             .eq("start_delivery", new_start_delivery))
+        if ean is None:
+            q = q.is_("ean", "null")
+        else:
+            q = q.eq("ean", ean)
+        return q.limit(1).execute()
+
+    found = supa_with_retry(_select_target).data or []
+    if found:
+        tgt = found[0]
+        tgt_id = int(tgt["id"])
+        new_val = int(tgt.get("da_produrre") or 0) + take
+        supa_with_retry(lambda: (
+            sb_table("produzione_vendor").update({"da_produrre": new_val}).eq("id", tgt_id).execute()
+        ))
+    else:
+        nuovo = {
+            "prelievo_id": src.get("prelievo_id"),
+            "sku": sku,
+            "ean": ean,
+            "qty": src.get("qty"),              # informativo
+            "riscontro": src.get("riscontro"),  # informativo
+            "plus": 0,
+            "start_delivery": new_start_delivery,
+            "stato": src.get("stato"),
+            "stato_produzione": st,
+            "da_produrre": take,
+            "cavallotti": src.get("cavallotti"),
+            "note": src.get("note"),
+            "canale": can,
+        }
+        inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
+        tgt_id = int(inserted[0]["id"]) if inserted else None
+
+    # 3) scala la sorgente (e cancella se diventa 0)
+    src_before = int(src.get("da_produrre") or 0)
+    src_after  = src_before - take
+    supa_with_retry(lambda: (
+        sb_table("produzione_vendor").update({"da_produrre": src_after}).eq("id", src_id).execute()
+    ))
+    if src_after <= 0:
+        supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", src_id).execute())
+
+    # 4) log di retarget (sulla SORGENTE)
+    try:
+        src_log_row = dict(src); src_log_row["id"] = src_id
+        log_movimento_produzione(
+            src_log_row,
+            utente=user_label,
+            motivo="Retarget data (auto)",
+            stato_vecchio=st,
+            stato_nuovo=st,
+            qty_vecchia=src_before,
+            qty_nuova=src_after,
+            dettaglio={
+                "retarget": True,
+                "from_date": src.get("start_delivery"),
+                "to_date": new_start_delivery
+            }
+        )
+    except Exception:
+        pass
+
+    return tgt_id
 
 
 # -----------------------------------------------------------------------------
@@ -2596,13 +2696,19 @@ def badge_counts():
 
 def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parziale: int):
     """
-    Sposta in 'Trasferito' le quantità del parziale confermato, usando SOLO la RPC move_qty_rpc.
-    Ritorna un report: { "moved": int, "failures": [ {sku, take, error}, ... ] }
+    Sposta in 'Trasferito' le quantità del parziale confermato usando SOLO la RPC move_qty_rpc,
+    con regola 'riscontro-first'. Se, dopo il parziale, (Trasferito + Riscontro) >= Ordinate,
+    qualunque residuo in stati attivi (Stampato/Calandrato/Cucito/Confezionato) viene spostato
+    in 'Deposito'. Ritorna un report: { "moved": int, "failures": [ ... ], "deposited": int }.
     """
-    report = {"moved": 0, "failures": []}
+    report = {"moved": 0, "failures": [], "deposited": 0}
 
-    # 1) Riepilogo e parziale corrente
-    rres = supa_with_retry(lambda: (
+    # 0) util
+    def _rows(query_fn):
+        return supa_with_retry(lambda: query_fn()).data or []
+
+    # 1) id riepilogo e parziale corrente (dati + timestamp)
+    rres = _rows(lambda: (
         sb_table("ordini_vendor_riepilogo")
         .select("id")
         .eq("fulfillment_center", center)
@@ -2610,117 +2716,96 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         .limit(1)
         .execute()
     ))
-    rows_r = rres.data or []
-    riepilogo_id = rows_r[0]["id"] if rows_r else None
+    riepilogo_id = rres[0]["id"] if rres else None
     if not riepilogo_id:
-        return report  # niente da fare
+        return report
 
-    pres = supa_with_retry(lambda: (
+    pres = _rows(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("dati, gestito, numero_parziale, created_at")  # <-- aggiunto created_at
+        .select("dati, numero_parziale, created_at, confermato")
         .eq("riepilogo_id", riepilogo_id)
         .eq("numero_parziale", numero_parziale)
         .limit(1)
         .execute()
     ))
-    _pres_rows = pres.data or []
-    pres_data = _pres_rows[0] if _pres_rows else {}
-    dati_curr = pres_data.get("dati") or []
-    curr_ts = pres_data.get("created_at")  # <— TIMESTAMP del parziale corrente
+    if not pres:
+        return report
+    p_curr = pres[0]
+    curr_ts = p_curr.get("created_at")
+    dati_curr = p_curr.get("dati") or []
     if isinstance(dati_curr, str):
         try:
             dati_curr = json.loads(dati_curr)
         except Exception:
             dati_curr = []
-    curr_created = pres_data.get("created_at")  # <-- timestamp di riferimento
 
-    # 2) Quantità da spostare per SKU/EAN
-    parziale_sku_curr = {}
-    parziale_exact_curr = {}
+    # 2) aggregazioni parziale corrente (per sku ed esatto sku+ean)
+    parziale_sku_curr: dict[str,int] = {}
+    parziale_exact_curr: dict[tuple[str,str],int] = {}
     for r in (dati_curr or []):
         sku = r.get("model_number") or r.get("sku")
         ean = (r.get("vendor_product_id") or r.get("ean") or "")
-        q = int(r.get("quantita") or r.get("qty") or 0)
+        q   = int(r.get("quantita") or r.get("qty") or 0)
         if not sku or q <= 0:
             continue
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
         parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
-    # ---- Parziali precedenti (ordinati per created_at) ----
-    parziali_prec_all = supa_with_retry(lambda: (
+    # 3) parziali confermati precedenti (solo < curr_ts) per calcolo riscontro residuo
+    parz_prec = _rows(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("numero_parziale,dati,confermato,created_at")
+        .select("numero_parziale, dati, confermato, created_at")
         .eq("riepilogo_id", riepilogo_id)
-        .order("created_at", desc=False)  # asc=True  -> desc=False
+        .order("created_at")  # asc (default)
         .execute()
-    )).data or []
-
-    sum_parz_prec_sku = {}
-    for p in parziali_prec_all:
-        # prendi solo quelli CONFERMATI e temporalmente precedenti al corrente
+    ))
+    sum_parz_prec_sku: dict[str,int] = {}
+    for p in parz_prec:
         if not p.get("confermato"):
             continue
         p_ts = p.get("created_at")
         if curr_ts and p_ts and str(p_ts) >= str(curr_ts):
             continue
-
-        dati_p = p.get("dati") or []
-        if isinstance(dati_p, str):
+        dati = p.get("dati") or []
+        if isinstance(dati, str):
             try:
-                dati_p = json.loads(dati_p)
+                dati = json.loads(dati)
             except Exception:
-                dati_p = []
-        for r in dati_p:
-            sku_p = r.get("model_number") or r.get("sku")
-            q = int(r.get("quantita") or r.get("qty") or 0)
-            if not sku_p or q <= 0:
-                continue
-            sum_parz_prec_sku[sku_p] = sum_parz_prec_sku.get(sku_p, 0) + q
+                dati = []
+        for r in (dati or []):
+            sku = r.get("model_number") or r.get("sku")
+            q   = int(r.get("quantita") or r.get("qty") or 0)
+            if sku and q > 0:
+                sum_parz_prec_sku[sku] = sum_parz_prec_sku.get(sku, 0) + q
 
-    # riscontro stessa data
-    riscontro_sku = {}
-    prelievi_same_date = supa_with_retry(lambda: (
+    # 4) riscontro totale (stessa data)
+    prelievi_same_date = _rows(lambda: (
         sb_table("prelievi_ordini_amazon")
-        .select("sku,riscontro")
+        .select("sku, qty, riscontro")
         .eq("start_delivery", start_delivery)
         .execute()
-    )).data or []
+    ))
+    riscontro_sku: dict[str,int] = {}
+    ordered_qty_sku: dict[str,int] = {}
     for p in prelievi_same_date:
-        sku_p = p.get("sku")
-        if not sku_p:
+        sku = p.get("sku")
+        if not sku:
             continue
         try:
-            riscontro_sku[sku_p] = riscontro_sku.get(sku_p, 0) + int(p.get("riscontro") or 0)
+            riscontro_sku[sku] = riscontro_sku.get(sku, 0) + int(p.get("riscontro") or 0)
+            ordered_qty_sku[sku] = ordered_qty_sku.get(sku, 0) + int(p.get("qty") or 0)
         except Exception:
             pass
 
-    # qty da spostare per SKU = parziale_corrente - max(0, riscontro_totale - somma_parziali_precedenti)
-    to_move_sku = {}
+    # 5) 'need' per SKU con regola "riscontro-first"
+    to_move_sku: dict[str,int] = {}
     for sku, q_curr in parziale_sku_curr.items():
-        residuo_riscontro = max(0, riscontro_sku.get(sku, 0) - sum_parz_prec_sku.get(sku, 0))
-        to_move_sku[sku] = max(0, q_curr)
+        risc_residuo = max(0, riscontro_sku.get(sku, 0) - sum_parz_prec_sku.get(sku, 0))
+        to_move_sku[sku] = max(0, q_curr - risc_residuo)
 
-
-    # 3) Righe produzione "attive"
+    # 6) selezione candidati attivi e movimenti verso 'Trasferito'
     stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
     stato_index = {s: i for i, s in enumerate(stati_attivi)}
-    target_skus = [s for s, need in to_move_sku.items() if need > 0]
-    if not target_skus:
-        return report
-
-    rows_all = supa_with_retry(lambda: (
-        sb_table("produzione_vendor")
-        .select("*")
-        .in_("sku", target_skus)
-        .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi"])
-        .execute()
-    )).data or []
-
-    rows_by_sku, rows_by_exact = {}, {}
-    for r in rows_all:
-        sku_r = r.get("sku"); ean_r = (r.get("ean") or "")
-        rows_by_sku.setdefault(sku_r, []).append(r)
-        rows_by_exact.setdefault((sku_r, ean_r), []).append(r)
 
     def _priority(row):
         same_date = 0 if str(row.get("start_delivery") or "")[:10] == str(start_delivery)[:10] else 1
@@ -2728,71 +2813,54 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         dt = str(row.get("start_delivery") or "")
         return (same_date, st_i, dt)
 
-    for k in rows_by_sku: rows_by_sku[k].sort(key=_priority)
-    for k in rows_by_exact: rows_by_exact[k].sort(key=_priority)
-
-    # 4) Spostamenti tramite RPC (atomici, con lock)
     for sku, need in list(to_move_sku.items()):
         if need <= 0:
             continue
 
-        need_initial = int(need)
         moved_for_sku = 0
 
-        # Riprova più volte ricaricando i candidati (stato si muove durante le RPC)
-        # 3 pass sono più che sufficienti per coprire i casi reali
-        for _pass in range(3):
+        # -------- PASSATA 1: stessa data (già in uso) --------
+        for _pass in range(2):  # 2 giri leggeri per refresh
             if need <= 0:
                 break
-
-            # (ri)costruisci i candidati aggiornati
             rows_all = supa_with_retry(lambda: (
                 sb_table("produzione_vendor")
                 .select("*")
                 .eq("sku", sku)
-                .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi"])
+                .eq("start_delivery", start_delivery)
+                .eq("canale", "Amazon Vendor")             # <-- CANALE vincolato
+                .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi", "Deposito"])
                 .execute()
             )).data or []
 
             rows_by_sku, rows_by_exact = {}, {}
             for r in rows_all:
-                sku_r = r.get("sku"); ean_r = (r.get("ean") or "")
-                rows_by_sku.setdefault(sku_r, []).append(r)
-                rows_by_exact.setdefault((sku_r, ean_r), []).append(r)
-
-            def _priority(row):
-                same_date = 0 if str(row.get("start_delivery") or "")[:10] == str(start_delivery)[:10] else 1
-                st_i = stato_index.get(row.get("stato_produzione"), 999)
-                dt = str(row.get("start_delivery") or "")
-                return (same_date, st_i, dt)
-
-            for k in rows_by_sku: rows_by_sku[k].sort(key=_priority)
+                ean_r = (r.get("ean") or "")
+                rows_by_sku.setdefault(sku, []).append(r)
+                rows_by_exact.setdefault((sku, ean_r), []).append(r)
+            for k in rows_by_sku:   rows_by_sku[k].sort(key=_priority)
             for k in rows_by_exact: rows_by_exact[k].sort(key=_priority)
 
-            # ordina prima per exact (EAN) in base al parziale, poi per SKU
             eans_for_sku = sorted(
-                [ean for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
+                [e for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
                 key=lambda e: parziale_exact_curr.get((sku, e), 0),
                 reverse=True
             )
-            ordered_candidates = []
-            for e in eans_for_sku:
-                ordered_candidates.extend(rows_by_exact.get((sku, e), []))
-            already_ids = {r["id"] for r in ordered_candidates}
-            ordered_candidates.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids])
+            ordered = []
+            for e in eans_for_sku: ordered.extend(rows_by_exact.get((sku, e), []))
+            already = {r["id"] for r in ordered}
+            ordered.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already])
 
-            # tenta i candidati aggiornati
-            for r in ordered_candidates:
+            for row in ordered:
                 if need <= 0:
                     break
-                avail = int(r.get("da_produrre") or 0)
+                avail = int(row.get("da_produrre") or 0)
                 if avail <= 0:
                     continue
-
                 take = min(avail, need)
                 try:
                     payload = {
-                        "p_from_id": int(r["id"]),
+                        "p_from_id": int(row["id"]),
                         "p_to_state": "Trasferito",
                         "p_qty": int(take),
                         "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
@@ -2802,24 +2870,115 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                     moved_for_sku += take
                     need -= take
                 except Exception as ex:
-                    logging.warning(
-                        "[move_to_trasferito] fallimento sku=%s take=%s payload=%s err=%s",
-                        sku, take, payload, ex
-                    )
+                    logging.warning("[move_to_trasferito] same-date sku=%s take=%s err=%s", sku, take, ex)
                     report["failures"].append({"sku": sku, "take": int(take), "error": str(ex)})
-                    # non decremento need: si prova il prossimo candidato
 
-        # se ancora resta bisogno, spiega bene cosa è rimasto e perché
+        # -------- PASSATA 2 (FALLBACK): ALTRE DATE -> RETARGET -> TRASFERITO --------
+        if need > 0:
+            rows_other = supa_with_retry(lambda: (
+                sb_table("produzione_vendor")
+                .select("*")
+                .eq("sku", sku)
+                .eq("canale", "Amazon Vendor")             # <-- CANALE vincolato
+                .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi", "Deposito"])
+                .neq("start_delivery", start_delivery)
+                .execute()
+            )).data or []
+
+            st_order = {s: i for i, s in enumerate(stati_attivi)}
+            rows_other.sort(key=lambda r: (st_order.get(r.get("stato_produzione"), 999),
+                                        str(r.get("start_delivery") or "")))
+
+            user_label = "Sistema (retarget auto)"
+            for row in rows_other:
+                if need <= 0:
+                    break
+                avail = int(row.get("da_produrre") or 0)
+                if avail <= 0:
+                    continue
+                take = min(avail, need)
+
+                tgt_id = _retarget_qty_to_date(int(row["id"]), str(start_delivery), int(take), user_label)
+                if not tgt_id:
+                    continue
+
+                try:
+                    payload = {
+                        "p_from_id": int(tgt_id),
+                        "p_to_state": "Trasferito",
+                        "p_qty": int(take),
+                        "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
+                    }
+                    supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
+                    report["moved"] += take
+                    moved_for_sku += take
+                    need -= take
+                except Exception as ex:
+                    logging.warning("[move_to_trasferito] cross-date sku=%s take=%s err=%s", sku, take, ex)
+                    report["failures"].append({"sku": sku, "take": int(take), "error": f"retarget+move: {ex}"})
+
         if need > 0:
             report["failures"].append({
                 "sku": sku,
                 "missing": int(need),
-                "need_initial": int(need_initial),
-                "moved_for_sku": int(moved_for_sku),
-                "sum_parz_prec_sku": int(sum_parz_prec_sku.get(sku, 0)),
-                "riscontro_totale": int(riscontro_sku.get(sku, 0)),
-                "note": "residuo non spostabile ora (resta in stati attivi o coperto da riscontro, o candidati esauriti)"
+                "note": "residuo non spostabile (nessun attivo disponibile)"
             })
 
+
+    # 7) Post-step: se (Trasferito + Riscontro) >= Ordinato -> sposta residui attivi in 'Deposito'
+    #    (evita code appese quando gli operatori "trovano" pezzi extra)
+    deposited_total = 0
+    target_skus = list(parziale_sku_curr.keys())  # solo gli SKU toccati dal parziale
+
+    for sku in target_skus:
+        ordered = int(ordered_qty_sku.get(sku, 0))
+        risc    = int(riscontro_sku.get(sku, 0))
+
+        # transferred totale
+        transferred = sum(int(r.get("da_produrre") or 0) for r in _rows(lambda: (
+            sb_table("produzione_vendor")
+            .select("da_produrre")
+            .eq("sku", sku)
+            .eq("canale", "Amazon Vendor")
+            .eq("stato_produzione", "Trasferito")
+            .eq("start_delivery", start_delivery)
+            .execute()
+        )))
+
+        # residui attivi
+        active_rows = _rows(lambda: (
+            sb_table("produzione_vendor")
+            .select("id, da_produrre, stato_produzione")
+            .eq("sku", sku)
+            .eq("canale", "Amazon Vendor")
+            .eq("start_delivery", start_delivery)
+            .in_("stato_produzione", stati_attivi)
+            .execute()
+        ))
+        active_total = sum(int(r.get("da_produrre") or 0) for r in active_rows)
+
+        if (transferred + risc) >= ordered and active_total > 0:
+            # sposta TUTTO l'attivo a 'Deposito'
+            # priorità: più "avanti" prima
+            st_order = {s: i for i, s in enumerate(stati_attivi)}
+            active_rows.sort(key=lambda r: st_order.get(r.get("stato_produzione"), 999), reverse=True)
+            for row in active_rows:
+                qty = int(row.get("da_produrre") or 0)
+                if qty <= 0:
+                    continue
+                try:
+                    payload = {
+                        "p_from_id": int(row["id"]),
+                        "p_to_state": "Deposito",
+                        "p_qty": int(qty),
+                        "p_user_label": "Sistema (cleanup post-conferma)"
+                    }
+                    supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
+                    deposited_total += qty
+                except Exception as ex:
+                    logging.warning("[deposito_cleanup] sku=%s qty=%s err=%s", sku, qty, ex)
+                    report["failures"].append({"sku": sku, "take": int(qty), "error": f"deposito: {ex}"})
+
+    report["deposited"] = deposited_total
     return report
  

@@ -28,6 +28,51 @@ bp = Blueprint("produzione", __name__)
 # Helper & Utilities
 # =============================================================================
 
+def _coalesce_logs(logs, window_seconds=3):
+    """
+    Deduplica i trigger tecnici a ridosso di un'azione umana.
+    Regola: se entro 'window_seconds' c'è un log dell'operatore
+    che descrive la stessa azione, nascondi il Trigger INSERT/UPDATE.
+    """
+    out = []
+    # indicizza per (sku, ean, stato_nuovo, qty_nuova) entro la finestra
+    human_events = []
+    for l in logs:
+        when = None
+        try:
+            when = datetime.fromisoformat(str(l.get("created_at")).replace("Z", "+00:00"))
+        except Exception:
+            pass
+        l["_dt"] = when
+        is_human = (l.get("utente") or "").strip().lower() not in ("", "postgres", "postgrest", "supabase", "sistema")
+        if is_human:
+            human_events.append(l)
+
+    for l in logs:
+        motivo_low = (l.get("motivo") or "").strip().lower()
+        if motivo_low.startswith("trigger"):
+            # cerca human match nella finestra temporale
+            dt = l.get("_dt")
+            if dt:
+                for h in human_events:
+                    if h.get("sku")==l.get("sku") and h.get("ean")==l.get("ean"):
+                        if h.get("stato_nuovo")==l.get("stato_nuovo") and h.get("qty_nuova")==l.get("qty_nuova"):
+                            hdt = h.get("_dt")
+                            if hdt and abs((hdt - dt).total_seconds()) <= window_seconds:
+                                # drop questo trigger
+                                break
+                else:
+                    out.append(l)
+            else:
+                out.append(l)
+        else:
+            out.append(l)
+    # pulizia
+    for l in out:
+        l.pop("_dt", None)
+    return out
+
+
 # eccezioni di rete retryable per supabase
 _RETRYABLE_EXC = (
     httpx.RemoteProtocolError,
@@ -277,6 +322,19 @@ def patch_produzione(id):
                 stato_vecchio=old["stato_produzione"],
                 stato_nuovo=data["stato_produzione"]
             ))
+            # Log coerente di spostamento (per la flow map)
+            moved_qty = int(old.get("da_produrre") or 0)
+            if moved_qty > 0:
+                log_entries.append(dict(
+                    produzione_row=old,
+                    utente=utente,
+                    motivo=f"Spostamento a {data['stato_produzione']}",
+                    stato_vecchio=old["stato_produzione"],
+                    stato_nuovo=data["stato_produzione"],
+                    qty_vecchia=moved_qty,
+                    qty_nuova=0
+                ))
+                
         if "da_produrre" in data and data["da_produrre"] != old["da_produrre"]:
             fields["da_produrre"] = data["da_produrre"]
             fields["modificata_manualmente"] = True
@@ -319,6 +377,8 @@ def patch_produzione(id):
         logging.exception("[patch_produzione] Errore patch produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
+
+
 # -----------------------------------------------------------------------------
 # Patch bulk produzione (con log)
 # -----------------------------------------------------------------------------
@@ -344,6 +404,19 @@ def patch_produzione_bulk():
                     stato_vecchio=r["stato_produzione"],
                     stato_nuovo=update_fields["stato_produzione"]
                 ))
+                
+               # ➜ Log “Spostamento a …” (bulk) con la quantità della riga r
+                moved_qty = int(r.get("da_produrre") or 0)
+                if moved_qty > 0:
+                    logs.append(dict(
+                        produzione_row=r,
+                        utente=utente,
+                        motivo=f"Spostamento a {update_fields['stato_produzione']}",
+                        stato_vecchio=r["stato_produzione"],
+                        stato_nuovo=update_fields["stato_produzione"],
+                        qty_vecchia=moved_qty,
+                        qty_nuova=0,
+                    ))    
             if "da_produrre" in update_fields and update_fields["da_produrre"] != r["da_produrre"]:
                 logs.append(dict(
                     produzione_row=r,
@@ -466,7 +539,7 @@ def get_log_movimenti(id):
 
             out.append(l)
 
-        return jsonify(out)
+        return jsonify(_coalesce_logs(out, window_seconds=3))
     except Exception as ex:
         logging.exception(f"[get_log_movimenti] Errore GET log movimenti produzione {id}")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
