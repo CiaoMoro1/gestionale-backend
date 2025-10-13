@@ -2626,6 +2626,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     _pres_rows = pres.data or []
     pres_data = _pres_rows[0] if _pres_rows else {}
     dati_curr = pres_data.get("dati") or []
+    curr_ts = pres_data.get("created_at")  # <— TIMESTAMP del parziale corrente
     if isinstance(dati_curr, str):
         try:
             dati_curr = json.loads(dati_curr)
@@ -2645,21 +2646,22 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
         parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
-    parziali_prec = supa_with_retry(lambda: (
+    # ---- Parziali precedenti (ordinati per created_at) ----
+    parziali_prec_all = supa_with_retry(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("numero_parziale,dati,confermato,created_at")  # <-- aggiunto created_at
+        .select("dati, confermato, created_at")
         .eq("riepilogo_id", riepilogo_id)
-        .order("created_at")                                   # <-- ordina per tempo
+        .order("created_at", asc=True)
         .execute()
     )).data or []
 
-    sum_parz_prec_sku: dict[str, int] = {}
-    for p in parziali_prec:
+    sum_parz_prec_sku = {}
+    for p in parziali_prec_all:
+        # prendi solo quelli CONFERMATI e temporalmente precedenti al corrente
         if not p.get("confermato"):
             continue
-
-        # Considera "precedente" solo se creato prima del parziale corrente
-        if curr_created and p.get("created_at") and str(p["created_at"]) >= str(curr_created):
+        p_ts = p.get("created_at")
+        if curr_ts and p_ts and str(p_ts) >= str(curr_ts):
             continue
 
         dati_p = p.get("dati") or []
@@ -2668,13 +2670,12 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 dati_p = json.loads(dati_p)
             except Exception:
                 dati_p = []
-
         for r in dati_p:
-            model = r.get("model_number") or r.get("sku")
+            sku_p = r.get("model_number") or r.get("sku")
             q = int(r.get("quantita") or r.get("qty") or 0)
-            if not model or q <= 0:
+            if not sku_p or q <= 0:
                 continue
-            sum_parz_prec_sku[model] = sum_parz_prec_sku.get(model, 0) + q
+            sum_parz_prec_sku[sku_p] = sum_parz_prec_sku.get(sku_p, 0) + q
 
     # riscontro stessa data
     riscontro_sku = {}
@@ -2776,7 +2777,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
             report["failures"].append({
                 "sku": sku,
                 "missing": int(need),
-                "error": "non disponibile in stati attivi (restano DS) o residuo riscontro"
+                "error": "residuo non spostabile ora (resta in stati attivi o coperto da riscontro)"
             })
 
     return report
