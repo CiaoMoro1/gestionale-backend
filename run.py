@@ -25,6 +25,7 @@ from app.routes.fatture_amazon_vendor import bp as fatture_amazon_vendor_bp
 from app.routes.notecredito_amazon_reso import bp as notecredito_amazon_reso_bp
 from app.routes.notecredito import bp as notecredito_tools_bp
 from app.routes.produzione import bp as produzione_bp  # NEW
+from app.routes.prelievo import bp as prelievo_bp  # NEW
 
 
 
@@ -63,6 +64,7 @@ def create_app():
     app.register_blueprint(amazon_oauth_bp)
     app.register_blueprint(cavallotti.bp)
     app.register_blueprint(jobs_bp)
+    app.register_blueprint(prelievo_bp)  # NEW
     names = ", ".join(sorted(app.blueprints.keys()))
     logging.info(f"App Flask avviata. Blueprint registrati: {names}")
     return app

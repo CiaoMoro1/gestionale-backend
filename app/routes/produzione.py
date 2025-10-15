@@ -322,18 +322,6 @@ def patch_produzione(id):
                 stato_vecchio=old["stato_produzione"],
                 stato_nuovo=data["stato_produzione"]
             ))
-            # Log coerente di spostamento (per la flow map)
-            moved_qty = int(old.get("da_produrre") or 0)
-            if moved_qty > 0:
-                log_entries.append(dict(
-                    produzione_row=old,
-                    utente=utente,
-                    motivo=f"Spostamento a {data['stato_produzione']}",
-                    stato_vecchio=old["stato_produzione"],
-                    stato_nuovo=data["stato_produzione"],
-                    qty_vecchia=moved_qty,
-                    qty_nuova=0
-                ))
                 
         if "da_produrre" in data and data["da_produrre"] != old["da_produrre"]:
             fields["da_produrre"] = data["da_produrre"]
@@ -391,55 +379,38 @@ def patch_produzione_bulk():
             return jsonify({"error": "Nessun id/campo"}), 400
 
         utente = _current_user_label()
-        rows = supa_with_retry(lambda: (
-            sb_table("produzione_vendor").select("*").in_("id", ids).execute()
-        )).data
-        logs = []
-        for r in rows:
-            if "stato_produzione" in update_fields and update_fields["stato_produzione"] != r["stato_produzione"]:
-                logs.append(dict(
-                    produzione_row=r,
-                    utente=utente,
-                    motivo="Cambio stato (bulk)",
-                    stato_vecchio=r["stato_produzione"],
-                    stato_nuovo=update_fields["stato_produzione"]
-                ))
-                
-               # ➜ Log “Spostamento a …” (bulk) con la quantità della riga r
-                moved_qty = int(r.get("da_produrre") or 0)
-                if moved_qty > 0:
-                    logs.append(dict(
-                        produzione_row=r,
-                        utente=utente,
-                        motivo=f"Spostamento a {update_fields['stato_produzione']}",
-                        stato_vecchio=r["stato_produzione"],
-                        stato_nuovo=update_fields["stato_produzione"],
-                        qty_vecchia=moved_qty,
-                        qty_nuova=0,
-                    ))    
-            if "da_produrre" in update_fields and update_fields["da_produrre"] != r["da_produrre"]:
-                logs.append(dict(
-                    produzione_row=r,
-                    utente=utente,
-                    motivo="Modifica quantità (bulk)",
-                    qty_vecchia=r["da_produrre"],
-                    qty_nuova=update_fields["da_produrre"]
-                ))
-            if "plus" in update_fields and (r.get("plus") or 0) != (update_fields.get("plus") or 0):
-                logs.append(dict(
-                    produzione_row=r,
-                    utente=utente,
-                    motivo="Modifica plus (bulk)",
-                    plus_vecchio=r.get("plus") or 0,
-                    plus_nuovo=update_fields["plus"]
-                ))
 
+        # 👉 Aggiornamento bulk “secco”: niente select preventiva, niente log per-riga
         supa_with_retry(lambda: (
             sb_table("produzione_vendor").update(update_fields).in_("id", ids).execute()
         ))
 
-        for entry in logs:
-            log_movimento_produzione(**entry)
+        # 👉 Unico log di riepilogo dell’operazione bulk
+        try:
+            stub = {
+                "id": None,
+                "sku": "*",
+                "ean": None,
+                "start_delivery": None,
+                "stato_produzione": None,
+                "plus": 0,
+                "canale": "Amazon Vendor",
+            }
+            log_movimento_produzione(
+                stub,
+                utente=utente,
+                motivo="Bulk update produzione",
+                dettaglio={
+                    # se in futuro distingui scope, cambia questo valore:
+                    "scope": "bulk_selected",   # possibili: 'bulk_selected' | 'bulk_filtered' | 'bulk_all'
+                    "affected_count": len(ids),
+                    "fields": update_fields,
+                    "ids": ids,
+                },
+            )
+        except Exception:
+            # il bulk rimane valido anche se il log di riepilogo fallisse
+            pass
 
         return jsonify({"ok": True, "updated_count": len(ids)})
     except Exception as ex:
@@ -616,11 +587,29 @@ def pulisci_da_stampare_endpoint():
                 ids_da_eliminare.append(r["id"])
 
         if ids_da_eliminare:
-            rows_log = supa_with_retry(lambda: (
-                sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute()
-            )).data
-            for riga in rows_log:
-                log_movimento_produzione(riga, utente=_current_user_label(), motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)")
+            # Log unico di sintesi (nessun log per singola riga)
+            try:
+                stub = {
+                    "id": None,
+                    "sku": "*",
+                    "ean": None,
+                    "start_delivery": None,
+                    "stato_produzione": None,
+                    "plus": 0,
+                    "canale": "Amazon Vendor",
+                }
+                log_movimento_produzione(
+                    stub,
+                    utente=_current_user_label(),
+                    motivo="Pulizia Da Stampare",
+                    dettaglio={
+                        "scope": "globale",
+                        "deleted": len(ids_da_eliminare),
+                    },
+                )
+            except Exception:
+                pass
+
             supa_with_retry(lambda: (
                 sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
             ))
@@ -629,6 +618,7 @@ def pulisci_da_stampare_endpoint():
     except Exception as ex:
         logging.exception("[pulisci_da_stampare_endpoint] Errore pulizia produzione da stampare")
         return jsonify({"error": f"Errore pulizia: {str(ex)}"}), 500
+
 
 # -----------------------------------------------------------------------------
 # Pulizia parziale "Da Stampare"
@@ -679,11 +669,31 @@ def pulisci_da_stampare_parziale():
                 ids_da_eliminare.append(r["id"])
 
         if ids_da_eliminare:
-            rows_log = supa_with_retry(lambda: (
-                sb_table("produzione_vendor").select("*").in_("id", ids_da_eliminare).execute()
-            )).data
-            for riga in rows_log:
-                log_movimento_produzione(riga, utente=_current_user_label(), motivo="Auto-eliminazione da pulizia prelievo (vecchia data o assente)")
+            # Log unico di sintesi (nessun log per singola riga)
+            try:
+                stub = {
+                    "id": None,
+                    "sku": "*",
+                    "ean": None,
+                    "start_delivery": None,
+                    "stato_produzione": None,
+                    "plus": 0,
+                    "canale": "Amazon Vendor",
+                }
+                log_movimento_produzione(
+                    stub,
+                    utente=_current_user_label(),
+                    motivo="Pulizia Da Stampare (parziale)",
+                    dettaglio={
+                        "scope": "parziale",
+                        "deleted": len(ids_da_eliminare),
+                        "radice": radice,
+                        "prelievo_ids": ids,
+                    },
+                )
+            except Exception:
+                pass
+
             supa_with_retry(lambda: (
                 sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
             ))
@@ -692,7 +702,6 @@ def pulisci_da_stampare_parziale():
     except Exception as ex:
         logging.exception("[pulisci_da_stampare_parziale] Errore pulizia parziale da stampare")
         return jsonify({"error": f"Errore pulizia parziale: {str(ex)}"}), 500
-
 
 # -----------------------------------------------------------------------------
 # Inserimento manuale in produzione (canali: Amazon Seller, Sito)

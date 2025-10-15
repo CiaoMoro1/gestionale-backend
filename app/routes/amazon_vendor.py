@@ -2126,6 +2126,33 @@ def aggiorna_parziale_gestito():
 # -----------------------------------------------------------------------------
 # Logging movimenti produzione
 # -----------------------------------------------------------------------------
+
+def _log_sync_summary(*, utente: str, motivo: str, scope: str, dettaglio: dict):
+    """
+    Scrive UN SOLO log riepilogativo per i job/sync automatici (no spam per-riga).
+    """
+    try:
+        stub = {
+            "id": None,
+            "sku": "*",
+            "ean": None,
+            "start_delivery": None,
+            "stato_produzione": None,
+            "plus": 0,
+            "canale": "Amazon Vendor",
+        }
+        log_movimento_produzione(
+            stub,
+            utente=utente or "Sistema",
+            motivo=motivo,
+            dettaglio={"scope": scope, **(dettaglio or {})}
+        )
+    except Exception as ex:
+        logging.warning("[_log_sync_summary] errore log: %s", ex)
+
+
+
+
 def log_movimento_produzione(
     produzione_row, utente, motivo,
     stato_vecchio=None, stato_nuovo=None,
@@ -2487,23 +2514,27 @@ def sync_produzione(prelievi_modificati, utente=None, motivo="Modifica prelievo"
         except Exception as ex:
             logging.error(f"[sync_produzione] Errore update produzione_vendor id={id_val}: {ex}")
 
-    if to_insert:
-        BATCH = 100
-        for i in range(0, len(to_insert), BATCH):
-            batch = to_insert[i:i + BATCH]
-            try:
-                inserted = supa_with_retry(lambda b=batch: (
-                    sb_table("produzione_vendor").insert(b).execute()
-                )).data
-                for irow in inserted or []:
-                    log_other.append(dict(
-                        produzione_row=irow,
-                        utente=utente,
-                        motivo="Creazione da patch prelievo",
-                        qty_nuova=irow.get("da_produrre")
-                    ))
-            except Exception as ex:
-                logging.error(f"[sync_produzione] Errore insert produzione_vendor batch={i}-{i + BATCH}: {ex}")
+        if to_insert:
+            BATCH = 100
+            for i in range(0, len(to_insert), BATCH):
+                batch = to_insert[i:i + BATCH]
+                try:
+                    # 🔐 idempotente: se esiste già una DS per quel prelievo_id, aggiorna invece di creare doppioni
+                    inserted = supa_with_retry(lambda b=batch: (
+                        sb_table("produzione_vendor").upsert(b, on_conflict="prelievo_id").execute()
+                    )).data
+                    # NB: a seconda della versione, .data può non contenere tutte le righe "conflict update";
+                    # va bene comunque: il flusso non dipende da questi log per-riga.
+                    for irow in inserted or []:
+                        log_other.append(dict(
+                            produzione_row=irow,
+                            utente=utente,
+                            motivo="Creazione da patch prelievo",
+                            qty_nuova=irow.get("da_produrre")
+                        ))
+                except Exception as ex:
+                    logging.error(f"[sync_produzione] Errore upsert produzione_vendor batch={i}-{i + BATCH}: {ex}")
+
 
     flush_logs(log_other)
 
