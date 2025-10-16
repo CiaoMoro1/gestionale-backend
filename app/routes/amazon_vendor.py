@@ -510,37 +510,41 @@ def site_orders_sku_summary():
 # -----------------------------------------------------------------------------
 def sync_produzione_from_prelievo(prelievo_id):
     """
-    Sincronizza produzione_vendor a partire da una singola riga di prelievo.
+    Sincronizza produzione_vendor per UNA riga di prelievo (Amazon Vendor).
+    Idempotente su prelievo_id.
     """
     try:
         res = supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").select("*").eq("id", prelievo_id).single()
-            .execute()
+            sb_table("prelievi_ordini_amazon")
+            .select("*").eq("id", prelievo_id).single().execute()
         ))
         prelievo = res.data
         if not prelievo:
             logging.warning(f"[sync_produzione_from_prelievo] Prelievo ID {prelievo_id} non trovato")
             return
 
-        stato = prelievo["stato"]
+        stato = prelievo.get("stato")
         qty = int(prelievo.get("qty") or 0)
         riscontro = int(prelievo.get("riscontro") or 0)
         plus = int(prelievo.get("plus") or 0)
 
+        # richiesta base in funzione dello stato (parziale/manca/completo)
         if stato == "manca":
-            da_produrre = qty + plus
+            richiesta = qty
         elif stato == "parziale":
-            da_produrre = (qty - riscontro) + plus
-        elif stato == "completo" and plus > 0:
-            da_produrre = plus
+            richiesta = max(0, qty - riscontro)
+        elif stato == "completo":
+            richiesta = 0
         else:
-            logging.info(f"[sync_produzione_from_prelievo] Niente da produrre per prelievo {prelievo_id}, stato: {stato}")
-            return
+            # fallback prudente: come parziale
+            richiesta = max(0, qty - riscontro)
+
+        da_produrre = richiesta + max(0, plus)
 
         row = {
             "prelievo_id": prelievo["id"],
-            "sku": prelievo["sku"],
-            "ean": prelievo["ean"],
+            "sku": prelievo.get("sku"),
+            "ean": prelievo.get("ean"),
             "qty": qty,
             "riscontro": riscontro,
             "plus": plus,
@@ -550,15 +554,16 @@ def sync_produzione_from_prelievo(prelievo_id):
             "da_produrre": da_produrre,
             "note": prelievo.get("note"),
             "centri": prelievo.get("centri") or {},
-            "canale": "Amazon Vendor",          # <-- AGGIUNGI QUESTO
+            "canale": "Amazon Vendor",
             "updated_at": (datetime.now(timezone.utc)).isoformat()
         }
 
-        supa_with_retry(lambda: sb_table("produzione_vendor").upsert(row, on_conflict="prelievo_id"))
-        logging.info(f"[sync_produzione_from_prelievo] Upsert produzione_vendor completata per prelievo {prelievo_id}")
-    except Exception as ex:
-        logging.exception(f"[sync_produzione_from_prelievo] Errore definitivo per prelievo {prelievo_id}: {ex}")
+        # Idempotente: richiede vincolo unico su prelievo_id (tu ce l'hai già)
+        supa_with_retry(lambda: sb_table("produzione_vendor").upsert(row, on_conflict="prelievo_id").execute())
+        logging.info(f"[sync_produzione_from_prelievo] upsert OK prelievo {prelievo_id} (da_produrre={da_produrre})")
 
+    except Exception as ex:
+        logging.exception(f"[sync_produzione_from_prelievo] Errore per prelievo {prelievo_id}: {ex}")
 # -----------------------------------------------------------------------------
 # Upload ordini -> storage + job su Supabase
 # -----------------------------------------------------------------------------
