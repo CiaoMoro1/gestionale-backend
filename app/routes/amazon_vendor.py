@@ -700,24 +700,13 @@ def dettaglio_destinazione():
 
         ares = supa_with_retry(lambda: (
             sb_table("ordini_vendor_items")
-            .select("po_number, model_number, vendor_product_id, title, qty_ordered, fulfillment_center, start_delivery")
+            .select("po_number, model_number, vendor_product_id, title, qty_ordered")
             .in_("po_number", po_list)
-            .order("model_number")           # 👈 ordine stabile
-            .order("po_number") 
             .range(offset, offset + limit - 1)
             .execute()
         ))
         articoli = ares.data or []
-        seen = set()
-        dedup = []
-        for a in articoli:
-            k = (str(a.get("po_number") or "").upper(), str(a.get("model_number") or "").upper())
-            if k in seen:
-                continue
-            seen.add(k)
-            dedup.append(a)
-
-        return jsonify({"articoli": dedup, "riepilogo_id": riepilogo_id})
+        return jsonify({"articoli": articoli, "riepilogo_id": riepilogo_id})
     except Exception as ex:
         logging.exception("[dettaglio_destinazione] Errore interno")
         return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
