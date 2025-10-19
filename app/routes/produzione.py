@@ -315,71 +315,84 @@ def lista_produzione():
 # Patch singola riga produzione (con log)
 # -----------------------------------------------------------------------------
 @bp.route('/api/produzione/<int:id>', methods=['PATCH'])
-def patch_produzione(id):
+def patch_produzione(id: int):
     try:
         data = request.json or {}
-        fields = {}
+        fields: dict = {}
         utente = _current_user_label()
 
+        # riga "prima" dell'update (serve anche per il log)
         old = supa_with_retry(lambda: (
             sb_table("produzione_vendor").select("*").eq("id", id).single().execute()
         )).data
         if not old:
             return jsonify({"error": "Produzione non trovata"}), 404
 
-        log_entries = []
+        log_entries: list[dict] = []
 
+        # cambio stato
         if "stato_produzione" in data and data["stato_produzione"] != old["stato_produzione"]:
             fields["stato_produzione"] = data["stato_produzione"]
             log_entries.append(dict(
-                produzione_row=old,
+                row=old,
                 utente=utente,
                 motivo="Cambio stato",
                 stato_vecchio=old["stato_produzione"],
                 stato_nuovo=data["stato_produzione"]
             ))
-                
+
+        # cambio quantità (Da Stampare → libero, altri stati → password)
         if "da_produrre" in data and data["da_produrre"] != old["da_produrre"]:
+            if old["stato_produzione"] != "Da Stampare":
+                if data.get("password") != "oreste":
+                    return jsonify({"error": "Password richiesta per modificare la quantità in questo stato."}), 403
+
             fields["da_produrre"] = data["da_produrre"]
             fields["modificata_manualmente"] = True
             log_entries.append(dict(
-                produzione_row=old,
+                row=old,
                 utente=utente,
                 motivo="Modifica quantità",
                 qty_vecchia=old["da_produrre"],
                 qty_nuova=data["da_produrre"]
             ))
+
+        # cambio plus
         if "plus" in data and (old.get("plus") or 0) != (data.get("plus") or 0):
             fields["plus"] = data["plus"]
             log_entries.append(dict(
-                produzione_row=old,
+                row=old,
                 utente=utente,
                 motivo="Modifica plus",
                 plus_vecchio=old.get("plus") or 0,
                 plus_nuovo=data["plus"]
             ))
-        for f in ["cavallotti", "note"]:
+
+        # campi "soft"
+        for f in ("cavallotti", "note"):
             if f in data:
                 fields[f] = data[f]
-
-        if "da_produrre" in data and old["stato_produzione"] != "Da Stampare":
-            if data.get("password") != "oreste":
-                return jsonify({"error": "Password richiesta per modificare la quantità in questo stato."}), 403
 
         if not fields:
             return jsonify({"error": "Nessun campo da aggiornare"}), 400
 
+        # update
         res = supa_with_retry(lambda: (
-        sb_table("produzione_vendor").update(fields).eq("id", id).execute()
-            ))
+            sb_table("produzione_vendor").update(fields).eq("id", id).execute()
+        ))
 
+        # log: best-effort (non deve rompere la PATCH)
         for entry in log_entries:
-            log_movimento_produzione(**entry)
+            try:
+                log_movimento_produzione(**entry)
+            except Exception as ex:
+                logging.warning("[patch_produzione] log fallito: %s", ex)
 
         return jsonify({"ok": True, "updated": res.data})
     except Exception as ex:
         logging.exception("[patch_produzione] Errore patch produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
+
 
 
 
