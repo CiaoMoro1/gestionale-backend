@@ -177,43 +177,59 @@ def _eq_or_is_null(query, col: str, value):
         return query.is_(col, "null")
     return query.eq(col, value)
 
-def log_movimento_produzione(
-    produzione_row: Dict[str, Any],
-    *,
-    utente: str,
-    motivo: str,
-    stato_vecchio: Optional[str] = None,
-    stato_nuovo: Optional[str] = None,
-    qty_vecchia: Optional[int] = None,
-    qty_nuova: Optional[int] = None,
-    plus_vecchio: Optional[int] = None,
-    plus_nuovo: Optional[int] = None,
-    dettaglio: Optional[Dict[str, Any]] = None,
-) -> None:
+def _is_fk_error(ex: Exception) -> bool:
     try:
-        canale_norm = (produzione_row.get("canale") or "Amazon Vendor").strip() or "Amazon Vendor"
-        sku = produzione_row.get("sku")
-        payload = {
-            "produzione_id": produzione_row.get("id"),
-            "sku": sku,
-            "ean": produzione_row.get("ean"),
-            "start_delivery": produzione_row.get("start_delivery"),
-            "canale": canale_norm,  # <- evita NULL
-            "stato_vecchio": stato_vecchio,
-            "stato_nuovo": stato_nuovo,
-            "qty_vecchia": qty_vecchia,
-            "qty_nuova": qty_nuova,
-            "plus_vecchio": plus_vecchio,
-            "plus_nuovo": plus_nuovo,
-            "utente": utente or "Sistema",
-            "motivo": motivo or "Aggiornamento",
-            "dettaglio": (dettaglio or {}),
-            "meta": {"canale": canale_norm, "radice": estrai_radice(sku or "")},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        arg0 = ex.args[0] if ex.args else None
+        if isinstance(arg0, dict) and arg0.get("code") == "23503":
+            return True
+        s = str(ex).lower()
+        return "23503" in s or "foreign key" in s
+    except Exception:
+        return False
+    
+    
+def log_movimento_produzione(row, utente, motivo,
+                             stato_vecchio=None, stato_nuovo=None,
+                             qty_vecchia=None, qty_nuova=None,
+                             dettaglio=None, **extra):   # <--- NEW
+    # unisci extra nel dettaglio
+    det = dict(dettaglio or {})
+    for k, v in extra.items():
+        # evita collisioni con chiavi note
+        if k not in det:
+            det[k] = v
+
+    payload = {
+        "produzione_id": row.get("id"),
+        "sku": row.get("sku"),
+        "ean": row.get("ean"),
+        "canale": row.get("canale"),
+        "stato_vecchio": stato_vecchio,
+        "stato_nuovo": stato_nuovo,
+        "qty_vecchia": qty_vecchia,
+        "qty_nuova": qty_nuova,
+        "motivo": motivo,
+        "utente": utente,
+        "dettaglio": det
+    }
+
+    try:
         supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(payload).execute())
     except Exception as ex:
+        if _is_fk_error(ex):
+            payload2 = dict(payload)
+            payload2["produzione_id"] = None
+            det2 = dict(payload2.get("dettaglio") or {})
+            det2["_fk_fallback"] = True
+            det2["_missing_produzione_id"] = payload.get("produzione_id")
+            payload2["dettaglio"] = det2
+            try:
+                supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(payload2).execute())
+                return
+            except Exception as ex2:
+                logging.warning(f"[log_movimento_produzione] fallback FK fallito: {ex2}")
         logging.warning(f"[log_movimento_produzione] errore log: {ex}")
+
 
 @bp.get("/api/produzione/<int:produzione_id>/log-unified")
 def log_unified(produzione_id: int):
@@ -380,39 +396,87 @@ def patch_produzione_bulk():
 
         utente = _current_user_label()
 
-        # 👉 Aggiornamento bulk “secco”: niente select preventiva, niente log per-riga
-        supa_with_retry(lambda: (
-            sb_table("produzione_vendor").update(update_fields).in_("id", ids).execute()
-        ))
+        # CASO 1: non sto cambiando stato -> update secco idempotente
+        if "stato_produzione" not in update_fields:
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").update(update_fields).in_("id", ids).execute()
+            ))
+            try:
+                stub = {"id": None, "sku": "*", "ean": None, "start_delivery": None,
+                        "stato_produzione": None, "plus": 0, "canale": "Amazon Vendor"}
+                log_movimento_produzione(
+                    stub, utente=utente, motivo="Bulk update produzione",
+                    dettaglio={"affected_count": len(ids), "fields": update_fields, "ids": ids}
+                )
+            except Exception:
+                pass
+            return jsonify({"ok": True, "updated_count": len(ids)})
 
-        # 👉 Unico log di riepilogo dell’operazione bulk
+        # CASO 2: cambio stato -> usa MERGE (niente update in-place che collide con l’unico)
+        to_state = update_fields["stato_produzione"]
+        rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor").select("*").in_("id", ids).execute()
+        )).data or []
+
+        moved = 0
+        for r in rows:
+            q = int(r.get("da_produrre") or 0)
+
+            # se non c'è quantità, applica solo eventuali altri campi (es. plus/note) e continua
+            other_updates = {k: v for k, v in update_fields.items() if k != "stato_produzione"}
+            if q <= 0:
+                if other_updates:
+                    supa_with_retry(lambda: (
+                        sb_table("produzione_vendor").update(other_updates).eq("id", r["id"]).execute()
+                    ))
+                continue
+
+            # 1) sommo/creo la target con stesso sku/ean/canale/data ma stato=to_state
+            tgt_id = _merge_into_target(r, to_state, q, log_merge=False)
+
+            # 2) azzero e cancello la sorgente (così non collide col vincolo unico)
+            supa_with_retry(lambda: (
+                sb_table("produzione_vendor").update({"da_produrre": 0}).eq("id", r["id"]).execute()
+            ))
+            supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", r["id"]).execute())
+
+            # 3) eventuali altri campi (plus/note) li applico alla TARGET
+            if other_updates:
+                supa_with_retry(lambda: (
+                    sb_table("produzione_vendor").update(other_updates).eq("id", tgt_id).execute()
+                ))
+
+            # 4) log di spostamento — SULLA TARGET (per non rompere l’FK)
+            try:
+                log_movimento_produzione(
+                    {"id": tgt_id, "sku": r.get("sku"), "ean": r.get("ean"),
+                     "start_delivery": r.get("start_delivery"), "canale": r.get("canale")},
+                    utente=utente,
+                    motivo=f"Spostamento a {to_state}",
+                    stato_vecchio=r.get("stato_produzione"),
+                    stato_nuovo=to_state,
+                    qty_vecchia=q,          # quantità presa dalla sorgente
+                    qty_nuova=q,            # confluita nella target
+                    plus_vecchio=r.get("plus") or 0,
+                    plus_nuovo=(other_updates.get("plus") if "plus" in other_updates else (r.get("plus") or 0)),
+                    dettaglio={"source_id": r["id"], "bulk": True}
+                )
+            except Exception:
+                pass
+
+            moved += q
+
         try:
-            stub = {
-                "id": None,
-                "sku": "*",
-                "ean": None,
-                "start_delivery": None,
-                "stato_produzione": None,
-                "plus": 0,
-                "canale": "Amazon Vendor",
-            }
+            stub = {"id": None, "sku": "*", "ean": None, "start_delivery": None,
+                    "stato_produzione": None, "plus": 0, "canale": "Amazon Vendor"}
             log_movimento_produzione(
-                stub,
-                utente=utente,
-                motivo="Bulk update produzione",
-                dettaglio={
-                    # se in futuro distingui scope, cambia questo valore:
-                    "scope": "bulk_selected",   # possibili: 'bulk_selected' | 'bulk_filtered' | 'bulk_all'
-                    "affected_count": len(ids),
-                    "fields": update_fields,
-                    "ids": ids,
-                },
+                stub, utente=utente, motivo=f"Bulk spostamento a {to_state}",
+                dettaglio={"affected_count": len(rows), "moved_qty": moved}
             )
         except Exception:
-            # il bulk rimane valido anche se il log di riepilogo fallisse
             pass
 
-        return jsonify({"ok": True, "updated_count": len(ids)})
+        return jsonify({"ok": True, "moved_qty": moved})
     except Exception as ex:
         logging.exception("[patch_produzione_bulk] Errore PATCH bulk produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
@@ -466,7 +530,7 @@ def get_log_movimenti(id):
             q = sb_table("produzione_vendor").select("canale").eq("sku", l.get("sku"))
             q = _eq_or_is_null(q, "ean", l.get("ean"))
             q = _eq_or_is_null(q, "start_delivery", l.get("start_delivery"))
-            r = supa_with_retry(lambda: q.limit(1).execute()).data or []
+            r = supa_with_retry(lambda: q.order("id").limit(1).execute()).data or []
             return (r[0]["canale"] if r else None)
 
         def _humanize(l):
@@ -564,10 +628,10 @@ def pulisci_da_stampare_endpoint():
             )
 
         produzione = supa_with_retry(lambda: (
-            sb_table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").execute()
+            sb_table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").eq("canale", "Amazon Vendor").execute()
         )).data
         prelievi = supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").select("sku,ean,start_delivery").execute()
+            sb_table("prelievi_ordini_amazon").select("sku,ean,start_delivery").eq("canale", "Amazon Vendor").execute()
         )).data
 
         max_data_per_sku_ean = defaultdict(str)
@@ -629,6 +693,9 @@ def pulisci_da_stampare_parziale():
         data = request.json
         radice = data.get("radice")
         ids = data.get("ids", [])
+        # 👉 Evita pulizie “a tappeto” senza filtro: obbliga ids o radice
+        if not ids and not radice:
+            return jsonify({"error": "Fornire 'ids' (prelievo_id) oppure 'radice'."}), 400
 
         def norm(x):
             return (
@@ -637,6 +704,7 @@ def pulisci_da_stampare_parziale():
             )
 
         produzione_query = sb_table("produzione_vendor").select("id,sku,ean,start_delivery,prelievo_id")
+        produzione_query = produzione_query.eq("canale", "Amazon Vendor")  # <— vincolo canale
         if ids:
             produzione_query = produzione_query.in_("prelievo_id", ids)
         elif radice:
@@ -744,7 +812,7 @@ def crea_produzione_manuale():
                 .eq("canale", canale))
             q = _eq_or_is_null(q, "ean", ean)
             q = _eq_or_is_null(q, "start_delivery", start_delivery)
-            return q.limit(1).execute()
+            return q.order("id").limit(1).execute()
 
         existing = supa_with_retry(_build_existing_query).data or []
 
@@ -832,7 +900,7 @@ def _merge_into_target(row_src: dict, to_state: str, qty: int, *, log_merge: boo
             .eq("canale", key["canale"]))
         q = _eq_or_is_null(q, "ean", key["ean"])
         q = _eq_or_is_null(q, "start_delivery", key["start_delivery"])
-        return q.limit(1).execute()
+        return q.order("id").limit(1).execute()
 
 
     found = supa_with_retry(_select_target).data or []
@@ -879,7 +947,7 @@ def _merge_into_target(row_src: dict, to_state: str, qty: int, *, log_merge: boo
 
     # target non esiste -> lo creo
     nuovo = {
-        "prelievo_id": row_src.get("prelievo_id"),
+        "prelievo_id": None,
         "sku": key["sku"],
         "ean": key["ean"],
         "qty": row_src.get("qty"),
@@ -940,50 +1008,59 @@ def move_qty_endpoint():
         avail = int(src.get("da_produrre") or 0)
         user_label = _current_user_label()
 
-        def _log_spostamento(qty_before: int, qty_after: int, tgt_id: int | None):
+        # helper: log sulla TARGET (non sulla sorgente che potrebbe essere cancellata)
+        def _log_to_target(tgt_id: int, taken: int, src_before: int, src_after: int):
             try:
-                src_row = dict(src); src_row["id"] = from_id
                 log_movimento_produzione(
-                    src_row,
+                    {"id": tgt_id, "sku": src.get("sku"), "ean": src.get("ean"),
+                     "start_delivery": src.get("start_delivery"), "canale": src.get("canale")},
                     utente=user_label,
                     motivo=f"Spostamento a {to_state}",
                     stato_vecchio=src.get("stato_produzione"),
                     stato_nuovo=to_state,
-                    qty_vecchia=qty_before,
-                    qty_nuova=qty_after,
+                    qty_vecchia=taken,                 # qty prelevata in questo step
+                    qty_nuova=taken,                   # qty confluita nella target
                     plus_vecchio=src.get("plus") or 0,
                     plus_nuovo=src.get("plus") or 0,
-                    dettaglio={"target_id": tgt_id}
+                    dettaglio={"source_id": from_id, "src_before": src_before, "src_after": src_after}
                 )
             except Exception:
                 pass
 
         if qty <= avail:
             new_src_val = avail - qty
+
+            # 1) crea/merge target
+            tgt_id = _merge_into_target(src, to_state, qty, log_merge=False)
+
+            # 2) aggiorna/azzera sorgente
             supa_with_retry(lambda: (
                 sb_table("produzione_vendor").update({"da_produrre": new_src_val}).eq("id", from_id).execute()
             ))
-
-            tgt_id = _merge_into_target(src, to_state, qty, log_merge=False)  # <— niente log 'Merge in ...' qui
-            _log_spostamento(avail, new_src_val, tgt_id)
-
             if new_src_val <= 0:
                 supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", from_id).execute())
+
+            # 3) log sulla target
+            _log_to_target(tgt_id, qty, avail, new_src_val)
 
             return jsonify({"ok": True})
 
         # qty > avail
         if canale in ("Sito", "Amazon Seller"):
+            # sposta tutto l'avail per primo
             if avail > 0:
-                supa_with_retry(lambda: sb_table("produzione_vendor").update({"da_produrre": 0}).eq("id", from_id).execute())
                 tgt_id_1 = _merge_into_target(src, to_state, avail, log_merge=False)
-                _log_spostamento(avail, 0, tgt_id_1)
+                supa_with_retry(lambda: (
+                    sb_table("produzione_vendor").update({"da_produrre": 0}).eq("id", from_id).execute()
+                ))
                 supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", from_id).execute())
+                _log_to_target(tgt_id_1, avail, avail, 0)
 
             extra = qty - avail
             if extra > 0:
+                # l'extra confluisce nella stessa chiave logica (target) creando/mergiando
                 tgt_id_2 = _merge_into_target(src, to_state, extra, log_merge=False)
-                _log_spostamento(0, 0, tgt_id_2)
+                _log_to_target(tgt_id_2, extra, 0, 0)
 
             return jsonify({"ok": True, "over_move": True})
 

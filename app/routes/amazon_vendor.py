@@ -215,16 +215,10 @@ def enqueue_job(job_type: str, payload: dict) -> None:
 
 
 def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_label: str) -> Optional[int]:
-    """
-    Sposta 'qty' dalla riga attiva SRC (qualsiasi stato attivo: Stampato/Calandrato/Cucito/Confezionato)
-    verso una riga TARGET con la stessa chiave (sku, ean, canale, stato_produzione) ma con
-    start_delivery = new_start_delivery. Crea/merge la TARGET se serve.
-    Ritorna l'ID della riga TARGET (nella nuova data). Logga un evento 'Retarget data (auto)'.
-    """
     if qty <= 0:
         return None
 
-    # 1) leggi sorgente
+    # 1) sorgente
     src = supa_with_retry(lambda: (
         sb_table("produzione_vendor").select("*").eq("id", src_id).single().execute()
     )).data
@@ -240,7 +234,7 @@ def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_l
     st   = src.get("stato_produzione")
     can  = src.get("canale")
 
-    # 2) cerca/crea target con stessa chiave logica ma data nuova
+    # 2) target stessa chiave (sku, ean, canale, stato) ma con data nuova
     def _select_target():
         q = (sb_table("produzione_vendor")
              .select("id, da_produrre, plus")
@@ -248,11 +242,8 @@ def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_l
              .eq("stato_produzione", st)
              .eq("canale", can)
              .eq("start_delivery", new_start_delivery))
-        if ean is None:
-            q = q.is_("ean", "null")
-        else:
-            q = q.eq("ean", ean)
-        return q.limit(1).execute()
+        q = q.is_("ean", "null") if ean is None else q.eq("ean", ean)
+        return q.order("id").limit(1).execute()
 
     found = supa_with_retry(_select_target).data or []
     if found:
@@ -267,8 +258,8 @@ def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_l
             "prelievo_id": src.get("prelievo_id"),
             "sku": sku,
             "ean": ean,
-            "qty": src.get("qty"),              # informativo
-            "riscontro": src.get("riscontro"),  # informativo
+            "qty": src.get("qty"),
+            "riscontro": src.get("riscontro"),
             "plus": 0,
             "start_delivery": new_start_delivery,
             "stato": src.get("stato"),
@@ -279,18 +270,28 @@ def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_l
             "canale": can,
         }
         inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
+        try:
+            irow = (inserted[0] if inserted else None)
+            if irow:
+                log_movimento_produzione(
+                    irow,
+                    utente=_current_user_label(),
+                    motivo="Creazione Da Stampare (sync singolo)",
+                    stato_vecchio=None,
+                    stato_nuovo="Da Stampare",
+                    qty_vecchia=None,
+                    qty_nuova=irow.get("da_produrre"),
+                )
+        except Exception:
+            pass
         tgt_id = int(inserted[0]["id"]) if inserted else None
 
-    # 3) scala la sorgente (e cancella se diventa 0)
+    # 3) scala SEMPRE la sorgente e logga UNA volta
     src_before = int(src.get("da_produrre") or 0)
     src_after  = src_before - take
     supa_with_retry(lambda: (
         sb_table("produzione_vendor").update({"da_produrre": src_after}).eq("id", src_id).execute()
     ))
-    if src_after <= 0:
-        supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", src_id).execute())
-
-    # 4) log di retarget (sulla SORGENTE)
     try:
         src_log_row = dict(src); src_log_row["id"] = src_id
         log_movimento_produzione(
@@ -301,16 +302,39 @@ def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_l
             stato_nuovo=st,
             qty_vecchia=src_before,
             qty_nuova=src_after,
-            dettaglio={
-                "retarget": True,
-                "from_date": src.get("start_delivery"),
-                "to_date": new_start_delivery
-            }
+            dettaglio={"retarget": True, "from_date": src.get("start_delivery"), "to_date": new_start_delivery}
         )
     except Exception:
         pass
 
+    if src_after <= 0:
+        supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", src_id).execute())
+
     return tgt_id
+
+
+def _reserved_open(prelievo_id: int) -> int:
+    """
+    Somma il 'prenotato aperto' per il prelievo: SUM(qty_reserved - qty_consumed).
+    Se la tabella non esiste o non ci sono righe, ritorna 0.
+    """
+    try:
+        res = supa_with_retry(lambda: (
+            sb_table("magazzino_reservations")
+            .select("qty_reserved,qty_consumed")
+            .eq("prelievo_id", prelievo_id)
+            .execute()
+        ))
+        rows = res.data or []
+        total = 0
+        for r in rows:
+            try:
+                total += int(r.get("qty_reserved") or 0) - int(r.get("qty_consumed") or 0)
+            except Exception:
+                pass
+        return max(total, 0)
+    except Exception:
+        return 0
 
 
 # -----------------------------------------------------------------------------
@@ -430,21 +454,22 @@ def search_products():
         query = base
 
         # token esatti: SKU part delimitato (^|-)tok($|-) oppure EAN esatto se numerico
-        for tok in exact_tokens:
-            tokc = tok.strip()
-            if not tokc:
+        # token esatti: SKU part delimitato senza regex + EAN numerico esatto
+        # fuzzy: AND su più token, OR sui campi
+        for tok in fuzzy_tokens:
+            t = tok.strip()
+            if not t:
                 continue
-            if tokc.isdigit():
-                query = query.eq("ean", tokc)
-            else:
-                pattern = rf"(^|-){tokc}($|-)"
-                query = query.filter("sku", "iregex", pattern)
+            star = f"*{t}*"
+            query = query.or_(f"sku.ilike.{star},ean.ilike.{star},variant_title.ilike.{star},product_title.ilike.{star}")
 
         # fuzzy: AND su più campi
         for tok in fuzzy_tokens:
-            like = f"%{tok}%"
-            query = query.or_(f"sku.ilike.{like},ean.ilike.{like},variant_title.ilike.{like},product_title.ilike.{like}")
-
+            t = tok.strip()
+            if not t:
+                continue
+            star = f"*{t}*"
+            query = query.or_(f"sku.ilike.{star},ean.ilike.{star},variant_title.ilike.{star},product_title.ilike.{star}")
         rows = supa_with_retry(lambda: query.limit(limit).execute()).data or []
 
         # ordina con "preferenza" per match esatti
@@ -511,10 +536,17 @@ def site_orders_sku_summary():
 def sync_produzione_from_prelievo(prelievo_id):
     """
     Sincronizza produzione_vendor a partire da una singola riga di prelievo.
+    Regola: MERGE per FASE (sku, ean, canale, stato_produzione, start_delivery).
+    - Se esiste già la riga "Da Stampare" per quella fase -> UPDATE
+    - Altrimenti -> INSERT (qui posso associare prelievo_id)
     """
     try:
+        # 1) leggo il prelievo
         res = supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").select("*").eq("id", prelievo_id).single()
+            sb_table("prelievi_ordini_amazon")
+            .select("*")
+            .eq("id", prelievo_id)
+            .single()
             .execute()
         ))
         prelievo = res.data
@@ -525,37 +557,161 @@ def sync_produzione_from_prelievo(prelievo_id):
         stato = prelievo["stato"]
         qty = int(prelievo.get("qty") or 0)
         riscontro = int(prelievo.get("riscontro") or 0)
+        mag_usato = int(prelievo.get("magazzino_usato") or 0)
         plus = int(prelievo.get("plus") or 0)
+
+        # coperto: riscontro + prenotato (magazzino_usato)
+        eff_riscontro = riscontro
 
         if stato == "manca":
             da_produrre = qty + plus
         elif stato == "parziale":
-            da_produrre = (qty - riscontro) + plus
-        elif stato == "completo" and plus > 0:
-            da_produrre = plus
+            da_produrre = max(0, qty - eff_riscontro) + plus
+        elif stato == "completo":
+            da_produrre = plus  # solo extra
         else:
-            logging.info(f"[sync_produzione_from_prelievo] Niente da produrre per prelievo {prelievo_id}, stato: {stato}")
-            return
+            da_produrre = max(0, qty - eff_riscontro) + plus
 
-        row = {
-            "prelievo_id": prelievo["id"],
-            "sku": prelievo["sku"],
-            "ean": prelievo["ean"],
+        # campi aggiornabili/comuni
+        upd_fields = {
             "qty": qty,
             "riscontro": riscontro,
             "plus": plus,
-            "start_delivery": prelievo.get("start_delivery"),
             "stato": stato,
             "stato_produzione": "Da Stampare",
             "da_produrre": da_produrre,
             "note": prelievo.get("note"),
-            "centri": prelievo.get("centri") or {},
-            "canale": "Amazon Vendor",          # <-- AGGIUNGI QUESTO
-            "updated_at": (datetime.now(timezone.utc)).isoformat()
+            "canale": "Amazon Vendor",
+            "start_delivery": prelievo.get("start_delivery"),
+            "cavallotti": bool(prelievo.get("cavallotti") or False),
         }
 
-        supa_with_retry(lambda: sb_table("produzione_vendor").upsert(row, on_conflict="prelievo_id"))
-        logging.info(f"[sync_produzione_from_prelievo] Upsert produzione_vendor completata per prelievo {prelievo_id}")
+        # 2) cerco la riga nella STESSA FASE (sku, ean, canale, stato=DS, data)
+        def _select_phase_row():
+            q = (sb_table("produzione_vendor")
+                 .select("id, prelievo_id")
+                 .eq("sku", prelievo["sku"])
+                 .eq("stato_produzione", "Da Stampare")
+                 .eq("canale", "Amazon Vendor")
+                 .eq("start_delivery", prelievo.get("start_delivery")))
+            # ean gestito come NULL-safe
+            if prelievo.get("ean") in (None, ""):
+                q = q.is_("ean", "null")
+            else:
+                q = q.eq("ean", prelievo["ean"])
+            return q.order("id").limit(1).execute()  
+
+        # 2) cerco la riga nella STESSA FASE (sku, ean, canale=Vendor, stato_produzione=DS, data)
+        phase = supa_with_retry(_select_phase_row).data or []
+
+        if phase:
+            pid = int(phase[0]["id"])
+            # leggo riga attuale per log (qty/plus attuali)
+            cur_row = supa_with_retry(lambda: (
+                sb_table("produzione_vendor")
+                .select("id,sku,ean,start_delivery,canale,stato_produzione,da_produrre,plus")
+                .eq("id", pid).single().execute()
+            )).data or {}
+
+            if da_produrre <= 0:
+                # LOG eliminazione DS (qty -> 0)
+                try:
+                    log_movimento_produzione(
+                        cur_row,
+                        utente=_current_user_label(),
+                        motivo="Auto-eliminazione Da Stampare (sync singolo)",
+                        stato_vecchio=cur_row.get("stato_produzione"),
+                        stato_nuovo=None,
+                        qty_vecchia=cur_row.get("da_produrre"),
+                        qty_nuova=0,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    supa_with_retry(lambda: sb_table("produzione_vendor")
+                        .delete()
+                        .eq("id", pid)
+                        .execute()
+                    )
+                except Exception as ex:
+                    logging.warning(f"[sync_produzione_from_prelievo] delete DS id={pid} fallita: {ex}")
+            else:
+                old_qty = int(cur_row.get("da_produrre") or 0)
+                supa_with_retry(lambda: (
+                    sb_table("produzione_vendor")
+                    .update({
+                        "qty": qty,
+                        "riscontro": riscontro,
+                        "plus": plus,
+                        "stato": stato,
+                        "stato_produzione": "Da Stampare",
+                        "da_produrre": da_produrre,
+                        "note": prelievo.get("note"),
+                        "canale": "Amazon Vendor",
+                        "start_delivery": prelievo.get("start_delivery"),
+                        "cavallotti": bool(prelievo.get("cavallotti") or False),
+                    })
+                    .eq("id", pid)
+                    .execute()
+                ))
+
+                # LOG update quantità (solo se cambia)
+                try:
+                    if old_qty != da_produrre:
+                        log_movimento_produzione(
+                            {"id": pid, "sku": prelievo["sku"], "ean": prelievo.get("ean"),
+                            "start_delivery": prelievo.get("start_delivery"), "canale": "Amazon Vendor"},
+                            utente=_current_user_label(),
+                            motivo="Aggiornamento Da Stampare (sync singolo)",
+                            stato_vecchio="Da Stampare",
+                            stato_nuovo="Da Stampare",
+                            qty_vecchia=old_qty,
+                            qty_nuova=da_produrre,
+                        )
+                except Exception:
+                    pass
+        else:
+            # Non esiste la fase
+            if da_produrre > 0:
+                # ✅ Inserisci solo se > 0
+                nuovo = {
+                    "prelievo_id": prelievo["id"],
+                    "sku": prelievo["sku"],
+                    "ean": prelievo.get("ean"),
+                    "qty": qty,
+                    "riscontro": riscontro,
+                    "plus": plus,
+                    "start_delivery": prelievo.get("start_delivery"),
+                    "stato": stato,
+                    "stato_produzione": "Da Stampare",
+                    "da_produrre": da_produrre,
+                    "cavallotti": bool(prelievo.get("cavallotti") or False),
+                    "note": prelievo.get("note"),
+                    "canale": "Amazon Vendor",
+                }
+                inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
+                # LOG creazione
+                try:
+                    irow = (inserted[0] if inserted else None)
+                    if irow:
+                        log_movimento_produzione(
+                            irow,
+                            utente=_current_user_label(),
+                            motivo="Creazione Da Stampare (sync singolo)",
+                            stato_vecchio=None,
+                            stato_nuovo="Da Stampare",
+                            qty_vecchia=None,
+                            qty_nuova=irow.get("da_produrre"),
+                        )
+                except Exception:
+                    pass
+            else:
+                # ✅ da_produrre <= 0 e fase assente → non fare nulla
+                pass
+
+        logging.info(f"[sync_produzione_from_prelievo] OK prelievo {prelievo_id} -> DS={da_produrre}")
+
     except Exception as ex:
         logging.exception(f"[sync_produzione_from_prelievo] Errore definitivo per prelievo {prelievo_id}: {ex}")
 
@@ -2164,34 +2320,39 @@ def _log_sync_summary(*, utente: str, motivo: str, scope: str, dettaglio: dict):
 
 
 
-def log_movimento_produzione(
-    produzione_row, utente, motivo,
-    stato_vecchio=None, stato_nuovo=None,
-    qty_vecchia=None, qty_nuova=None,
-    plus_vecchio=None, plus_nuovo=None,
-    dettaglio=None
-):
+def log_movimento_produzione(row, utente, motivo, stato_vecchio=None, stato_nuovo=None,
+                             qty_vecchia=None, qty_nuova=None, dettaglio=None):
+    payload = {
+        "produzione_id": row.get("id"),
+        "sku": row.get("sku"),
+        "ean": row.get("ean"),
+        "canale": row.get("canale"),
+        "stato_vecchio": stato_vecchio,
+        "stato_nuovo": stato_nuovo,
+        "qty_vecchia": qty_vecchia,
+        "qty_nuova": qty_nuova,
+        "motivo": motivo,
+        "utente": utente,
+        "dettaglio": dettaglio or {}
+    }
+
     try:
-        canale_norm = (produzione_row.get("canale") or "Amazon Vendor").strip() or "Amazon Vendor"
-        payload = {
-            "produzione_id": produzione_row["id"],
-            "sku": produzione_row.get("sku"),
-            "ean": produzione_row.get("ean"),
-            "canale": canale_norm,
-            "stato_vecchio": stato_vecchio,
-            "stato_nuovo": stato_nuovo,
-            "qty_vecchia": qty_vecchia,
-            "qty_nuova": qty_nuova,
-            "plus_vecchio": plus_vecchio,
-            "plus_nuovo": plus_nuovo,
-            "utente": utente,
-            "motivo": motivo,
-            "dettaglio": dettaglio,
-            "created_at": datetime.now(timezone.utc).isoformat(),  # resta UTC
-        }
-        supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(payload).execute())
+        supa_with_retry(lambda: sb_table("movimenti_produzione_vendor")
+                        .insert(payload).execute())
     except Exception as ex:
-        logging.error(f"[log_movimento_produzione] Errore insert log: {ex}")
+        msg = str(ex).lower()
+        # PARACADUTE: se è una violazione FK (23503), reinserisci senza produzione_id
+        if "23503" in msg or "foreign key" in msg:
+            try:
+                payload2 = dict(payload)
+                payload2["produzione_id"] = None
+                supa_with_retry(lambda: sb_table("movimenti_produzione_vendor")
+                                .insert(payload2).execute())
+                return
+            except Exception:
+                pass
+        # altri errori: logga e vai avanti senza bloccare il flusso operativo
+        logging.warning(f"[log_movimento_produzione] errore log: {ex}")
 
 
 def log_movimenti_produzione_bulk(rows, utente, motivo):
@@ -2223,124 +2384,15 @@ def log_movimenti_produzione_bulk(rows, utente, motivo):
 # -----------------------------------------------------------------------------
 # Date importabili per prelievo (da nuovi)
 # -----------------------------------------------------------------------------
-@bp.route('/api/prelievi/date-importabili', methods=['GET'])
-def date_importabili_prelievo():
-    try:
-        res = supa_with_retry(lambda: (
-            sb_table("ordini_vendor_riepilogo")
-            .select("start_delivery")
-            .eq("stato_ordine", "nuovo")
-            .order("start_delivery")
-            .execute()
-        ))
-        date_set = sorted({r["start_delivery"] for r in (res.data or [])})
-        return jsonify(date_set)
-    except Exception as ex:
-        logging.exception("Errore in date_importabili_prelievo")
-        return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
 # -----------------------------------------------------------------------------
 # Importa prelievi da nuovi
 # -----------------------------------------------------------------------------
-@bp.route('/api/prelievi/importa', methods=['POST'])
-def importa_prelievi():
-    try:
-        data = request.json.get("data")
-        if not data:
-            return jsonify({"error": "Data richiesta"}), 400
 
-        supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").delete().eq("start_delivery", data).execute())
-
-        items = supa_with_retry(lambda: (
-            sb_table("ordini_vendor_items").select("*").eq("start_delivery", data).execute()
-        )).data
-        riepiloghi = supa_with_retry(lambda: (
-            sb_table("ordini_vendor_riepilogo")
-            .select("fulfillment_center,start_delivery,stato_ordine")
-            .eq("start_delivery", data)
-            .eq("stato_ordine", "nuovo")
-            .execute()
-        )).data
-
-        centri_validi = set((r["fulfillment_center"], str(r["start_delivery"])) for r in riepiloghi)
-        articoli = [i for i in items if (i["fulfillment_center"], str(i["start_delivery"])) in centri_validi]
-
-        aggrega = {}
-        for a in articoli:
-            key = (a["model_number"], a["vendor_product_id"], str(a["start_delivery"]))
-            if key not in aggrega:
-                aggrega[key] = {
-                    "sku": a["model_number"],
-                    "ean": a["vendor_product_id"],
-                    "radice": estrai_radice(a["model_number"]),
-                    "start_delivery": a["start_delivery"][:10],
-                    "qty": 0,
-                    "centri": {}
-                }
-            centro = a["fulfillment_center"]
-            qty = int(a["qty_ordered"] or 0)
-            aggrega[key]["qty"] += qty
-            aggrega[key]["centri"][centro] = aggrega[key]["centri"].get(centro, 0) + qty
-
-        lista_to_insert = []
-        for agg in aggrega.values():
-            lista_to_insert.append({
-                "sku": agg["sku"],
-                "ean": agg["ean"],
-                "qty": agg["qty"],
-                "radice": agg["radice"],
-                "start_delivery": agg["start_delivery"],
-                "centri": agg["centri"],
-                "stato": "in verifica"
-            })
-
-        batch_size = 200
-        errors = []
-        inserted_total = 0
-        for i in range(0, len(lista_to_insert), batch_size):
-            batch = lista_to_insert[i:i + batch_size]
-            try:
-                supa_with_retry(lambda b=batch: sb_table("prelievi_ordini_amazon").insert(b).execute())
-                inserted_total += len(batch)
-            except Exception as ex:
-                logging.warning(f"[importa_prelievi] Errore batch [{i}-{i+len(batch)-1}]: {ex}")
-                errors.append({"start": i, "end": i + len(batch) - 1, "error": str(ex)})
-
-        return jsonify({
-            "ok": inserted_total == len(lista_to_insert),
-            "importati": inserted_total,
-            "totali": len(lista_to_insert),
-            "errors": errors
-        })
-    except Exception as ex:
-        logging.exception("Errore generale in importa_prelievi")
-        return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
 # -----------------------------------------------------------------------------
 # Lista prelievi
 # -----------------------------------------------------------------------------
-@bp.route('/api/prelievi', methods=['GET'])
-def lista_prelievi():
-    try:
-        data = request.args.get("data")
-        radice = request.args.get("radice")
-        search = request.args.get("search", "").strip()
-
-        query = sb_table("prelievi_ordini_amazon").select(
-            "id,stato,sku,ean,qty,riscontro,plus,radice,note"
-        )
-        if data:
-            query = query.eq("start_delivery", data)
-        if radice:
-            query = query.eq("radice", radice)
-        if search:
-            query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
-        query = query.order("radice").order("sku")
-        prelievi = supa_with_retry(lambda: query.execute()).data
-        return jsonify(prelievi)
-    except Exception as ex:
-        logging.exception("[lista_prelievi] Errore in GET prelievi")
-        return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
 # -----------------------------------------------------------------------------
 # Sync produzione
@@ -2427,19 +2479,22 @@ def sync_produzione(prelievi_modificati, utente=None, motivo="Modifica prelievo"
         lavorato = sum(r["da_produrre"] for r in righe_lavorate)
         da_stampare_righe = [r for r in righe_attuali if r["stato_produzione"] == "Da Stampare"]
 
-        qty = p["qty"]
-        riscontro = p.get("riscontro") or 0
-        plus = p.get("plus") or 0
-        stato = p["stato"]
+        qty = int(p.get("qty") or 0)
+        riscontro = int(p.get("riscontro") or 0)
+        mag_usato = int(p.get("magazzino_usato") or 0)   # NEW
+        plus = int(p.get("plus") or 0)
+        stato = p.get("stato")
+
+        eff_riscontro = riscontro
 
         if stato == "manca":
             richiesta = qty
         elif stato == "parziale":
-            richiesta = qty - riscontro
+            richiesta = max(0, qty - eff_riscontro)   # <—
         elif stato == "completo":
             richiesta = 0
         else:
-            richiesta = qty
+            richiesta = max(0, qty - eff_riscontro)   # <—
 
         if lavorato >= richiesta:
             da_produrre = plus if plus > 0 else 0
@@ -2525,26 +2580,25 @@ def sync_produzione(prelievi_modificati, utente=None, motivo="Modifica prelievo"
         except Exception as ex:
             logging.error(f"[sync_produzione] Errore update produzione_vendor id={id_val}: {ex}")
 
-        if to_insert:
-            BATCH = 100
-            for i in range(0, len(to_insert), BATCH):
-                batch = to_insert[i:i + BATCH]
-                try:
-                    # 🔐 idempotente: se esiste già una DS per quel prelievo_id, aggiorna invece di creare doppioni
-                    inserted = supa_with_retry(lambda b=batch: (
-                        sb_table("produzione_vendor").upsert(b, on_conflict="prelievo_id").execute()
-                    )).data
-                    # NB: a seconda della versione, .data può non contenere tutte le righe "conflict update";
-                    # va bene comunque: il flusso non dipende da questi log per-riga.
-                    for irow in inserted or []:
-                        log_other.append(dict(
-                            produzione_row=irow,
-                            utente=utente,
-                            motivo="Creazione da patch prelievo",
-                            qty_nuova=irow.get("da_produrre")
-                        ))
-                except Exception as ex:
-                    logging.error(f"[sync_produzione] Errore upsert produzione_vendor batch={i}-{i + BATCH}: {ex}")
+    # <<< FUORI dal for
+    if to_insert:
+        BATCH = 100
+        for i in range(0, len(to_insert), BATCH):
+            batch = to_insert[i:i + BATCH]
+            try:
+                # idempotente per prelievo_id
+                inserted = supa_with_retry(lambda b=batch: (
+                    sb_table("produzione_vendor").upsert(b, on_conflict="prelievo_id").execute()
+                )).data
+                for irow in inserted or []:
+                    log_other.append(dict(
+                        produzione_row=irow,
+                        utente=utente,
+                        motivo="Creazione da patch prelievo",
+                        qty_nuova=irow.get("da_produrre")
+                    ))
+            except Exception as ex:
+                logging.error(f"[sync_produzione] Errore upsert produzione_vendor batch={i}-{i + BATCH}: {ex}")
 
 
     flush_logs(log_other)
@@ -2552,148 +2606,15 @@ def sync_produzione(prelievi_modificati, utente=None, motivo="Modifica prelievo"
 # -----------------------------------------------------------------------------
 # Patch singolo prelievo -> sync produzione
 # -----------------------------------------------------------------------------
-@bp.route('/api/prelievi/<int:id>', methods=['PATCH'])
-def patch_prelievo(id):
-    try:
-        data = request.json
-        fields = {}
-        for f in ["riscontro", "plus", "note"]:
-            if f in data:
-                fields[f] = data[f]
-
-        if "riscontro" in fields:
-            riscontro = fields["riscontro"]
-            if riscontro is not None and (not isinstance(riscontro, int) or riscontro < 0):
-                return jsonify({"error": "Riscontro non valido: deve essere un numero >= 0"}), 400
-
-        if "plus" in fields:
-            plus = fields["plus"]
-            if plus is not None and (not isinstance(plus, int) or plus < 0):
-                return jsonify({"error": "Plus non valido: deve essere un numero >= 0"}), 400
-
-        if "note" in fields:
-            note = fields["note"] or ""
-            if len(note) > 255:
-                return jsonify({"error": "Nota troppo lunga (max 255 caratteri)"}), 400
-            fields["note"] = note.strip()
-
-        if "riscontro" in data:
-            prelievo = supa_with_retry(lambda: (
-                sb_table("prelievi_ordini_amazon").select("qty").eq("id", id).single().execute()
-            )).data
-            if not prelievo:
-                return jsonify({"error": "Prelievo non trovato"}), 404
-            qty = prelievo["qty"]
-            riscontro = data["riscontro"]
-            if riscontro is None:
-                stato = "in verifica"
-            elif riscontro == 0:
-                stato = "manca"
-            elif 0 < riscontro < qty:
-                stato = "parziale"
-            elif riscontro == qty:
-                stato = "completo"
-            else:
-                stato = "in verifica"
-            fields["stato"] = stato
-
-        if not fields:
-            return jsonify({"error": "Nessun campo da aggiornare"}), 400
-
-        supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(fields).eq("id", id).execute())
-
-        prelievo = supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").select("*").eq("id", id).single().execute()
-        )).data
-        if not prelievo:
-            return jsonify({"error": "Prelievo non trovato dopo update"}), 404
-
-        sync_produzione([prelievo], motivo="Patch singolo prelievo")
-        return jsonify({"ok": True})
-    except Exception as ex:
-        logging.exception("[patch_prelievo] Errore patch singolo prelievo")
-        return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
 # -----------------------------------------------------------------------------
 # Patch bulk prelievi -> sync produzione
 # -----------------------------------------------------------------------------
-@bp.route('/api/prelievi/bulk', methods=['PATCH'])
-def patch_prelievi_bulk():
-    try:
-        ids = request.json.get("ids", [])
-        update_fields = request.json.get("fields", {})
-        if not ids or not update_fields:
-            return jsonify({"error": "Nessun id/campo"}), 400
 
-        import re
-        if "riscontro" in update_fields:
-            r = update_fields["riscontro"]
-            if r is not None and (not isinstance(r, int) or r < 0):
-                return jsonify({"error": "Riscontro non valido: deve essere un numero >= 0"}), 400
-        if "plus" in update_fields:
-            p = update_fields["plus"]
-            if p is not None and (not isinstance(p, int) or p < 0):
-                return jsonify({"error": "Plus non valido: deve essere un numero >= 0"}), 400
-        if "note" in update_fields:
-            note = update_fields["note"] or ""
-            if len(note) > 255:
-                return jsonify({"error": "Nota troppo lunga (max 255 caratteri)"}), 400
-            if not re.match(r'^[\w\s.,;:!?"\'àèéìòù()\-_/]*$', note):
-                return jsonify({"error": "Caratteri non validi nelle note"}), 400
-            update_fields["note"] = note.strip()
-
-        stato_per_id = {}
-        if "riscontro" in update_fields:
-            riscontro_val = update_fields["riscontro"]
-            prelievi = supa_with_retry(lambda: (
-                sb_table("prelievi_ordini_amazon").select("id,qty").in_("id", ids).execute()
-            )).data
-            for p in prelievi:
-                qty = p["qty"]
-                if riscontro_val is None:
-                    stato = "in verifica"
-                elif riscontro_val == 0:
-                    stato = "manca"
-                elif 0 < riscontro_val < qty:
-                    stato = "parziale"
-                elif riscontro_val == qty:
-                    stato = "completo"
-                else:
-                    stato = "in verifica"
-                stato_per_id[p["id"]] = stato
-            for stato in set(stato_per_id.values()):
-                ids_group = [pid for pid, st in stato_per_id.items() if st == stato]
-                if ids_group:
-                    supa_with_retry(lambda s=stato, g=ids_group: (
-                        sb_table("prelievi_ordini_amazon")
-                        .update({**update_fields, "stato": s}).in_("id", g).execute()
-                    ))
-        else:
-            supa_with_retry(lambda: sb_table("prelievi_ordini_amazon").update(update_fields).in_("id", ids).execute())
-
-        prelievi_full = supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").select("*").in_("id", ids).execute()
-        )).data
-        sync_produzione(prelievi_full, motivo="Patch bulk prelievi")
-        return jsonify({"ok": True, "updated_count": len(ids)})
-    except Exception as ex:
-        logging.exception("[patch_prelievi_bulk] Errore patch bulk prelievi")
-        return jsonify({"error": f"Errore: {str(ex)}"}), 500
-    
     
     # -----------------------------------------------------------------------------
 # Svuota prelievi
 # -----------------------------------------------------------------------------
-@bp.route('/api/prelievi/svuota', methods=['DELETE'])
-def svuota_prelievi():
-    try:
-        supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").delete().neq("id", 0).execute()
-        ))
-        return jsonify({"ok": True})
-    except Exception as ex:
-        logging.exception("[svuota_prelievi] Errore DELETE svuota prelievi")
-        return jsonify({"error": f"Errore: {str(ex)}"}), 500
     
     # -----------------------------------------------------------------------------
 # Badge counts
@@ -3024,3 +2945,40 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     report["deposited"] = deposited_total
     return report
  
+ 
+ # --- GIACENZE: per SKU/EAN, aggregate per canale -----------------------------
+@bp.route('/api/magazzino/giacenze', methods=['GET'])
+def api_magazzino_giacenze():
+    try:
+        sku = (request.args.get("sku") or "").strip()
+        ean = (request.args.get("ean") or "").strip()
+        if not sku:
+            return jsonify([]), 200
+
+        # base query
+        q = sb_table("magazzino_giacenze").select("canale, qty")
+        q = q.eq("sku", sku)
+        if ean:
+            q = q.eq("ean", ean)
+
+        rows = supa_with_retry(lambda: q.execute()).data or []
+
+        # ritorna anche quelli mancanti a 0? No: lasciamo solo presenti
+        # ma il frontend mostra 0 se non c'è (già gestito)
+        out = []
+        for r in rows:
+            try:
+                out.append({
+                    "canale": r.get("canale") or "Amazon Vendor",
+                    "qty": int(r.get("qty") or 0),
+                })
+            except Exception:
+                pass
+
+        # Se non c'è nulla, meglio 200 [] (il frontend mette 0)
+        return jsonify(out), 200
+
+    except Exception as ex:
+        # In caso di errore applicativo rispondi 500
+        logging.exception("[api_magazzino_giacenze] errore")
+        return jsonify({"error": str(ex)}), 500
