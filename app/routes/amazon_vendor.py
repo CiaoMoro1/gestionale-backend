@@ -2698,35 +2698,41 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
         parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
-    # 3) Parziali confermati PRECEDENTI (stesso riepilogo/centro), confronto NUMERICO
-    parz_prec = _rows(lambda: (
-        sb_table("ordini_vendor_parziali")
-        .select("numero_parziale, dati, confermato")
-        .eq("riepilogo_id", riepilogo_id)
-        .order("numero_parziale")
+
+    #    -> confronto temporale: created_at < curr_ts
+    riep_ids = _rows(lambda: (
+        sb_table("ordini_vendor_riepilogo")
+        .select("id")
+        .eq("start_delivery", start_delivery)     # TUTTI i centri per la data
         .execute()
     ))
-    sum_parz_prec_sku: dict[str, int] = {}
-    for p in parz_prec:
-        if not p.get("confermato"):
-            continue
-        try:
-            if int(p.get("numero_parziale") or 0) >= int(numero_parziale):
+    riep_id_list = [int(r["id"]) for r in riep_ids if r.get("id") is not None]
+
+    sum_parz_prec_sku: dict[str,int] = {}
+    if riep_id_list:
+        parz_prec_all = _rows(lambda: (
+            sb_table("ordini_vendor_parziali")
+            .select("numero_parziale, dati, confermato, created_at, riepilogo_id")
+            .in_("riepilogo_id", riep_id_list)
+            .order("created_at")  # asc
+            .execute()
+        ))
+        for p in parz_prec_all:
+            if not p.get("confermato"):
                 continue
-        except Exception:
-            if str(p.get("numero_parziale")) >= str(numero_parziale):
+            p_ts = p.get("created_at")
+            # escludi quelli NON "precedenti" al parziale corrente
+            if p_ts and p_ts >= p_curr.get("created_at"):
                 continue
-        dati = p.get("dati") or []
-        if isinstance(dati, str):
-            try:
-                dati = json.loads(dati)
-            except Exception:
-                dati = []
-        for r in (dati or []):
-            sku = r.get("model_number") or r.get("sku")
-            q = int(r.get("quantita") or r.get("qty") or 0)
-            if sku and q > 0:
-                sum_parz_prec_sku[sku] = sum_parz_prec_sku.get(sku, 0) + q
+            dati = p.get("dati") or []
+            if isinstance(dati, str):
+                try: dati = json.loads(dati)
+                except Exception: dati = []
+            for r in (dati or []):
+                sku = r.get("model_number") or r.get("sku")
+                q   = int(r.get("quantita") or r.get("qty") or 0)
+                if sku and q > 0:
+                    sum_parz_prec_sku[sku] = sum_parz_prec_sku.get(sku, 0) + q
 
     # 4) Riscontro/Ordinato totali del giorno (solo Vendor)
     prelievi_same_date = _rows(lambda: (
