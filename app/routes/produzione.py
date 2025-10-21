@@ -10,6 +10,7 @@ from flask import Blueprint, jsonify, request
 import logging
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -1005,80 +1006,28 @@ def _merge_into_target(row_src: dict, to_state: str, qty: int, *, log_merge: boo
 def move_qty_endpoint():
     try:
         body = request.json or {}
-        from_id = int(body.get("from_id") or 0)
-        to_state = body.get("to_state")
-        qty = int(body.get("qty") or 0)
+        from_id  = int(body.get("from_id") or 0)
+        to_state = (body.get("to_state") or "").strip()
+        qty      = int(body.get("qty") or 0)
         if from_id <= 0 or qty <= 0 or not to_state:
             return jsonify({"error": "Parametri non validi"}), 400
 
-        src = supa_with_retry(lambda: (
-            sb_table("produzione_vendor").select("*").eq("id", from_id).single().execute()
-        )).data
-        if not src:
-            return jsonify({"error": "Riga produzione non trovata"}), 404
-
-        canale = (src.get("canale") or "").strip()
-        avail = int(src.get("da_produrre") or 0)
-        user_label = _current_user_label()
-
-        # helper: log sulla TARGET (non sulla sorgente che potrebbe essere cancellata)
-        def _log_to_target(tgt_id: int, taken: int, src_before: int, src_after: int):
-            try:
-                log_movimento_produzione(
-                    {"id": tgt_id, "sku": src.get("sku"), "ean": src.get("ean"),
-                     "start_delivery": src.get("start_delivery"), "canale": src.get("canale")},
-                    utente=user_label,
-                    motivo=f"Spostamento a {to_state}",
-                    stato_vecchio=src.get("stato_produzione"),
-                    stato_nuovo=to_state,
-                    qty_vecchia=taken,                 # qty prelevata in questo step
-                    qty_nuova=taken,                   # qty confluita nella target
-                    plus_vecchio=src.get("plus") or 0,
-                    plus_nuovo=src.get("plus") or 0,
-                    dettaglio={"source_id": from_id, "src_before": src_before, "src_after": src_after}
-                )
-            except Exception:
-                pass
-
-        if qty <= avail:
-            new_src_val = avail - qty
-
-            # 1) crea/merge target
-            tgt_id = _merge_into_target(src, to_state, qty, log_merge=False)
-
-            # 2) aggiorna/azzera sorgente
-            supa_with_retry(lambda: (
-                sb_table("produzione_vendor").update({"da_produrre": new_src_val}).eq("id", from_id).execute()
-            ))
-            if new_src_val <= 0:
-                supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", from_id).execute())
-
-            # 3) log sulla target
-            _log_to_target(tgt_id, qty, avail, new_src_val)
-
-            return jsonify({"ok": True})
-
-        # qty > avail
-        if canale in ("Sito", "Amazon Seller"):
-            # sposta tutto l'avail per primo
-            if avail > 0:
-                tgt_id_1 = _merge_into_target(src, to_state, avail, log_merge=False)
-                supa_with_retry(lambda: (
-                    sb_table("produzione_vendor").update({"da_produrre": 0}).eq("id", from_id).execute()
-                ))
-                supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", from_id).execute())
-                _log_to_target(tgt_id_1, avail, avail, 0)
-
-            extra = qty - avail
-            if extra > 0:
-                # l'extra confluisce nella stessa chiave logica (target) creando/mergiando
-                tgt_id_2 = _merge_into_target(src, to_state, extra, log_merge=False)
-                _log_to_target(tgt_id_2, extra, 0, 0)
-
-            return jsonify({"ok": True, "over_move": True})
-
-        return jsonify({"error": "Quantità oltre il disponibile"}), 400
-
+        corr = str(uuid.uuid4())
+        payload = {
+            "p_from_id": from_id,
+            "p_to_state": to_state[:1].upper()+to_state[1:].lower(),
+            "p_qty": qty,
+            "p_user_label": _current_user_label(),
+            "p_correlation_id": corr,
+            "p_numero_parziale": None,
+            "p_riepilogo_id": None,
+        }
+        res = supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
+        target_id = (res.data[0]["target_id"] if res and res.data else None)
+        return jsonify({"ok": True, "target_id": target_id}), 200
     except Exception as ex:
+        msg = str(getattr(ex, "args", [""])[0])
+        if "Quantità oltre il disponibile" in msg:
+            return jsonify({"error": "Quantità oltre il disponibile"}), 400
         logging.exception("[move_qty_endpoint] errore")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500

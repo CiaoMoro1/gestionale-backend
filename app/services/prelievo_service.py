@@ -33,16 +33,6 @@ def _movimenta_magazzino_canale(row: dict, canale: str, delta: int, motivo: str)
   if err:
     raise RuntimeError(str(err))
 
-
-def _to_int_or_none(v: Any):
-    if v is None:
-        return None
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str) and v.strip().isdigit():
-        return int(v)
-    raise ValueError("Valore numerico non valido")
-
 def _deriva_stato(qty:int, riscontro:int|None)->str:
     r = int(riscontro or 0)
     if r < 0 or r > qty: return "in verifica"
@@ -60,31 +50,64 @@ def importa_prelievi_da_data(data:str):
 def lista_prelievi(data:str|None, radice:str|None):
     return sel_prelievi(data=data, radice=radice)
 
+def _to_int_or_none(v: Any):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        i = int(v)
+        return i
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return None
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return int(s)
+    raise ValueError("Valore numerico non valido")
+
 def _validate_payload(p: dict):
+    # --- riscontro (TOTALE) ---
     if "riscontro" in p and p["riscontro"] is not None:
         p["riscontro"] = _to_int_or_none(p["riscontro"])
-        if p["riscontro"] < 0:
+        if p["riscontro"] is None or p["riscontro"] < 0:
             raise ValueError("Riscontro non valido (>=0)")
+
+    # --- plus ---
     if "plus" in p and p["plus"] is not None:
         p["plus"] = _to_int_or_none(p["plus"])
-        if p["plus"] < 0:
+        if p["plus"] is None or p["plus"] < 0:
             raise ValueError("Plus non valido (>=0)")
-    if "magazzino_usato" in p and p["magazzino_usato"] is not None:
-        p["magazzino_usato"] = _to_int_or_none(p["magazzino_usato"])
-        if p["magazzino_usato"] < 0:
-            raise ValueError("Magazzino usato non valido (>=0)")
 
-    # NEW: breakdown per canale (dict string->int)
+    # --- breakdown per canale (nuovo) ---
+    total_by_canale = None
     if "mag_usato_by_canale" in p and p["mag_usato_by_canale"] is not None:
         if not isinstance(p["mag_usato_by_canale"], dict):
             raise ValueError("mag_usato_by_canale dev'essere un oggetto {canale: qty}")
         norm: dict[str, int] = {}
+        s = 0
         for k, v in p["mag_usato_by_canale"].items():
             iv = _to_int_or_none(v)
             if iv is None or iv < 0:
                 raise ValueError(f"Quantità non valida per canale '{k}'")
             norm[str(k)] = iv
+            s += iv
         p["mag_usato_by_canale"] = norm
+        total_by_canale = s
+
+    # --- totale legacy (compatibilità) ---
+    if "magazzino_usato" in p and p["magazzino_usato"] is not None:
+        p["magazzino_usato"] = _to_int_or_none(p["magazzino_usato"])
+        if p["magazzino_usato"] is None or p["magazzino_usato"] < 0:
+            raise ValueError("Magazzino usato non valido (>=0)")
+
+    # Se abbiamo il breakdown, forziamo il totale legacy a combaciare con la somma
+    if total_by_canale is not None:
+        p["magazzino_usato"] = total_by_canale
+
+    # --- Coerenza: riscontro (totale) deve essere >= prenotato ---
+    # (solo se entrambi sono presenti nel payload)
+    if p.get("riscontro") is not None and p.get("magazzino_usato") is not None:
+        if int(p["riscontro"]) < int(p["magazzino_usato"]):
+            raise ValueError("Riscontro (totale) deve essere ≥ somma del magazzino usato")
   
 
 def _movimenta_magazzino(row: dict, delta: int):
@@ -151,13 +174,13 @@ def aggiorna_prelievi_bulk(ids: list[int], fields: dict):
     channels = ["Amazon Vendor", "Sito", "Amazon Seller"]
 
     if has_breakdown:
-        righe = sel_prelievi(ids=ids)
+        righe = sel_prelievi(ids=ids, canale="Amazon Vendor")
         for r in righe:
             prev_breakdown = r.get("mag_usato_by_canale") if isinstance(r.get("mag_usato_by_canale"), dict) else {}
             prev_by = {c: int(prev_breakdown.get(c, 0) or 0) for c in channels}
             next_by = {c: int(fields["mag_usato_by_canale"].get(c, 0) or 0) for c in channels}
 
-            # movimenti per canale (delta)
+            # Delta per canale -> movimenti magazzino
             for can in channels:
                 delta = next_by[can] - prev_by[can]
                 if delta != 0:
@@ -174,24 +197,19 @@ def aggiorna_prelievi_bulk(ids: list[int], fields: dict):
         sync_produzione_from_prelievo_ids(ids)
         return
 
-    # --- legacy: niente breakdown per-canale ---
+    # --- legacy: niente breakdown per-canale (UNICA versione) ---
     if "riscontro" in bulk_fields:
-        righe = sel_prelievi(ids=ids)
-        stato_per_id = {r["id"]: _deriva_stato(int(r["qty"]), bulk_fields["riscontro"]) for r in righe}
-        for stato in set(stato_per_id.values()):
-            ids_cluster = [i for i, s in stato_per_id.items() if s == stato]
-            if ids_cluster:
-                upd_prelievi_bulk(ids_cluster, {**bulk_fields, "stato": stato})
-    else:
-        if ids:
-            upd_prelievi_bulk(ids, bulk_fields)
+        righe = sel_prelievi(ids=ids, canale="Amazon Vendor")  # <-- SOLO Vendor
 
-    sync_produzione_from_prelievo_ids(ids)
+        # ⛑️ guard: se riscontro=0 (completa...), limita ai soli PENDING ("in verifica")
+        if int(bulk_fields["riscontro"]) == 0:
+            righe = [r for r in righe if r.get("stato") == "in verifica"]
+            ids = [int(r["id"]) for r in righe]
+            if not ids:
+                return  # nessun pending da trattare
 
+        # (opzionale) qui puoi auto-rilasciare prenotati residui se vuoi
 
-    # --- legacy: niente breakdown per-canale ---
-    if "riscontro" in bulk_fields:
-        righe = sel_prelievi(ids=ids)
         stato_per_id = { r["id"]: _deriva_stato(int(r["qty"]), bulk_fields["riscontro"]) for r in righe }
         for stato in set(stato_per_id.values()):
             ids_cluster = [i for i, s in stato_per_id.items() if s == stato]
@@ -203,20 +221,6 @@ def aggiorna_prelievi_bulk(ids: list[int], fields: dict):
 
     sync_produzione_from_prelievo_ids(ids)
 
-
-    # no magazzino_usato in bulk → possiamo clusterizzare per stato se c'è riscontro
-    if "riscontro" in bulk_fields:
-        righe = sel_prelievi(ids=ids)
-        stato_per_id = { r["id"]: _deriva_stato(int(r["qty"]), bulk_fields["riscontro"]) for r in righe }
-        for stato in set(stato_per_id.values()):
-            ids_cluster = [i for i,s in stato_per_id.items() if s==stato]
-            if ids_cluster:
-                upd_prelievi_bulk(ids_cluster, {**bulk_fields, "stato": stato})
-    else:
-        if ids:
-            upd_prelievi_bulk(ids, bulk_fields)
-
-    sync_produzione_from_prelievo_ids(ids)
 
 def svuota_prelievi():
     del_prelievi()

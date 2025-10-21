@@ -12,7 +12,7 @@ def sel_date_importabili():
     ))
     return sorted({ r["start_delivery"] for r in (res.data or []) })
 
-def sel_prelievi(data: str | None = None, radice: str | None = None, ids: list[int] | None = None):
+def sel_prelievi(data: str | None = None, radice: str | None = None, ids: list[int] | None = None, canale: str | None = None,  ):
     """
     Ritorna SEMPRE una lista (anche vuota). NIENTE .single().
     """
@@ -23,6 +23,8 @@ def sel_prelievi(data: str | None = None, radice: str | None = None, ids: list[i
         q = q.eq("start_delivery", data)
     if radice:
         q = q.eq("radice", radice)
+    if canale:                              # <-- AGGIUNTO: filtro Vendor/Sito/Seller
+        q = q.eq("canale", canale)    
     res = supa_with_retry(lambda: q.order("id").execute())
     return res.data or []
 

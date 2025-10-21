@@ -533,15 +533,18 @@ def site_orders_sku_summary():
 # -----------------------------------------------------------------------------
 # Produzione: sync da prelievo (usata quando cambia un singolo prelievo)
 # -----------------------------------------------------------------------------
-def sync_produzione_from_prelievo(prelievo_id):
+def sync_produzione_from_prelievo(prelievo_id: int):
     """
-    Sincronizza produzione_vendor a partire da una singola riga di prelievo.
-    Regola: MERGE per FASE (sku, ean, canale, stato_produzione, start_delivery).
-    - Se esiste già la riga "Da Stampare" per quella fase -> UPDATE
-    - Altrimenti -> INSERT (qui posso associare prelievo_id)
+    Nuova logica "semplice":
+      - Considera solo Amazon Vendor e la finestra (start_delivery) del prelievo
+      - Coperto desiderato = riscontro(TOTALE) + plus
+      - Somma attivi (Stampato/Calandrato/Cucito/Confezionato) per SKU/EAN/data
+      - Se attivi >= coperto -> NON fare nulla (ed elimina DS se presente)
+      - Se attivi <  coperto -> DS = (coperto - attivi)
+    Non tocca MAI gli stati attivi.
     """
     try:
-        # 1) leggo il prelievo
+        # 0) leggi il prelievo
         res = supa_with_retry(lambda: (
             sb_table("prelievi_ordini_amazon")
             .select("*")
@@ -549,171 +552,148 @@ def sync_produzione_from_prelievo(prelievo_id):
             .single()
             .execute()
         ))
-        prelievo = res.data
-        if not prelievo:
-            logging.warning(f"[sync_produzione_from_prelievo] Prelievo ID {prelievo_id} non trovato")
+        p = res.data
+        if not p:
+            logging.warning("[sync_produzione_from_prelievo] prelievo %s non trovato", prelievo_id)
             return
 
-        stato = prelievo["stato"]
-        qty = int(prelievo.get("qty") or 0)
-        riscontro = int(prelievo.get("riscontro") or 0)
-        mag_usato = int(prelievo.get("magazzino_usato") or 0)
-        plus = int(prelievo.get("plus") or 0)
+        if (p.get("canale") or "Amazon Vendor") != "Amazon Vendor":
+            # Isoliamo i flussi: niente sync per Sito/Seller
+            return
 
-        # coperto: riscontro + prenotato (magazzino_usato)
-        eff_riscontro = riscontro
+        sku  = p["sku"]
+        ean = (p["ean"] or "").strip()
+        data = p.get("start_delivery")
+        plus = int(p.get("plus") or 0)
+        # 💡 riscontro è TOTALE (già comprende il prenotato)
+        coperto = max(0, int(p.get("riscontro") or 0) + plus
+                      )
 
-        if stato == "manca":
-            da_produrre = qty + plus
-        elif stato == "parziale":
-            da_produrre = max(0, qty - eff_riscontro) + plus
-        elif stato == "completo":
-            da_produrre = plus  # solo extra
-        else:
-            da_produrre = max(0, qty - eff_riscontro) + plus
 
-        # campi aggiornabili/comuni
-        upd_fields = {
-            "qty": qty,
-            "riscontro": riscontro,
+        # 1) somma attivi per Vendor (SKU/EAN) su TUTTE le date (POOL)
+        stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
+        attivi_rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor")
+            .select("da_produrre")
+            .eq("canale", "Amazon Vendor")
+            .eq("sku", sku).eq("ean", ean)
+            .in_("stato_produzione", stati_attivi)
+            .execute()
+        )).data or []
+        attivi = sum(int(r.get("da_produrre") or 0) for r in attivi_rows)
+
+        # 2) differenza da mettere in "Da Stampare" (sulla data DEL PRELIEVO)
+        qty  = int(p.get("qty") or 0)
+        risc = int(p.get("riscontro") or 0)   # TOTALE che inserisci tu
+        plus = int(p.get("plus") or 0)
+
+        needed_ord = max(0, qty - risc - attivi)     # quanto serve per coprire l’ordinato
+        ds = needed_ord + plus  
+
+        # 3) trova eventuale riga DS esistente (stessa chiave logica)
+        ds_rows = supa_with_retry(lambda: (
+            sb_table("produzione_vendor")
+            .select("id, da_produrre")
+            .eq("canale", "Amazon Vendor")
+            .eq("sku", sku).eq("ean", ean)
+            .eq("start_delivery", data)
+            .eq("stato_produzione", "Da Stampare")
+            .limit(1)
+            .execute()
+        )).data or []
+        ds_id = ds_rows[0]["id"] if ds_rows else None
+
+        if ds <= 0:
+            # niente da stampare: elimina DS se esiste
+            if ds_id:
+                # log di auto-eliminazione (opzionale)
+                try:
+                    cur_qty = int(ds_rows[0].get("da_produrre") or 0)
+                    log_movimento_produzione(
+                        {"id": ds_id, "sku": sku, "ean": ean, "start_delivery": data,
+                         "canale": "Amazon Vendor"},
+                        utente=_current_user_label(),
+                        motivo="Auto-eliminazione Da Stampare (sync semplice)",
+                        stato_vecchio="Da Stampare",
+                        stato_nuovo=None,
+                        qty_vecchia=cur_qty,
+                        qty_nuova=0
+                    )
+                except Exception:
+                    pass
+                supa_with_retry(lambda: sb_table("produzione_vendor").delete().eq("id", ds_id).execute())
+            return
+
+        # 4) DS > 0: crea/aggiorna riga "Da Stampare"
+        nuovo = {
+            "prelievo_id": p["id"],       # utile per tracing, non vincola se re-sincronizzi
+            "sku": sku, "ean": ean,
+            "qty": int(p.get("qty") or 0),
+            "riscontro": int(p.get("riscontro") or 0),
             "plus": plus,
-            "stato": stato,
+            "start_delivery": data,
+            "stato": p.get("stato"),
             "stato_produzione": "Da Stampare",
-            "da_produrre": da_produrre,
-            "note": prelievo.get("note"),
+            "da_produrre": ds,
+            "cavallotti": bool(p.get("cavallotti") or False),
+            "note": p.get("note"),
             "canale": "Amazon Vendor",
-            "start_delivery": prelievo.get("start_delivery"),
-            "cavallotti": bool(prelievo.get("cavallotti") or False),
         }
 
-        # 2) cerco la riga nella STESSA FASE (sku, ean, canale, stato=DS, data)
-        def _select_phase_row():
-            q = (sb_table("produzione_vendor")
-                 .select("id, prelievo_id")
-                 .eq("sku", prelievo["sku"])
-                 .eq("stato_produzione", "Da Stampare")
-                 .eq("canale", "Amazon Vendor")
-                 .eq("start_delivery", prelievo.get("start_delivery")))
-            # ean gestito come NULL-safe
-            if prelievo.get("ean") in (None, ""):
-                q = q.is_("ean", "null")
-            else:
-                q = q.eq("ean", prelievo["ean"])
-            return q.order("id").limit(1).execute()  
-
-        # 2) cerco la riga nella STESSA FASE (sku, ean, canale=Vendor, stato_produzione=DS, data)
-        phase = supa_with_retry(_select_phase_row).data or []
-
-        if phase:
-            pid = int(phase[0]["id"])
-            # leggo riga attuale per log (qty/plus attuali)
-            cur_row = supa_with_retry(lambda: (
-                sb_table("produzione_vendor")
-                .select("id,sku,ean,start_delivery,canale,stato_produzione,da_produrre,plus")
-                .eq("id", pid).single().execute()
-            )).data or {}
-
-            if da_produrre <= 0:
-                # LOG eliminazione DS (qty -> 0)
+        if ds_id:
+            old = int(ds_rows[0].get("da_produrre") or 0)
+            if old != ds:
+                supa_with_retry(lambda: (
+                    sb_table("produzione_vendor").update({
+                        "qty": nuovo["qty"],
+                        "riscontro": nuovo["riscontro"],
+                        "plus": nuovo["plus"],
+                        "stato": nuovo["stato"],
+                        "da_produrre": ds,
+                        "note": nuovo["note"],
+                        "cavallotti": nuovo["cavallotti"],
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }).eq("id", ds_id).execute()
+                ))
+                # log aggiornamento
                 try:
                     log_movimento_produzione(
-                        cur_row,
+                        {"id": ds_id, "sku": sku, "ean": ean, "start_delivery": data,
+                         "canale": "Amazon Vendor"},
                         utente=_current_user_label(),
-                        motivo="Auto-eliminazione Da Stampare (sync singolo)",
-                        stato_vecchio=cur_row.get("stato_produzione"),
-                        stato_nuovo=None,
-                        qty_vecchia=cur_row.get("da_produrre"),
-                        qty_nuova=0,
+                        motivo="Aggiornamento Da Stampare (sync semplice)",
+                        stato_vecchio="Da Stampare",
+                        stato_nuovo="Da Stampare",
+                        qty_vecchia=old,
+                        qty_nuova=ds
                     )
-                except Exception:
-                    pass
-
-                try:
-                    supa_with_retry(lambda: sb_table("produzione_vendor")
-                        .delete()
-                        .eq("id", pid)
-                        .execute()
-                    )
-                except Exception as ex:
-                    logging.warning(f"[sync_produzione_from_prelievo] delete DS id={pid} fallita: {ex}")
-            else:
-                old_qty = int(cur_row.get("da_produrre") or 0)
-                supa_with_retry(lambda: (
-                    sb_table("produzione_vendor")
-                    .update({
-                        "qty": qty,
-                        "riscontro": riscontro,
-                        "plus": plus,
-                        "stato": stato,
-                        "stato_produzione": "Da Stampare",
-                        "da_produrre": da_produrre,
-                        "note": prelievo.get("note"),
-                        "canale": "Amazon Vendor",
-                        "start_delivery": prelievo.get("start_delivery"),
-                        "cavallotti": bool(prelievo.get("cavallotti") or False),
-                    })
-                    .eq("id", pid)
-                    .execute()
-                ))
-
-                # LOG update quantità (solo se cambia)
-                try:
-                    if old_qty != da_produrre:
-                        log_movimento_produzione(
-                            {"id": pid, "sku": prelievo["sku"], "ean": prelievo.get("ean"),
-                            "start_delivery": prelievo.get("start_delivery"), "canale": "Amazon Vendor"},
-                            utente=_current_user_label(),
-                            motivo="Aggiornamento Da Stampare (sync singolo)",
-                            stato_vecchio="Da Stampare",
-                            stato_nuovo="Da Stampare",
-                            qty_vecchia=old_qty,
-                            qty_nuova=da_produrre,
-                        )
                 except Exception:
                     pass
         else:
-            # Non esiste la fase
-            if da_produrre > 0:
-                # ✅ Inserisci solo se > 0
-                nuovo = {
-                    "prelievo_id": prelievo["id"],
-                    "sku": prelievo["sku"],
-                    "ean": prelievo.get("ean"),
-                    "qty": qty,
-                    "riscontro": riscontro,
-                    "plus": plus,
-                    "start_delivery": prelievo.get("start_delivery"),
-                    "stato": stato,
-                    "stato_produzione": "Da Stampare",
-                    "da_produrre": da_produrre,
-                    "cavallotti": bool(prelievo.get("cavallotti") or False),
-                    "note": prelievo.get("note"),
-                    "canale": "Amazon Vendor",
-                }
-                inserted = supa_with_retry(lambda: sb_table("produzione_vendor").insert(nuovo).execute()).data or []
-                # LOG creazione
-                try:
-                    irow = (inserted[0] if inserted else None)
-                    if irow:
-                        log_movimento_produzione(
-                            irow,
-                            utente=_current_user_label(),
-                            motivo="Creazione Da Stampare (sync singolo)",
-                            stato_vecchio=None,
-                            stato_nuovo="Da Stampare",
-                            qty_vecchia=None,
-                            qty_nuova=irow.get("da_produrre"),
-                        )
-                except Exception:
-                    pass
-            else:
-                # ✅ da_produrre <= 0 e fase assente → non fare nulla
+            inserted = supa_with_retry(lambda: (
+                sb_table("produzione_vendor").upsert(nuovo, on_conflict="prelievo_id").execute()
+            )).data or []
+
+            try:
+                irow = inserted[0] if inserted else None
+                if irow:
+                    log_movimento_produzione(
+                        irow,
+                        utente=_current_user_label(),
+                        motivo="Creazione Da Stampare (sync semplice)",
+                        stato_vecchio=None,
+                        stato_nuovo="Da Stampare",
+                        qty_vecchia=None,
+                        qty_nuova=irow.get("da_produrre")
+                    )
+            except Exception:
                 pass
 
-        logging.info(f"[sync_produzione_from_prelievo] OK prelievo {prelievo_id} -> DS={da_produrre}")
+        logging.info("[sync semplice] prelievo %s -> DS=%s (attivi=%s, coperto=%s)", prelievo_id, ds, attivi, coperto)
 
     except Exception as ex:
-        logging.exception(f"[sync_produzione_from_prelievo] Errore definitivo per prelievo {prelievo_id}: {ex}")
+        logging.exception("[sync_produzione_from_prelievo] Errore (sync semplice): %s", ex)
+
 
 # -----------------------------------------------------------------------------
 # Upload ordini -> storage + job su Supabase
@@ -2670,7 +2650,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     def _rows(query_fn):
         return supa_with_retry(lambda: query_fn()).data or []
 
-    # 1) id riepilogo e parziale corrente (dati + timestamp)
+    # 1) id riepilogo (per centro+data) e parziale corrente
     rres = _rows(lambda: (
         sb_table("ordini_vendor_riepilogo")
         .select("id")
@@ -2694,7 +2674,11 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
     if not pres:
         return report
     p_curr = pres[0]
-    curr_ts = p_curr.get("created_at")
+
+    # 🚫 Non muovere se non è confermato (failsafe)
+    if not bool(p_curr.get("confermato")):
+        return {"moved": 0, "failures": [{"note": "parziale non confermato"}], "deposited": 0}
+
     dati_curr = p_curr.get("dati") or []
     if isinstance(dati_curr, str):
         try:
@@ -2702,33 +2686,36 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         except Exception:
             dati_curr = []
 
-    # 2) aggregazioni parziale corrente (per sku ed esatto sku+ean)
-    parziale_sku_curr: dict[str,int] = {}
-    parziale_exact_curr: dict[tuple[str,str],int] = {}
+    # 2) aggregazioni parziale corrente (per SKU ed esatto (SKU, EAN))
+    parziale_sku_curr: dict[str, int] = {}
+    parziale_exact_curr: dict[tuple[str, str], int] = {}
     for r in (dati_curr or []):
         sku = r.get("model_number") or r.get("sku")
         ean = (r.get("vendor_product_id") or r.get("ean") or "")
-        q   = int(r.get("quantita") or r.get("qty") or 0)
+        q = int(r.get("quantita") or r.get("qty") or 0)
         if not sku or q <= 0:
             continue
         parziale_sku_curr[sku] = parziale_sku_curr.get(sku, 0) + q
         parziale_exact_curr[(sku, ean)] = parziale_exact_curr.get((sku, ean), 0) + q
 
-    # 3) parziali confermati precedenti (solo < curr_ts) per calcolo riscontro residuo
+    # 3) Parziali confermati PRECEDENTI (stesso riepilogo/centro), confronto NUMERICO
     parz_prec = _rows(lambda: (
         sb_table("ordini_vendor_parziali")
-        .select("numero_parziale, dati, confermato, created_at")
+        .select("numero_parziale, dati, confermato")
         .eq("riepilogo_id", riepilogo_id)
-        .order("created_at")  # asc (default)
+        .order("numero_parziale")
         .execute()
     ))
-    sum_parz_prec_sku: dict[str,int] = {}
+    sum_parz_prec_sku: dict[str, int] = {}
     for p in parz_prec:
         if not p.get("confermato"):
             continue
-        p_ts = p.get("created_at")
-        if curr_ts and p_ts and str(p_ts) >= str(curr_ts):
-            continue
+        try:
+            if int(p.get("numero_parziale") or 0) >= int(numero_parziale):
+                continue
+        except Exception:
+            if str(p.get("numero_parziale")) >= str(numero_parziale):
+                continue
         dati = p.get("dati") or []
         if isinstance(dati, str):
             try:
@@ -2737,36 +2724,41 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 dati = []
         for r in (dati or []):
             sku = r.get("model_number") or r.get("sku")
-            q   = int(r.get("quantita") or r.get("qty") or 0)
+            q = int(r.get("quantita") or r.get("qty") or 0)
             if sku and q > 0:
                 sum_parz_prec_sku[sku] = sum_parz_prec_sku.get(sku, 0) + q
 
-    # 4) riscontro totale (stessa data)
+    # 4) Riscontro/Ordinato totali del giorno (solo Vendor)
     prelievi_same_date = _rows(lambda: (
         sb_table("prelievi_ordini_amazon")
-        .select("sku, qty, riscontro")
+        .select("sku, qty, riscontro, magazzino_usato")
         .eq("start_delivery", start_delivery)
+        .eq("canale", "Amazon Vendor")
         .execute()
     ))
-    riscontro_sku: dict[str,int] = {}
-    ordered_qty_sku: dict[str,int] = {}
+    riscontro_sku: dict[str, int] = {}
+    ordered_qty_sku: dict[str, int] = {}
     for p in prelievi_same_date:
         sku = p.get("sku")
         if not sku:
             continue
         try:
-            riscontro_sku[sku] = riscontro_sku.get(sku, 0) + int(p.get("riscontro") or 0)
+            totale = int(p.get("riscontro") or 0)   # <-- TOTALE già comprensivo
+            riscontro_sku[sku]   = riscontro_sku.get(sku, 0) + totale
             ordered_qty_sku[sku] = ordered_qty_sku.get(sku, 0) + int(p.get("qty") or 0)
+            # (facoltativo) sanity-check storico:
+            if int(p.get("magazzino_usato") or 0) > totale:
+                logging.warning("magazzino_usato > riscontro (sku=%s): legacy data?", sku)
         except Exception:
             pass
 
-    # 5) 'need' per SKU con regola "riscontro-first"
-    to_move_sku: dict[str,int] = {}
+    # 5) 'need' per SKU: regola "riscontro-first"
+    to_move_sku: dict[str, int] = {}
     for sku, q_curr in parziale_sku_curr.items():
-        risc_residuo = max(0, riscontro_sku.get(sku, 0) - sum_parz_prec_sku.get(sku, 0))
-        to_move_sku[sku] = max(0, q_curr - risc_residuo)
+        risc_residuo = max(0, int(riscontro_sku.get(sku, 0)) - int(sum_parz_prec_sku.get(sku, 0)))
+        to_move_sku[sku] = max(0, int(q_curr) - risc_residuo)
 
-    # 6) selezione candidati attivi e movimenti verso 'Trasferito'
+    # 6) Selezione candidati attivi e movimenti verso 'Trasferito'
     stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
     stato_index = {s: i for i, s in enumerate(stati_attivi)}
 
@@ -2780,6 +2772,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         if need <= 0:
             continue
 
+        planned = int(need)   # piano massimo per questo SKU in questo parziale
         moved_for_sku = 0
 
         # -------- PASSATA 1: stessa data (già in uso) --------
@@ -2791,7 +2784,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 .select("*")
                 .eq("sku", sku)
                 .eq("start_delivery", start_delivery)
-                .eq("canale", "Amazon Vendor")             # <-- CANALE vincolato
+                .eq("canale", "Amazon Vendor")
                 .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi", "Deposito"])
                 .execute()
             )).data or []
@@ -2801,32 +2794,41 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 ean_r = (r.get("ean") or "")
                 rows_by_sku.setdefault(sku, []).append(r)
                 rows_by_exact.setdefault((sku, ean_r), []).append(r)
-            for k in rows_by_sku:   rows_by_sku[k].sort(key=_priority)
-            for k in rows_by_exact: rows_by_exact[k].sort(key=_priority)
+            for k in rows_by_sku:
+                rows_by_sku[k].sort(key=_priority)
+            for k in rows_by_exact:
+                rows_by_exact[k].sort(key=_priority)
 
             eans_for_sku = sorted(
                 [e for (s, e), q in parziale_exact_curr.items() if s == sku and q > 0],
                 key=lambda e: parziale_exact_curr.get((sku, e), 0),
                 reverse=True
             )
-            ordered = []
-            for e in eans_for_sku: ordered.extend(rows_by_exact.get((sku, e), []))
-            already = {r["id"] for r in ordered}
-            ordered.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already])
+            ordered_list = []
+            for e in eans_for_sku:
+                ordered_list.extend(rows_by_exact.get((sku, e), []))
+            already_ids = {r["id"] for r in ordered_list}
+            ordered_list.extend([r for r in rows_by_sku.get(sku, []) if r["id"] not in already_ids])
 
-            for row in ordered:
+            for row in ordered_list:
                 if need <= 0:
                     break
                 avail = int(row.get("da_produrre") or 0)
                 if avail <= 0:
                     continue
-                take = min(avail, need)
+                take = min(avail, need, planned - moved_for_sku)  # 🛡️ cap difensivo
+                if take <= 0:
+                    continue
                 try:
+                    corr = str(uuid.uuid4())  # idempotenza del singolo move
                     payload = {
                         "p_from_id": int(row["id"]),
                         "p_to_state": "Trasferito",
                         "p_qty": int(take),
-                        "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
+                        "p_user_label": f"Sistema (conferma parziale #{numero_parziale})",
+                        "p_correlation_id": corr,                 # <-- estendi RPC
+                        "p_numero_parziale": int(numero_parziale),# <-- opzionale log
+                        "p_riepilogo_id": int(riepilogo_id),      # <-- opzionale log
                     }
                     supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
                     report["moved"] += take
@@ -2842,7 +2844,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 sb_table("produzione_vendor")
                 .select("*")
                 .eq("sku", sku)
-                .eq("canale", "Amazon Vendor")             # <-- CANALE vincolato
+                .eq("canale", "Amazon Vendor")
                 .not_.in_("stato_produzione", ["Da Stampare", "Trasferito", "Rimossi", "Deposito"])
                 .neq("start_delivery", start_delivery)
                 .execute()
@@ -2850,7 +2852,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
             st_order = {s: i for i, s in enumerate(stati_attivi)}
             rows_other.sort(key=lambda r: (st_order.get(r.get("stato_produzione"), 999),
-                                        str(r.get("start_delivery") or "")))
+                                           str(r.get("start_delivery") or "")))
 
             user_label = "Sistema (retarget auto)"
             for row in rows_other:
@@ -2859,18 +2861,24 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 avail = int(row.get("da_produrre") or 0)
                 if avail <= 0:
                     continue
-                take = min(avail, need)
+                take = min(avail, need, planned - moved_for_sku)
+                if take <= 0:
+                    continue
 
                 tgt_id = _retarget_qty_to_date(int(row["id"]), str(start_delivery), int(take), user_label)
                 if not tgt_id:
                     continue
 
                 try:
+                    corr = str(uuid.uuid4())
                     payload = {
                         "p_from_id": int(tgt_id),
                         "p_to_state": "Trasferito",
                         "p_qty": int(take),
-                        "p_user_label": f"Sistema (conferma parziale #{numero_parziale})"
+                        "p_user_label": f"Sistema (conferma parziale #{numero_parziale})",
+                        "p_correlation_id": corr,
+                        "p_numero_parziale": int(numero_parziale),
+                        "p_riepilogo_id": int(riepilogo_id),
                     }
                     supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
                     report["moved"] += take
@@ -2888,16 +2896,15 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
             })
 
 
-    # 7) Post-step: se (Trasferito + Riscontro) >= Ordinato -> sposta residui attivi in 'Deposito'
-    #    (evita code appese quando gli operatori "trovano" pezzi extra)
+    # 7) Post-step: se (Trasferito + Riscontro) >= Ordinato OPPURE (parziali cumulativi >= Ordinato)
+    #    -> sposta residui attivi in 'Deposito'
     deposited_total = 0
-    target_skus = list(parziale_sku_curr.keys())  # solo gli SKU toccati dal parziale
+    target_skus = list(parziale_sku_curr.keys())  # come prima (o la variante "tutti gli SKU attivi")
 
     for sku in target_skus:
         ordered = int(ordered_qty_sku.get(sku, 0))
         risc    = int(riscontro_sku.get(sku, 0))
 
-        # transferred totale
         transferred = sum(int(r.get("da_produrre") or 0) for r in _rows(lambda: (
             sb_table("produzione_vendor")
             .select("da_produrre")
@@ -2908,7 +2915,6 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
             .execute()
         )))
 
-        # residui attivi
         active_rows = _rows(lambda: (
             sb_table("produzione_vendor")
             .select("id, da_produrre, stato_produzione")
@@ -2920,9 +2926,12 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
         ))
         active_total = sum(int(r.get("da_produrre") or 0) for r in active_rows)
 
-        if (transferred + risc) >= ordered and active_total > 0:
-            # sposta TUTTO l'attivo a 'Deposito'
-            # priorità: più "avanti" prima
+        # NEW: somma complessiva dei parziali confermati (prima + corrente)
+        confirmed_total = int(sum_parz_prec_sku.get(sku, 0)) + int(parziale_sku_curr.get(sku, 0))
+
+        should_drain = ((transferred + risc) >= ordered) or (confirmed_total >= ordered)
+
+        if should_drain and active_total > 0:
             st_order = {s: i for i, s in enumerate(stati_attivi)}
             active_rows.sort(key=lambda r: st_order.get(r.get("stato_produzione"), 999), reverse=True)
             for row in active_rows:
@@ -2930,11 +2939,15 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 if qty <= 0:
                     continue
                 try:
+                    corr = str(uuid.uuid4())
                     payload = {
                         "p_from_id": int(row["id"]),
                         "p_to_state": "Deposito",
                         "p_qty": int(qty),
-                        "p_user_label": "Sistema (cleanup post-conferma)"
+                        "p_user_label": "Sistema (cleanup post-conferma)",
+                        "p_correlation_id": corr,
+                        "p_numero_parziale": int(numero_parziale),
+                        "p_riepilogo_id": int(riepilogo_id),
                     }
                     supa_with_retry(lambda: supabase.rpc("move_qty_rpc", payload).execute())
                     deposited_total += qty
@@ -2944,6 +2957,7 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
     report["deposited"] = deposited_total
     return report
+
  
  
  # --- GIACENZE: per SKU/EAN, aggregate per canale -----------------------------
