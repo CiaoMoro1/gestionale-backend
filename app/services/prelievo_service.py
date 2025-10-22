@@ -7,31 +7,31 @@ from app.repositories.prelievo_repo import (
 )
 from app.services.produzione_service import sync_produzione_from_prelievo_ids
 from app.supabase_client import supabase
-from app.supabase import supa_with_retry  # in testa al file, con gli altri import
+from app.common.supa_retry import supa_with_retry
 
 
 STATI = ("manca", "parziale", "completo", "in verifica")
 
 def _movimenta_magazzino_canale(row: dict, canale: str, delta: int, motivo: str):
-  """
-  delta > 0 => SCARICA dal canale
-  delta < 0 => CARICA (reso) al canale
-  """
-  if delta == 0:
-    return
-  args = {
-    "p_sku": row["sku"],
-    "p_ean": row["ean"],
-    "p_canale": canale,
-    "p_qty": abs(int(delta)),
-    "p_motivo": motivo,
-    "p_prelievo_id": int(row["id"])
-  }
-  rpc = "magazzino_scarica" if delta > 0 else "magazzino_carica"
-  rpc_res = supabase.rpc(rpc, args).execute()
-  err = getattr(rpc_res, "error", None) or (rpc_res.get("error") if isinstance(rpc_res, dict) else None)
-  if err:
-    raise RuntimeError(str(err))
+    """
+    delta > 0 => SCARICA dal canale
+    delta < 0 => CARICA (reso) al canale
+    """
+    if delta == 0:
+        return
+
+    args = {
+        "p_sku": row["sku"],
+        "p_ean": row["ean"],                      # può essere None: la RPC deve accettarlo
+        "p_canale": canale,
+        "p_qty": abs(int(delta)),
+        "p_motivo": motivo,
+        "p_prelievo_id": int(row["id"]),
+    }
+    rpc = "magazzino_scarica" if delta > 0 else "magazzino_carica"
+
+    # 👉 allineamento a _movimenta_magazzino: usa il retry centralizzato
+    supa_with_retry(lambda: supabase.rpc(rpc, args).execute())
 
 def _deriva_stato(qty:int, riscontro:int|None)->str:
     r = int(riscontro or 0)
@@ -122,7 +122,7 @@ def _movimenta_magazzino(row: dict, delta: int):
         "p_prelievo_id": int(row["id"]),
     }
     rpc = "magazzino_scarica" if delta > 0 else "magazzino_carica"  # <-- implementa/usa RPC di carico
-    supabase.rpc(rpc, args).execute()
+    supa_with_retry(lambda: supabase.rpc(rpc, args).execute())
 
 def aggiorna_prelievo(prelievo_id:int, payload:dict):
     _validate_payload(payload)
@@ -217,7 +217,10 @@ def aggiorna_prelievi_bulk(ids: list[int], fields: dict):
                 upd_prelievi_bulk(ids_cluster, {**bulk_fields, "stato": stato})
     else:
         if ids:
-            upd_prelievi_bulk(ids, bulk_fields)
+            righe = sel_prelievi(ids=ids, canale="Amazon Vendor")
+            ids_vendor = [int(r["id"]) for r in righe]
+            if ids_vendor:
+                upd_prelievi_bulk(ids_vendor, bulk_fields)
 
     sync_produzione_from_prelievo_ids(ids)
 

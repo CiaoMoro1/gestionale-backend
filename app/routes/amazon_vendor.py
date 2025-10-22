@@ -11,9 +11,9 @@ import time
 import uuid
 import logging
 import requests
-import httpx
-import random 
 from fpdf.enums import XPos, YPos  # <-- necessario per il jitter nel retry
+from app.common.supa_retry import supa_with_retry
+
 
 from requests_aws4auth import AWS4Auth
 from fpdf import FPDF
@@ -23,49 +23,9 @@ from barcode.writer import ImageWriter
 
 from app.supabase_client import supabase
 
-def _coalesce_logs(logs, window_seconds=3):
-    """
-    Deduplica i trigger tecnici a ridosso di un'azione umana.
-    Regola: se entro 'window_seconds' c'è un log dell'operatore
-    che descrive la stessa azione, nascondi il Trigger INSERT/UPDATE.
-    """
-    out = []
-    # indicizza per (sku, ean, stato_nuovo, qty_nuova) entro la finestra
-    human_events = []
-    for l in logs:
-        when = None
-        try:
-            when = datetime.fromisoformat(str(l.get("created_at")).replace("Z", "+00:00"))
-        except Exception:
-            pass
-        l["_dt"] = when
-        is_human = (l.get("utente") or "").strip().lower() not in ("", "postgres", "postgrest", "supabase", "sistema")
-        if is_human:
-            human_events.append(l)
-
-    for l in logs:
-        motivo_low = (l.get("motivo") or "").strip().lower()
-        if motivo_low.startswith("trigger"):
-            # cerca human match nella finestra temporale
-            dt = l.get("_dt")
-            if dt:
-                for h in human_events:
-                    if h.get("sku")==l.get("sku") and h.get("ean")==l.get("ean"):
-                        if h.get("stato_nuovo")==l.get("stato_nuovo") and h.get("qty_nuova")==l.get("qty_nuova"):
-                            hdt = h.get("_dt")
-                            if hdt and abs((hdt - dt).total_seconds()) <= window_seconds:
-                                # drop questo trigger
-                                break
-                else:
-                    out.append(l)
-            else:
-                out.append(l)
-        else:
-            out.append(l)
-    # pulizia
-    for l in out:
-        l.pop("_dt", None)
-    return out
+def _eq_or_is_null(qb, col: str, val: str | None):
+    v = (val or "").strip()
+    return qb.is_(col, None) if not v else qb.eq(col, v)
 
 
 def _current_user_label() -> str:
@@ -117,51 +77,6 @@ bp = Blueprint('amazon_vendor', __name__)
 # amazon_vendor.py
 
 from app import supabase_client
-
-# includo anche alcune eccezioni comuni di rete
-_RETRYABLE_EXC = (
-   httpx.RemoteProtocolError,
-   httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-   httpx.ConnectError, httpx.ReadError, httpx.ProtocolError,
-   httpx.TransportError, httpx.RequestError,
-)
-
-def supa_with_retry(builder_fn, retries=6, delay=0.5, backoff=2.0):
-    """
-    Esegue una operazione Supabase con retry + exponential backoff + jitter.
-    - Se avvengono disconnessioni consecutive, il client httpx viene ricreato
-      automaticamente dal modulo supabase_client.
-    - Su esito positivo, azzera il contatore di disconnessioni.
-    """
-    last_ex = None
-    cur_delay = delay
-
-    for attempt in range(1, retries + 1):
-        try:
-            builder = builder_fn()
-            # compat: o ritorna un builder con .execute() oppure un risultato già eseguito
-            res = builder.execute() if hasattr(builder, "execute") else builder
-            supabase_client.note_success()  # ✅ ok: azzera contatore consecutivi
-            return res
-
-        except _RETRYABLE_EXC as ex:
-            last_ex = ex
-            logging.warning(f"[supa_with_retry] tentativo {attempt}/{retries} — rete/protocollo: {ex}")
-            # segnala il disconnect e lascia che il modulo decida se resettare la sessione
-            supabase_client.note_disconnect_and_maybe_reset()
-
-        except Exception as ex:
-            # altri errori (es. validazione): ritentiamo comunque (alcuni sono transient)
-            last_ex = ex
-            logging.warning(f"[supa_with_retry] tentativo {attempt}/{retries} — errore generico: {ex}")
-
-        if attempt < retries:
-            # exponential backoff con jitter leggero
-            time.sleep(cur_delay * (1.0 + random.uniform(0.0, 0.2)))
-            cur_delay *= backoff
-
-    # esauriti i tentativi
-    raise last_ex
 
 # Helper esecuzione con paginazione "elastica" per builder finti dei test
 def exec_range_or_limit(query_builder, offset=None, limit=None):
@@ -273,12 +188,13 @@ def _retarget_qty_to_date(src_id: int, new_start_delivery: str, qty: int, user_l
         try:
             irow = (inserted[0] if inserted else None)
             if irow:
+                motivo = f"Creazione {st} (retarget)"
                 log_movimento_produzione(
                     irow,
                     utente=_current_user_label(),
-                    motivo="Creazione Da Stampare (sync singolo)",
+                    motivo=motivo,
                     stato_vecchio=None,
-                    stato_nuovo="Da Stampare",
+                    stato_nuovo=st,
                     qty_vecchia=None,
                     qty_nuova=irow.get("da_produrre"),
                 )
@@ -453,26 +369,19 @@ def search_products():
 
         query = base
 
-        # token esatti: SKU part delimitato (^|-)tok($|-) oppure EAN esatto se numerico
-        # token esatti: SKU part delimitato senza regex + EAN numerico esatto
-        # fuzzy: AND su più token, OR sui campi
         for tok in fuzzy_tokens:
-            t = tok.strip()
+            # 🔧 SANITIZZA: togli % e virgole (che rompono l'or=...)
+            t = (tok or "").replace("%", "").replace(",", " ").strip()
             if not t:
                 continue
             star = f"*{t}*"
-            query = query.or_(f"sku.ilike.{star},ean.ilike.{star},variant_title.ilike.{star},product_title.ilike.{star}")
+            query = query.or_(
+                f"sku.ilike.{star},ean.ilike.{star},variant_title.ilike.{star},product_title.ilike.{star}"
+            )
 
-        # fuzzy: AND su più campi
-        for tok in fuzzy_tokens:
-            t = tok.strip()
-            if not t:
-                continue
-            star = f"*{t}*"
-            query = query.or_(f"sku.ilike.{star},ean.ilike.{star},variant_title.ilike.{star},product_title.ilike.{star}")
         rows = supa_with_retry(lambda: query.limit(limit).execute()).data or []
 
-        # ordina con "preferenza" per match esatti
+        # ordina con "preferenza" per match esatti (token con ';')
         def score(r):
             s = (r.get("sku") or "").upper()
             exact_hit = any(
@@ -564,22 +473,24 @@ def sync_produzione_from_prelievo(prelievo_id: int):
         sku  = p["sku"]
         ean = (p["ean"] or "").strip()
         data = p.get("start_delivery")
-        plus = int(p.get("plus") or 0)
-        # 💡 riscontro è TOTALE (già comprende il prenotato)
-        coperto = max(0, int(p.get("riscontro") or 0) + plus
-                      )
 
 
         # 1) somma attivi per Vendor (SKU/EAN) su TUTTE le date (POOL)
         stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
-        attivi_rows = supa_with_retry(lambda: (
+
+        # sku: resta match esatto
+        q = (
             sb_table("produzione_vendor")
             .select("da_produrre")
             .eq("canale", "Amazon Vendor")
-            .eq("sku", sku).eq("ean", ean)
+            .eq("sku", sku)
             .in_("stato_produzione", stati_attivi)
-            .execute()
-        )).data or []
+        )
+
+        # ean: match NULL-aware (evita doppi quando da un lato è NULL e dall’altro "")
+        q = _eq_or_is_null(q, "ean", ean)
+
+        attivi_rows = supa_with_retry(lambda: q.execute()).data or []
         attivi = sum(int(r.get("da_produrre") or 0) for r in attivi_rows)
 
         # 2) differenza da mettere in "Da Stampare" (sulla data DEL PRELIEVO)
@@ -591,16 +502,17 @@ def sync_produzione_from_prelievo(prelievo_id: int):
         ds = needed_ord + plus  
 
         # 3) trova eventuale riga DS esistente (stessa chiave logica)
-        ds_rows = supa_with_retry(lambda: (
+        q_ds = (
             sb_table("produzione_vendor")
             .select("id, da_produrre")
             .eq("canale", "Amazon Vendor")
-            .eq("sku", sku).eq("ean", ean)
+            .eq("sku", sku)
             .eq("start_delivery", data)
             .eq("stato_produzione", "Da Stampare")
-            .limit(1)
-            .execute()
-        )).data or []
+        )
+        q_ds = _eq_or_is_null(q_ds, "ean", ean)   # <<--- QUI la differenza
+
+        ds_rows = supa_with_retry(lambda: q_ds.limit(1).execute()).data or []
         ds_id = ds_rows[0]["id"] if ds_rows else None
 
         if ds <= 0:
@@ -689,7 +601,10 @@ def sync_produzione_from_prelievo(prelievo_id: int):
             except Exception:
                 pass
 
-        logging.info("[sync semplice] prelievo %s -> DS=%s (attivi=%s, coperto=%s)", prelievo_id, ds, attivi, coperto)
+        logging.info(
+            "[sync semplice] prelievo %s -> DS=%s (qty=%s, risc=%s, attivi=%s, plus=%s, needed_ord=%s)",
+            prelievo_id, ds, qty, risc, attivi, plus, needed_ord
+        )
 
     except Exception as ex:
         logging.exception("[sync_produzione_from_prelievo] Errore (sync semplice): %s", ex)
@@ -2300,8 +2215,11 @@ def _log_sync_summary(*, utente: str, motivo: str, scope: str, dettaglio: dict):
 
 
 
-def log_movimento_produzione(row, utente, motivo, stato_vecchio=None, stato_nuovo=None,
-                             qty_vecchia=None, qty_nuova=None, dettaglio=None):
+def log_movimento_produzione(row, utente, motivo,
+                             stato_vecchio=None, stato_nuovo=None,
+                             qty_vecchia=None, qty_nuova=None,
+                             plus_vecchio=None, plus_nuovo=None,   # <— AGGIUNTI
+                             dettaglio=None):
     payload = {
         "produzione_id": row.get("id"),
         "sku": row.get("sku"),
@@ -2311,6 +2229,8 @@ def log_movimento_produzione(row, utente, motivo, stato_vecchio=None, stato_nuov
         "stato_nuovo": stato_nuovo,
         "qty_vecchia": qty_vecchia,
         "qty_nuova": qty_nuova,
+        "plus_vecchio": plus_vecchio,     # <—
+        "plus_nuovo": plus_nuovo,         # <—
         "motivo": motivo,
         "utente": utente,
         "dettaglio": dettaglio or {}
@@ -2638,12 +2558,7 @@ def badge_counts():
 
 
 def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parziale: int):
-    """
-    Sposta in 'Trasferito' le quantità del parziale confermato usando SOLO la RPC move_qty_rpc,
-    con regola 'riscontro-first'. Se, dopo il parziale, (Trasferito + Riscontro) >= Ordinate,
-    qualunque residuo in stati attivi (Stampato/Calandrato/Cucito/Confezionato) viene spostato
-    in 'Deposito'. Ritorna un report: { "moved": int, "failures": [ ... ], "deposited": int }.
-    """
+    
     report = {"moved": 0, "failures": [], "deposited": 0}
 
     # 0) util
@@ -2822,7 +2737,19 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
                 avail = int(row.get("da_produrre") or 0)
                 if avail <= 0:
                     continue
-                take = min(avail, need, planned - moved_for_sku)  # 🛡️ cap difensivo
+                take = min(avail, need, planned - moved_for_sku)
+                if take <= 0:
+                    continue
+
+                # 🔄 STALENESS GUARD: rileggi avail corrente e riduci take
+                try:
+                    cur = supa_with_retry(lambda: (
+                        sb_table("produzione_vendor").select("da_produrre").eq("id", row["id"]).single().execute()
+                    ))
+                    avail_now = int((cur.data or {}).get("da_produrre") or 0)
+                except Exception:
+                    avail_now = 0
+                take = min(take, avail_now)
                 if take <= 0:
                     continue
                 try:
@@ -2873,6 +2800,18 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
                 tgt_id = _retarget_qty_to_date(int(row["id"]), str(start_delivery), int(take), user_label)
                 if not tgt_id:
+                    continue
+                
+                # 🔄 STALENESS GUARD: rileggi avail della riga target appena creata/mergiata
+                try:
+                    cur = supa_with_retry(lambda: (
+                        sb_table("produzione_vendor").select("da_produrre").eq("id", tgt_id).single().execute()
+                    ))
+                    avail_now = int((cur.data or {}).get("da_produrre") or 0)
+                except Exception:
+                    avail_now = 0
+                take = min(take, avail_now)
+                if take <= 0:
                     continue
 
                 try:
@@ -2979,7 +2918,7 @@ def api_magazzino_giacenze():
         q = sb_table("magazzino_giacenze").select("canale, qty")
         q = q.eq("sku", sku)
         if ean:
-            q = q.eq("ean", ean)
+            q_tgt = _eq_or_is_null(q_tgt, "ean", ean)
 
         rows = supa_with_retry(lambda: q.execute()).data or []
 

@@ -14,14 +14,14 @@ import uuid
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
-
-
+from postgrest.exceptions import APIError
+from app.common.supa_retry import supa_with_retry
 # Supabase client (come nel tuo progetto)
 from app.supabase_client import supabase
 from app import supabase_client  # per note_success / reset
 
 # HTTPX per gestione retryable exceptions (come già usavi)
-import httpx
+
 
 bp = Blueprint("produzione", __name__)
 
@@ -73,15 +73,6 @@ def _coalesce_logs(logs, window_seconds=3):
         l.pop("_dt", None)
     return out
 
-
-# eccezioni di rete retryable per supabase
-_RETRYABLE_EXC = (
-    httpx.RemoteProtocolError,
-    httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-    httpx.ConnectError, httpx.ReadError, httpx.ProtocolError,
-    httpx.TransportError, httpx.RequestError,
-)
-
 def sb_table(name: str):
     """
     Rende compatibile la tua istanza supabase in caso di differenze di binding.
@@ -105,33 +96,6 @@ def sb_table(name: str):
             return tbl_attr_cls(name)
     raise RuntimeError("sb_table: supabase.table() non disponibile")
 
-def supa_with_retry(builder_fn, retries=6, delay=0.35, backoff=1.8):
-    """
-    Esegue il builder con retry sugli errori di rete. Ritorna l'oggetto
-    response di supabase (con .data). Se il builder ha già .execute, la invoca.
-    """
-    last_ex = None
-    cur_delay = delay
-    for attempt in range(1, retries + 1):
-        try:
-            builder = builder_fn()
-            res = builder.execute() if hasattr(builder, "execute") else builder
-            # hook di salute connessione (come nel tuo progetto)
-            if hasattr(supabase_client, "note_success"):
-                supabase_client.note_success()
-            return res
-        except _RETRYABLE_EXC as ex:
-            last_ex = ex
-            logging.warning(f"[supa_with_retry] attempt {attempt}/{retries} net: {ex}")
-            if hasattr(supabase_client, "note_disconnect_and_maybe_reset"):
-                supabase_client.note_disconnect_and_maybe_reset()
-        except Exception as ex:
-            last_ex = ex
-            logging.warning(f"[supa_with_retry] attempt {attempt}/{retries} generic: {ex}")
-        if attempt < retries:
-            time.sleep(cur_delay * (1.0 + 0.15))
-            cur_delay *= backoff
-    raise last_ex
 
 def _current_user_label() -> str:
     """
@@ -192,11 +156,10 @@ def _is_fk_error(ex: Exception) -> bool:
 def log_movimento_produzione(row, utente, motivo,
                              stato_vecchio=None, stato_nuovo=None,
                              qty_vecchia=None, qty_nuova=None,
-                             dettaglio=None, **extra):   # <--- NEW
-    # unisci extra nel dettaglio
+                             plus_vecchio=None, plus_nuovo=None,   # <—
+                             dettaglio=None, **extra):
     det = dict(dettaglio or {})
     for k, v in extra.items():
-        # evita collisioni con chiavi note
         if k not in det:
             det[k] = v
 
@@ -209,6 +172,8 @@ def log_movimento_produzione(row, utente, motivo,
         "stato_nuovo": stato_nuovo,
         "qty_vecchia": qty_vecchia,
         "qty_nuova": qty_nuova,
+        "plus_vecchio": plus_vecchio,              # <—
+        "plus_nuovo": plus_nuovo,                  # <—
         "motivo": motivo,
         "utente": utente,
         "dettaglio": det
@@ -218,10 +183,8 @@ def log_movimento_produzione(row, utente, motivo,
         supa_with_retry(lambda: sb_table("movimenti_produzione_vendor").insert(payload).execute())
     except Exception as ex:
         if _is_fk_error(ex):
-            payload2 = dict(payload)
-            payload2["produzione_id"] = None
-            det2 = dict(payload2.get("dettaglio") or {})
-            det2["_fk_fallback"] = True
+            payload2 = dict(payload); payload2["produzione_id"] = None
+            det2 = dict(payload2.get("dettaglio") or {}); det2["_fk_fallback"] = True
             det2["_missing_produzione_id"] = payload.get("produzione_id")
             payload2["dettaglio"] = det2
             try:
@@ -283,7 +246,9 @@ def lista_produzione():
         if canale:
             query = query.eq("canale", canale)  # NEW
         if search:
-            query = query.or_(f"sku.ilike.%{search}%,ean.ilike.%{search}%")
+            s = search.replace("%", "").replace(",", " ").strip()
+            star = f"%{s}%"
+            query = query.or_(f"sku.ilike.{star},ean.ilike.{star}")
         query = query.order("start_delivery", desc=False, nullsfirst=True).order("sku")
         rows = supa_with_retry(lambda: query.execute()).data
 
@@ -627,163 +592,6 @@ def delete_produzione_bulk():
         logging.exception("[delete_produzione_bulk] Errore DELETE bulk produzione")
         return jsonify({"error": f"Errore: {str(ex)}"}), 500
 
-
-
-# -----------------------------------------------------------------------------
-# Pulizia produzione "Da Stampare"
-# -----------------------------------------------------------------------------
-@bp.route('/api/produzione/pulisci-da-stampare', methods=['POST'])
-def pulisci_da_stampare_endpoint():
-    try:
-        def norm(x):
-            return (
-                (x.get("sku") or "").strip().lower().replace(" ", ""),
-                (x.get("ean") or "").strip().lower().replace(" ", "")
-            )
-
-        produzione = supa_with_retry(lambda: (
-            sb_table("produzione_vendor").select("id,sku,ean,start_delivery").eq("stato_produzione", "Da Stampare").eq("canale", "Amazon Vendor").execute()
-        )).data
-        prelievi = supa_with_retry(lambda: (
-            sb_table("prelievi_ordini_amazon").select("sku,ean,start_delivery").eq("canale", "Amazon Vendor").execute()
-        )).data
-
-        max_data_per_sku_ean = defaultdict(str)
-        for p in prelievi:
-            chiave = norm(p)
-            data = str(p.get("start_delivery") or "")[:10]
-            if data and (data > max_data_per_sku_ean[chiave]):
-                max_data_per_sku_ean[chiave] = data
-
-        ids_da_eliminare = []
-        for r in produzione:
-            chiave = norm(r)
-            data_riga = str(r.get("start_delivery") or "")[:10]
-            if max_data_per_sku_ean.get(chiave) and data_riga != max_data_per_sku_ean[chiave]:
-                ids_da_eliminare.append(r["id"])
-            elif chiave not in max_data_per_sku_ean:
-                ids_da_eliminare.append(r["id"])
-
-        if ids_da_eliminare:
-            # Log unico di sintesi (nessun log per singola riga)
-            try:
-                stub = {
-                    "id": None,
-                    "sku": "*",
-                    "ean": None,
-                    "start_delivery": None,
-                    "stato_produzione": None,
-                    "plus": 0,
-                    "canale": "Amazon Vendor",
-                }
-                log_movimento_produzione(
-                    stub,
-                    utente=_current_user_label(),
-                    motivo="Pulizia Da Stampare",
-                    dettaglio={
-                        "scope": "globale",
-                        "deleted": len(ids_da_eliminare),
-                    },
-                )
-            except Exception:
-                pass
-
-            supa_with_retry(lambda: (
-                sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
-            ))
-
-        return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
-    except Exception as ex:
-        logging.exception("[pulisci_da_stampare_endpoint] Errore pulizia produzione da stampare")
-        return jsonify({"error": f"Errore pulizia: {str(ex)}"}), 500
-
-
-# -----------------------------------------------------------------------------
-# Pulizia parziale "Da Stampare"
-# -----------------------------------------------------------------------------
-@bp.route('/api/produzione/pulisci-da-stampare-parziale', methods=['POST'])
-def pulisci_da_stampare_parziale():
-    try:
-        data = request.json
-        radice = data.get("radice")
-        ids = data.get("ids", [])
-        # 👉 Evita pulizie “a tappeto” senza filtro: obbliga ids o radice
-        if not ids and not radice:
-            return jsonify({"error": "Fornire 'ids' (prelievo_id) oppure 'radice'."}), 400
-
-        def norm(x):
-            return (
-                (x.get("sku") or "").strip().lower().replace(" ", ""),
-                (x.get("ean") or "").strip().lower().replace(" ", "")
-            )
-
-        produzione_query = sb_table("produzione_vendor").select("id,sku,ean,start_delivery,prelievo_id")
-        produzione_query = produzione_query.eq("canale", "Amazon Vendor")  # <— vincolo canale
-        if ids:
-            produzione_query = produzione_query.in_("prelievo_id", ids)
-        elif radice:
-            produzione_query = produzione_query.eq("radice", radice)
-        produzione = supa_with_retry(lambda: (
-            produzione_query.eq("stato_produzione", "Da Stampare").execute()
-        )).data
-
-        prelievi_query = sb_table("prelievi_ordini_amazon").select("id,sku,ean,start_delivery")
-        if ids:
-            prelievi_query = prelievi_query.in_("id", ids)
-        elif radice:
-            prelievi_query = prelievi_query.eq("radice", radice)
-        prelievi = supa_with_retry(lambda: prelievi_query.execute()).data
-
-        max_data_per_sku_ean = defaultdict(str)
-        for p in prelievi:
-            chiave = norm(p)
-            data = str(p.get("start_delivery") or "")[:10]
-            if data and (data > max_data_per_sku_ean[chiave]):
-                max_data_per_sku_ean[chiave] = data
-
-        ids_da_eliminare = []
-        for r in produzione:
-            chiave = norm(r)
-            data_riga = str(r.get("start_delivery") or "")[:10]
-            if max_data_per_sku_ean.get(chiave) and data_riga != max_data_per_sku_ean[chiave]:
-                ids_da_eliminare.append(r["id"])
-            elif chiave not in max_data_per_sku_ean:
-                ids_da_eliminare.append(r["id"])
-
-        if ids_da_eliminare:
-            # Log unico di sintesi (nessun log per singola riga)
-            try:
-                stub = {
-                    "id": None,
-                    "sku": "*",
-                    "ean": None,
-                    "start_delivery": None,
-                    "stato_produzione": None,
-                    "plus": 0,
-                    "canale": "Amazon Vendor",
-                }
-                log_movimento_produzione(
-                    stub,
-                    utente=_current_user_label(),
-                    motivo="Pulizia Da Stampare (parziale)",
-                    dettaglio={
-                        "scope": "parziale",
-                        "deleted": len(ids_da_eliminare),
-                        "radice": radice,
-                        "prelievo_ids": ids,
-                    },
-                )
-            except Exception:
-                pass
-
-            supa_with_retry(lambda: (
-                sb_table("produzione_vendor").delete().in_("id", ids_da_eliminare).execute()
-            ))
-
-        return jsonify({"ok": True, "deleted": len(ids_da_eliminare)})
-    except Exception as ex:
-        logging.exception("[pulisci_da_stampare_parziale] Errore pulizia parziale da stampare")
-        return jsonify({"error": f"Errore pulizia parziale: {str(ex)}"}), 500
 
 # -----------------------------------------------------------------------------
 # Inserimento manuale in produzione (canali: Amazon Seller, Sito)
