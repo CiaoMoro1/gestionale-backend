@@ -13,7 +13,7 @@ import logging
 import requests
 from fpdf.enums import XPos, YPos  # <-- necessario per il jitter nel retry
 from app.common.supa_retry import supa_with_retry
-
+from postgrest.exceptions import APIError
 
 from requests_aws4auth import AWS4Auth
 from fpdf import FPDF
@@ -1967,9 +1967,11 @@ def riepilogo_dashboard_parziali():
             return jsonify([])
 
         riepilogo_ids = [r.get("id") or r.get("riepilogo_id") for r in riepiloghi]
+
+        # ⬇️ Aggiungo "confermato" così possiamo derivare parziale_chiuso
         pres = supa_with_retry(lambda: (
             sb_table("ordini_vendor_parziali")
-            .select("riepilogo_id,numero_parziale,dati,conferma_collo")
+            .select("riepilogo_id,numero_parziale,dati,conferma_collo,confermato")
             .in_("riepilogo_id", riepilogo_ids)
             .execute()
         ))
@@ -1983,10 +1985,12 @@ def riepilogo_dashboard_parziali():
             fulfillment_center = r["fulfillment_center"]
             start_delivery = r["start_delivery"]
             stato_ordine = r["stato_ordine"]
-            po_list = r["po_list"]
+            po_list = r.get("po_list")
             riepilogo_id = r.get("id") or r.get("riepilogo_id")
 
             my_parziali = parziali_per_riep.get(riepilogo_id, [])
+
+            # Nessun parziale: pubblichiamo una riga “vuota”
             if not my_parziali:
                 dashboard.append({
                     "fulfillment_center": fulfillment_center,
@@ -1997,11 +2001,16 @@ def riepilogo_dashboard_parziali():
                     "colli_confermati": 0,
                     "po_list": po_list,
                     "riepilogo_id": riepilogo_id,
+                    # nessun parziale -> non applicabile
+                    "parziale_chiuso": None,
                 })
                 continue
 
+            # Per ogni parziale esistente, calcoliamo i colli + lo stato "chiuso"
             for p in my_parziali:
                 numero_parziale = p.get("numero_parziale") or 1
+
+                # colli totali dai dati
                 dati = p.get("dati", [])
                 if isinstance(dati, str):
                     try:
@@ -2014,6 +2023,8 @@ def riepilogo_dashboard_parziali():
                         collo = d.get("collo")
                         if collo is not None:
                             colli_totali_set.add(collo)
+
+                # colli confermati da conferma_collo
                 conferma_collo = p.get("conferma_collo") or {}
                 if isinstance(conferma_collo, str):
                     try:
@@ -2028,6 +2039,13 @@ def riepilogo_dashboard_parziali():
                                 colli_confermati_set.add(int(k))
                             except Exception:
                                 pass
+
+                # ⬇️ NEW: deriviamo il flag richiesto dal frontend
+                parziale_chiuso = p.get("confermato")
+                # normalizziamo a bool/None (se il campo non c'è per retrocompatibilità)
+                if parziale_chiuso is not None:
+                    parziale_chiuso = bool(parziale_chiuso)
+
                 dashboard.append({
                     "fulfillment_center": fulfillment_center,
                     "start_delivery": start_delivery,
@@ -2037,11 +2055,16 @@ def riepilogo_dashboard_parziali():
                     "colli_confermati": len(colli_confermati_set),
                     "po_list": po_list,
                     "riepilogo_id": riepilogo_id,
+                    # ⬅️ Campo che userai per la “voce 5”
+                    "parziale_chiuso": parziale_chiuso,
                 })
+
         return jsonify(dashboard)
+
     except Exception as ex:
         logging.exception("[riepilogo_dashboard_parziali] Errore dashboard parziali")
         return jsonify({"error": f"Errore interno: {str(ex)}"}), 500
+
 
 # -----------------------------------------------------------------------------
 # PDF: Lista ordini nuovi per centro
@@ -2914,30 +2937,34 @@ def api_magazzino_giacenze():
         if not sku:
             return jsonify([]), 200
 
-        # base query
-        q = sb_table("magazzino_giacenze").select("canale, qty")
-        q = q.eq("sku", sku)
+        # Sanifica input (evita parse error PGRST100 su virgole/%)
+        ean = ean.replace("%", "").replace(",", " ").strip()
+
+        # Query base
+        q = sb_table("magazzino_giacenze").select("canale, qty").eq("sku", sku)
         if ean:
-            q_tgt = _eq_or_is_null(q_tgt, "ean", ean)
+            q = q.eq("ean", ean)
 
-        rows = supa_with_retry(lambda: q.execute()).data or []
+        try:
+            rows = supa_with_retry(lambda: q.execute()).data or []
+        except APIError as ex:
+            # Se PostgREST risponde con errori di parsing/HTML (transienti), non bloccare la pagina
+            logging.warning(f"[api_magazzino_giacenze] APIError: {ex}")
+            return jsonify([]), 200
 
-        # ritorna anche quelli mancanti a 0? No: lasciamo solo presenti
-        # ma il frontend mostra 0 se non c'è (già gestito)
+        # Normalizza output (il FE mostra 0 se canale mancante)
         out = []
         for r in rows:
             try:
                 out.append({
-                    "canale": r.get("canale") or "Amazon Vendor",
+                    "canale": (r.get("canale") or "Amazon Vendor"),
                     "qty": int(r.get("qty") or 0),
                 })
             except Exception:
                 pass
 
-        # Se non c'è nulla, meglio 200 [] (il frontend mette 0)
         return jsonify(out), 200
 
     except Exception as ex:
-        # In caso di errore applicativo rispondi 500
         logging.exception("[api_magazzino_giacenze] errore")
         return jsonify({"error": str(ex)}), 500
