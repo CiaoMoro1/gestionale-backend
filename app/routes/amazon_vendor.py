@@ -4,7 +4,6 @@ from collections import defaultdict
 from typing import Optional
 from io import BytesIO
 import os
-import io
 import json
 import math
 import time
@@ -2928,43 +2927,312 @@ def _move_parziale_to_trasferito(center: str, start_delivery: str, numero_parzia
 
  
  
- # --- GIACENZE: per SKU/EAN, aggregate per canale -----------------------------
+# --- GIACENZE: vista estesa per pagina o per SKU --------------------------------
+# Requisiti:
+# - Prenotati per canale derivati da prelievi attivi (mag_usato_by_canale)
+# - Quantità mostrate per canale = stock attuale + prenotati
+# - NIENTE reservations, NIENTE "In Verifica" nei conti (solo informativo se vuoi mantenerlo nel payload)
+
+ACTIVE_PRELIEVO_STATES = {"in_verifica", "parziale", "completo", "completato", "completi"}
+
+def _norm_canale(c: str) -> str:
+    c = (c or "").strip()
+    lc = c.lower()
+    if lc.startswith("amazon vendor") or lc == "vendor":
+        return "Amazon Vendor"
+    if lc.startswith("amazon seller") or "seller" in lc:
+        return "Amazon Seller"
+    if lc in ("sito", "shopify", "web"):
+        return "Sito"
+    return c or "Amazon Vendor"
+
+def _read_prelievi_prenotati_per_canale(keys, supa_with_retry, sb_table):
+    """
+    Aggrega prenotati dai prelievi ATTIVI (stato in ACTIVE_PRELIEVO_STATES)
+    keys: set([(sku, ean_or_None), ...]) della pagina corrente
+    ritorna: dict[(sku,ean)] -> { "Amazon Vendor": x, "Sito": y, "Amazon Seller": z }
+    """
+    import json as _json
+
+    skus = list({k[0] for k in keys})
+    eans = list({k[1] for k in keys if k[1]})
+
+    pq = sb_table("prelievi_ordini_amazon").select("sku, ean, mag_usato_by_canale, stato").in_("sku", skus)
+    # filtro stati lato SQL (ampio) + filtro difensivo lato Python
+    pq = pq.in_("stato", list(ACTIVE_PRELIEVO_STATES))
+    if eans and len(eans) <= 500:
+        pq = pq.in_("ean", eans)
+
+    try:
+        prelievi_rows = supa_with_retry(lambda: pq.execute()).data or []
+    except Exception as ex:
+        logging.warning(f"[giacenze estese] prelievi APIError: {ex}")
+        prelievi_rows = []
+
+    # filtro difensivo su stati
+    out = {}
+    for pr in prelievi_rows:
+        try:
+            stato = (pr.get("stato") or "").strip().lower()
+            if stato not in ACTIVE_PRELIEVO_STATES:
+                continue
+
+            k = (pr.get("sku"), pr.get("ean") or None)
+            if k not in keys:
+                # fallback per SKU: se in pagina c'è una sola coppia per quello SKU, mappa lì
+                candidates = [kk for kk in keys if kk[0] == k[0]]
+                if len(candidates) == 1:
+                    k = candidates[0]
+                else:
+                    continue
+
+            raw = pr.get("mag_usato_by_canale") or {}
+            if isinstance(raw, str):
+                try:
+                    raw = _json.loads(raw)
+                except Exception:
+                    raw = {}
+            if not isinstance(raw, dict):
+                continue
+
+            bucket = out.setdefault(k, {})
+            for canale, val in raw.items():
+                try:
+                    v = int(val or 0)
+                except Exception:
+                    v = 0
+                if v <= 0:
+                    continue
+                nn = _norm_canale(canale)
+                bucket[nn] = int(bucket.get(nn, 0)) + v
+        except Exception:
+            pass
+
+    return out
+
 @bp.route('/api/magazzino/giacenze', methods=['GET'])
 def api_magazzino_giacenze():
     try:
+        import json
         sku = (request.args.get("sku") or "").strip()
         ean = (request.args.get("ean") or "").strip()
-        if not sku:
-            return jsonify([]), 200
-
-        # Sanifica input (evita parse error PGRST100 su virgole/%)
-        ean = ean.replace("%", "").replace(",", " ").strip()
-
-        # Query base
-        q = sb_table("magazzino_giacenze").select("canale, qty").eq("sku", sku)
-        if ean:
-            q = q.eq("ean", ean)
+        q_text = (request.args.get("q") or "").strip()
+        mode = (request.args.get("mode") or "").strip().lower()
 
         try:
-            rows = supa_with_retry(lambda: q.execute()).data or []
-        except APIError as ex:
-            # Se PostgREST risponde con errori di parsing/HTML (transienti), non bloccare la pagina
-            logging.warning(f"[api_magazzino_giacenze] APIError: {ex}")
+            offset = int(request.args.get("offset", 0))
+            limit = int(request.args.get("limit", 50))
+        except ValueError:
+            offset, limit = 0, 50
+
+        # sanifica
+        ean = ean.replace("%", "").replace(",", " ").strip() or None
+
+        # -------------------- BRANCH A: DETTAGLIO SKU/EAN --------------------
+        if sku:
+            # Giacenze per canale
+            q = sb_table("magazzino_giacenze").select("canale, qty").eq("sku", sku)
+            if ean:
+                q = q.eq("ean", ean)
+            try:
+                rows = supa_with_retry(lambda: q.execute()).data or []
+            except Exception as ex:
+                logging.warning(f"[giacenze estese] APIError det: {ex}")
+                rows = []
+
+            per_canale = {}
+            for r in rows:
+                try:
+                    c = _norm_canale(r.get("canale"))
+                    per_canale[c] = int(r.get("qty") or 0) + int(per_canale.get(c, 0))
+                except Exception:
+                    pass
+
+            # Prenotati dai prelievi attivi (usa solo mag_usato_by_canale)
+            keys = {(sku, ean)}
+            pren_map = _read_prelievi_prenotati_per_canale(keys, supa_with_retry, sb_table)
+            pren_per = pren_map.get((sku, ean), {})
+
+            # Per canale: mostrato = stock attuale + prenotati di quel canale
+            vendor_pren  = int(pren_per.get("Amazon Vendor", 0))
+            sito_pren    = int(pren_per.get("Sito", 0))
+            seller_pren  = int(pren_per.get("Amazon Seller", 0))
+
+            vendor_show  = int(per_canale.get("Amazon Vendor", 0)) + vendor_pren
+            sito_show    = int(per_canale.get("Sito", 0)) + sito_pren
+            seller_show  = int(per_canale.get("Amazon Seller", 0)) + seller_pren
+
+            tot_show     = vendor_show + sito_show + seller_show
+            pren_tot     = vendor_pren + sito_pren + seller_pren
+
+            payload = {
+                "sku": sku,
+                "ean": ean,
+                "giacenza_totale": int(tot_show),
+                "prenotati_totali": int(pren_tot),
+                "vendor_qta": int(vendor_show),
+                "vendor_prenotati": int(vendor_pren),
+                "sito_qta": int(sito_show),
+                "sito_prenotati": int(sito_pren),
+                "seller_qta": int(seller_show),
+                "seller_prenotati": int(seller_pren),
+            }
+            return jsonify(payload if mode == "esteso" else [{"canale": k, "qty": v} for k, v in per_canale.items()]), 200
+
+        # -------------------- BRANCH B: LIST MODE (pagina) -------------------
+        base = sb_table("magazzino_giacenze").select("sku, ean, canale, qty")
+        if q_text:
+            base = base.or_(f"sku.ilike.*{q_text}*,ean.ilike.*{q_text}*")
+        try:
+            page_rows = supa_with_retry(
+                lambda: base.order("sku").order("ean").range(offset, offset + limit - 1).execute()
+            ).data or []
+        except Exception as ex:
+            logging.warning(f"[giacenze estese] LIST base APIError: {ex}")
             return jsonify([]), 200
 
-        # Normalizza output (il FE mostra 0 se canale mancante)
-        out = []
-        for r in rows:
+        # Aggrega giacenze per (sku, ean, canale)
+        gi_map = {}      # (sku,ean) -> {canale: qty}
+        keys = set()
+        for r in page_rows:
             try:
-                out.append({
-                    "canale": (r.get("canale") or "Amazon Vendor"),
-                    "qty": int(r.get("qty") or 0),
-                })
+                k = (r["sku"], (r.get("ean") or None))
+                keys.add(k)
+                c = _norm_canale(r.get("canale"))
+                slot = gi_map.setdefault(k, {})
+                slot[c] = int(r.get("qty") or 0) + int(slot.get(c, 0))
             except Exception:
                 pass
+        if not keys:
+            return jsonify([]), 200
+
+        # Prenotati dai prelievi attivi per la pagina
+        pren_map = _read_prelievi_prenotati_per_canale(keys, supa_with_retry, sb_table)
+
+        out = []
+        for (sku_i, ean_i) in keys:
+            per_canale = gi_map.get((sku_i, ean_i), {})
+            pren_per   = pren_map.get((sku_i, ean_i), {})
+
+            vendor_pren  = int(pren_per.get("Amazon Vendor", 0))
+            sito_pren    = int(pren_per.get("Sito", 0))
+            seller_pren  = int(pren_per.get("Amazon Seller", 0))
+
+            vendor_show  = int(per_canale.get("Amazon Vendor", 0)) + vendor_pren
+            sito_show    = int(per_canale.get("Sito", 0)) + sito_pren
+            seller_show  = int(per_canale.get("Amazon Seller", 0)) + seller_pren
+
+            tot_show     = vendor_show + sito_show + seller_show
+            pren_tot     = vendor_pren + sito_pren + seller_pren
+
+            out.append({
+                "sku": sku_i,
+                "ean": ean_i,
+                "giacenza_totale": int(tot_show),
+                "prenotati_totali": int(pren_tot),
+                "vendor_qta": int(vendor_show),
+                "vendor_prenotati": int(vendor_pren),
+                "sito_qta": int(sito_show),
+                "sito_prenotati": int(sito_pren),
+                "seller_qta": int(seller_show),
+                "seller_prenotati": int(seller_pren),
+            })
 
         return jsonify(out), 200
 
     except Exception as ex:
         logging.exception("[api_magazzino_giacenze] errore")
+        return jsonify({"error": str(ex)}), 500
+    
+@bp.route('/api/magazzino/trasferisci', methods=['POST'])
+def api_magazzino_trasferisci():
+    try:
+        data = request.get_json(force=True) or {}
+        sku = (data.get("sku") or "").strip()
+        ean = (data.get("ean") or "").strip()
+        from_pool_raw = (data.get("from") or "").strip()
+        to_pool_raw = (data.get("to") or "").strip()
+        quantita = int(data.get("quantita") or 0)
+
+        if not sku or not ean:
+            return jsonify({"error": "sku e ean sono obbligatori"}), 400
+        if quantita <= 0:
+            return jsonify({"error": "quantita deve essere > 0"}), 400
+
+        # normalizza canali in ingresso
+        def canon(c: str) -> str:
+            c = (c or "").strip().lower()
+            if c in ("vendor", "amazon vendor"):        return "Amazon Vendor"
+            if c in ("sito", "shopify", "web"):         return "Sito"
+            if c in ("seller", "amazon seller"):        return "Amazon Seller"
+            return c.title()
+
+        from_pool = canon(from_pool_raw)
+        to_pool   = canon(to_pool_raw)
+
+        ALLOWED = {"Amazon Vendor", "Sito", "Amazon Seller"}
+        if from_pool not in ALLOWED or to_pool not in ALLOWED:
+            return jsonify({"error": "canale non valido (usa: Amazon Vendor | Sito | Amazon Seller)"}), 400
+        if from_pool == to_pool:
+            return jsonify({"error": "from e to devono essere diversi"}), 400
+
+        # helper lettura qty: se riga manca => 0 (usa maybe_single)
+        def read_qty(canale: str) -> int:
+            res = supa_with_retry(lambda:
+                sb_table("magazzino_giacenze")
+                .select("qty")
+                .eq("sku", sku)
+                .eq("ean", ean)
+                .eq("canale", canale)
+                .maybe_single()              # <— evita 406 PGRST116
+                .execute()
+            )
+            row = res.data or {}
+            try:
+                return int(row.get("qty") or 0)
+            except Exception:
+                return 0
+
+        from_qty = read_qty(from_pool)
+        if quantita > from_qty:
+            return jsonify({
+                "error": f"quantita oltre disponibile nel pool '{from_pool}'",
+                "disponibile": from_qty
+            }), 409
+
+        to_qty   = read_qty(to_pool)
+
+        # aggiorna origine (upsert) e destinazione (upsert)
+        supa_with_retry(lambda:
+            sb_table("magazzino_giacenze")
+            .upsert({"sku": sku, "ean": ean, "canale": from_pool, "qty": from_qty - quantita})
+            .execute()
+        )
+        supa_with_retry(lambda:
+            sb_table("magazzino_giacenze")
+            .upsert({"sku": sku, "ean": ean, "canale": to_pool, "qty": to_qty + quantita})
+            .execute()
+        )
+
+        # log movimento
+        supa_with_retry(lambda:
+            sb_table("magazzino_movimenti")
+            .insert({
+                "sku": sku,
+                "ean": ean,
+                "canale": f"{from_pool}->{to_pool}",
+                "qty": quantita,
+                "motivo": "trasferimento_manual",
+            })
+            .execute()
+        )
+
+        return jsonify({
+            "ok": True,
+            "from": {"canale": from_pool, "qty": from_qty - quantita},
+            "to": {"canale": to_pool, "qty": to_qty + quantita}
+        }), 200
+
+    except Exception as ex:
+        logging.exception("[api_magazzino_trasferisci] errore")
         return jsonify({"error": str(ex)}), 500
