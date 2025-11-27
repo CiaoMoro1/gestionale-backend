@@ -406,9 +406,12 @@ def site_orders_sku_summary():
     if not sku:
         return jsonify({"orders_count": 0, "total_qty": 0})
     try:
-        # prendo solo ordini non annullati (fulfillment_status != 'annullato')
+        # prendo solo ordini INEVASI (non annullati, non evasi)
         orders = supa_with_retry(lambda: (
-            sb_table("orders").select("id, fulfillment_status").neq("fulfillment_status", "annullato").execute()
+            sb_table("orders")
+                .select("id, fulfillment_status")
+                .eq("fulfillment_status", "inevaso")   # <<< CAMBIATO QUI
+                .execute()
         )).data or []
         if not orders:
             return jsonify({"orders_count": 0, "total_qty": 0})
@@ -418,7 +421,11 @@ def site_orders_sku_summary():
             return jsonify({"orders_count": 0, "total_qty": 0})
 
         items = supa_with_retry(lambda: (
-            sb_table("order_items").select("order_id, quantity, sku").in_("order_id", order_ids).eq("sku", sku).execute()
+            sb_table("order_items")
+                .select("order_id, quantity, sku")
+                .in_("order_id", order_ids)
+                .eq("sku", sku)
+                .execute()
         )).data or []
 
         total_qty = 0
@@ -435,7 +442,6 @@ def site_orders_sku_summary():
     except Exception as ex:
         logging.exception("[site_orders_sku_summary] Errore")
         return jsonify({"orders_count": 0, "total_qty": 0})
-
 
 
 # -----------------------------------------------------------------------------
