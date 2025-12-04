@@ -1016,7 +1016,9 @@ def save_parziali_wip():
     start_delivery = request.args.get("data")
     data = request.json or {}
     parziali = data.get("parziali")
-    conferma_collo = data.get("confermaCollo", {})
+    # None = il client NON ha mandato il campo
+    # {}   = il client vuole svuotare completamente la mappa
+    conferma_collo = data.get("confermaCollo")
     merge = bool(data.get("merge"))
     client_ts = data.get("client_last_modified_at")
 
@@ -1052,18 +1054,26 @@ def save_parziali_wip():
             server_ts = row.get("last_modified_at")
             server_parziali = row.get("dati") or []
             server_conferma = row.get("conferma_collo") or {}
+
             # optimistic concurrency
             if client_ts and server_ts and str(client_ts) != str(server_ts):
                 return jsonify({"error": "Conflitto: dati aggiornati da altro client."}), 409
+
             if merge:
-                # MERGE lato server: sostituisci solo l'articolo presente nel body
-                # NB: qui non conosci 'articolo' lato server; lato client invii già l'array merged
-                merged = parziali
-                parziali_final = merged
-                conferma_final = conferma_collo or server_conferma
+                # lato client mandi già TUTTO l'array merged
+                parziali_final = parziali if parziali is not None else server_parziali
+
+                # conferma_collo:
+                # - None  -> il client NON l'ha toccato -> tieni quello del server
+                # - {}    -> il client vuole svuotare la mappa
+                # - {...} -> il client vuole sovrascrivere completamente
+                if conferma_collo is None:
+                    conferma_final = server_conferma
+                else:
+                    conferma_final = conferma_collo
             else:
                 parziali_final = parziali
-                conferma_final = conferma_collo
+                conferma_final = conferma_collo if conferma_collo is not None else server_conferma
         else:
             # non esiste WIP: crea nuovo numero_parziale
             conf = supa_with_retry(lambda: (
@@ -1078,7 +1088,8 @@ def save_parziali_wip():
             max_num = conf.data[0]["numero_parziale"] if (conf.data and len(conf.data) > 0) else 0
             numero_parziale = max_num + 1
             parziali_final = parziali
-            conferma_final = conferma_collo
+            conferma_final = conferma_collo or {}
+
 
         parziale_data = {
             "riepilogo_id": riepilogo_id,
