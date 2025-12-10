@@ -480,31 +480,42 @@ def sync_produzione_from_prelievo(prelievo_id: int):
         data = p.get("start_delivery")
 
 
-        # 1) somma attivi per Vendor (SKU/EAN) su TUTTE le date (POOL)
-        stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
+       # # 1) somma attivi per Vendor (SKU/EAN) su TUTTE le date (POOL)
+       # stati_attivi = ["Stampato", "Calandrato", "Cucito", "Confezionato"]
 
-        # sku: resta match esatto
-        q = (
-            sb_table("produzione_vendor")
-            .select("da_produrre")
-            .eq("canale", "Amazon Vendor")
-            .eq("sku", sku)
-            .in_("stato_produzione", stati_attivi)
-        )
+      #  # sku: resta match esatto
+       # q = (
+      #      sb_table("produzione_vendor")
+       #     .select("da_produrre")
+        #    .eq("canale", "Amazon Vendor")
+      #      .eq("sku", sku)
+       #     .in_("stato_produzione", stati_attivi)
+       # )
 
         # ean: match NULL-aware (evita doppi quando da un lato è NULL e dall’altro "")
-        q = _eq_or_is_null(q, "ean", ean)
+      #  q = _eq_or_is_null(q, "ean", ean)
 
-        attivi_rows = supa_with_retry(lambda: q.execute()).data or []
-        attivi = sum(int(r.get("da_produrre") or 0) for r in attivi_rows)
+        #attivi_rows = supa_with_retry(lambda: q.execute()).data or []
+       # attivi = sum(int(r.get("da_produrre") or 0) for r in attivi_rows)
 
         # 2) differenza da mettere in "Da Stampare" (sulla data DEL PRELIEVO)
+        #qty  = int(p.get("qty") or 0)
+       # risc = int(p.get("riscontro") or 0)   # TOTALE che inserisci tu
+      #  plus = int(p.get("plus") or 0)
+
+       # needed_ord = max(0, qty - risc - attivi)     # quanto serve per coprire l’ordinato
+       # ds = needed_ord + plus  
+       
         qty  = int(p.get("qty") or 0)
         risc = int(p.get("riscontro") or 0)   # TOTALE che inserisci tu
         plus = int(p.get("plus") or 0)
 
-        needed_ord = max(0, qty - risc - attivi)     # quanto serve per coprire l’ordinato
-        ds = needed_ord + plus  
+        # Nuova logica: per quella data, il "mancante" da produzione
+        # è semplicemente qty - riscontro (gli attivi NON riducono il DS)
+        ds = max(0, qty - risc) + plus
+       
+       
+       
 
         # 3) trova eventuale riga DS esistente (stessa chiave logica)
         q_ds = (
@@ -606,9 +617,14 @@ def sync_produzione_from_prelievo(prelievo_id: int):
             except Exception:
                 pass
 
+       # logging.info(
+        #    "[sync semplice] prelievo %s -> DS=%s (qty=%s, risc=%s, attivi=%s, plus=%s, needed_ord=%s)",
+        #    prelievo_id, ds, qty, risc, attivi, plus, needed_ord
+       # )
+        
         logging.info(
-            "[sync semplice] prelievo %s -> DS=%s (qty=%s, risc=%s, attivi=%s, plus=%s, needed_ord=%s)",
-            prelievo_id, ds, qty, risc, attivi, plus, needed_ord
+            "[sync semplice] prelievo %s -> DS=%s (qty=%s, risc=%s, plus=%s)",
+            prelievo_id, ds, qty, risc, plus
         )
 
     except Exception as ex:
